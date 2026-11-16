@@ -38,6 +38,8 @@ const GRIP: f32 = 8.0;
 const GRIP_OUT: f32 = 7.0;
 /// Esquina de arriba de un clip para los fundidos: alto de la franja y ancho de la agarradera.
 const FADE_GRIP: f32 = 12.0;
+/// Con el imán, un borde o una esquina que se arrastra se engancha a otro a menos de esto.
+const SNAP: f32 = 8.0;
 /// Arrastrando a menos de esto de un costado de la vista, la línea se desplaza sola (hasta AUTO_SCROLL px/s).
 const EDGE: f32 = 48.0;
 const AUTO_SCROLL: f32 = 900.0;
@@ -55,9 +57,10 @@ pub(super) enum Drag {
     /// Un borde (`left`: el izquierdo) de una pieza y su pareja. `press_x` se mide desde el inicio de la línea (no
     /// de la pantalla) y `pps` queda fijo mientras dura: así el borde sigue al mouse aunque la línea se desplace o
     /// cambie de largo.
-    Trim { parts: Vec<Trimmed>, left: bool, press_x: f32, pps: f32 },
-    /// Una esquina de arriba (`out`: la derecha) de una pieza: el fundido de ese lado.
-    Fade { part: Faded, out: bool, press_x: f32, pps: f32 },
+    /// `from`: dónde estaba el borde; `snaps`: dónde se puede enganchar (vacío sin el imán).
+    Trim { parts: Vec<Trimmed>, left: bool, press_x: f32, pps: f32, from: i64, snaps: Vec<i64> },
+    /// Una esquina de arriba (`out`: la derecha) de una pieza y su pareja: el fundido de ese lado.
+    Fade { parts: Vec<Faded>, out: bool, press_x: f32, pps: f32, from: i64, snaps: Vec<i64> },
     Move { id: u64, grab_dx: f32 },
 }
 
@@ -477,7 +480,11 @@ impl EditorApp {
             }
             ui.add_space(14.0);
             caption(ui, "Recortar");
-            ui.label(RichText::new("Arrastrá los bordes de un clip en la línea de tiempo. Arrastralo del medio para cambiarlo de lugar o de pista.").size(13.0).color(MUTED));
+            ui.label(
+                RichText::new("Arrastrá los bordes de un clip en la línea de tiempo. Arrastralo del medio para cambiarlo de lugar o de pista. Con Alt apretado, el borde o la esquina cambia solo la imagen o solo el sonido.")
+                    .size(13.0)
+                    .color(MUTED),
+            );
             ui.add_space(14.0);
             caption(ui, "Fundidos");
             ui.label(
@@ -733,6 +740,14 @@ impl EditorApp {
         }
     }
 
+    /// Con el imán, `dt` corrido para que `from + dt` caiga justo en el punto de `snaps` más cercano, si está a
+    /// menos de SNAP px; anota dónde se enganchó para marcarlo.
+    fn snapped(&mut self, from: i64, dt: i64, snaps: &[i64], pps: f32) -> i64 {
+        let tol = (SNAP / pps * 1e7) as i64;
+        self.snap = snaps.iter().copied().filter(|s| (s - from - dt).abs() <= tol).min_by_key(|s| (s - from - dt).abs());
+        self.snap.map_or(dt, |s| s - from)
+    }
+
     /// Acerca (k > 1) o aleja la línea de tiempo. Se aplica al dibujarla, con el cursor de reproducción quieto.
     pub(super) fn zoom_by(&mut self, k: f32) {
         let z = self.zoom_to.map_or(self.zoom, |(z, _)| z);
@@ -931,8 +946,23 @@ impl EditorApp {
             self.drag_before = Some(self.tracks.clone());
             self.pause();
             self.drag = match hit(press.x, press.y) {
-                Some((ti, i, corner @ 2..)) => Drag::Fade { part: self.start_fade(ti, i, corner == 3), out: corner == 3, press_x, pps },
-                Some((ti, i, side)) if side != 0 => Drag::Trim { parts: self.start_trim(ti, i), left: side < 0, press_x, pps },
+                Some((ti, i, kind)) if kind != 0 => {
+                    let at = self.dragged(ti, i, ui.input(|i| i.modifiers.alt));
+                    let snaps = if self.prefs.magnet { self.snap_points(&at) } else { Vec::new() };
+                    let p = &self.tracks[ti].clips[i];
+                    let corners = self.fade_handles(ti, i);
+                    match kind {
+                        2 | 3 => Drag::Fade {
+                            parts: at.iter().map(|&a| self.start_fade(a, kind == 3)).collect(),
+                            out: kind == 3,
+                            press_x,
+                            pps,
+                            from: if kind == 3 { corners.1 } else { corners.0 },
+                            snaps,
+                        },
+                        _ => Drag::Trim { parts: self.start_trim(&at), left: kind < 0, press_x, pps, from: if kind < 0 { p.start } else { p.end() }, snaps },
+                    }
+                }
                 Some((ti, i, _)) => Drag::Move { id: self.tracks[ti].clips[i].id, grab_dx: press.x - xs[ti][i].0 },
                 None => Drag::Scrub,
             };
@@ -960,8 +990,9 @@ impl EditorApp {
                             }
                         }
                     }
-                    Drag::Trim { parts, left, press_x, .. } => {
-                        self.trim(&parts, left, ((h.x - rect.left() - press_x) / pps * 1e7) as i64);
+                    Drag::Trim { parts, left, press_x, from, snaps, .. } => {
+                        let dt = self.snapped(from, ((h.x - rect.left() - press_x) / pps * 1e7) as i64, &snaps, pps);
+                        self.trim(&parts, left, dt);
                         if throttle {
                             let p = &self.tracks[parts[0].at.0].clips[parts[0].at.1];
                             let t = if left { p.start } else { p.end() - self.frame_len(&p.path) };
@@ -969,10 +1000,13 @@ impl EditorApp {
                             self.last_seek = Instant::now();
                         }
                     }
-                    Drag::Fade { part, out, press_x, .. } => {
-                        self.fade(&part, out, ((h.x - rect.left() - press_x) / pps * 1e7) as i64);
+                    Drag::Fade { parts, out, press_x, from, snaps, .. } => {
+                        let dt = self.snapped(from, ((h.x - rect.left() - press_x) / pps * 1e7) as i64, &snaps, pps);
+                        for f in &parts {
+                            self.fade(f, out, dt);
+                        }
                         if throttle {
-                            let (a, b) = self.fade_handles(part.at.0, part.at.1);
+                            let (a, b) = self.fade_handles(parts[0].at.0, parts[0].at.1);
                             self.seek(if out { b - self.frame_at_cursor() } else { a });
                             self.last_seek = Instant::now();
                         }
@@ -983,14 +1017,15 @@ impl EditorApp {
         } else if !matches!(self.drag, Drag::None) {
             // Se soltó (o Esc cortó el arrastre).
             let before = self.drag_before.take();
+            self.snap = None;
             match std::mem::replace(&mut self.drag, Drag::None) {
                 Drag::Trim { parts, left, .. } => {
                     let p = &self.tracks[parts[0].at.0].clips[parts[0].at.1];
                     let s = if left { p.start } else { p.end() - self.frame_len(&p.path) };
                     self.commit(before, s);
                 }
-                Drag::Fade { part, out, .. } => {
-                    let (a, b) = self.fade_handles(part.at.0, part.at.1);
+                Drag::Fade { parts, out, .. } => {
+                    let (a, b) = self.fade_handles(parts[0].at.0, parts[0].at.1);
                     self.commit(before, if out { b - self.frame_at_cursor() } else { a });
                 }
                 Drag::Move { id, grab_dx } => {
@@ -1149,9 +1184,13 @@ impl EditorApp {
             }
         }
 
+        // Dónde quedó enganchado lo que se arrastra.
+        if let Some(t) = self.snap {
+            painter.vline(tx(t), Rangef::new(ruler.bottom(), lanes_bottom), Stroke::new(1.0_f32, WHITE.gamma_multiply(0.7)));
+        }
         // Mientras se arrastra una esquina, cuánto dura ese fundido.
-        if let (Drag::Fade { part, out, .. }, Some(h)) = (&self.drag, pointer) {
-            let (crossed, len) = self.fade_len(part, *out);
+        if let (Drag::Fade { parts, out, .. }, Some(h)) = (&self.drag, pointer) {
+            let (crossed, len) = self.fade_len(&parts[0], *out);
             let text = format!("{} {}", if crossed { "Fundido" } else if *out { "Se va en" } else { "Aparece en" }, fmt_len(len));
             let g = painter.layout_no_wrap(text, FontId::proportional(12.0), WHITE);
             let r = Rect::from_min_size(Pos2::new(h.x + 12.0, h.y - g.size().y - 12.0), g.size() + egui::vec2(12.0, 6.0));

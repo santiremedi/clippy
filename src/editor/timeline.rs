@@ -544,12 +544,35 @@ impl EditorApp {
         self.tracks != before
     }
 
-    /// Empieza a recortar la pieza `(ti, i)` y su pareja (primero la tocada).
-    pub(super) fn start_trim(&self, ti: usize, i: usize) -> Vec<Trimmed> {
+    /// Lo que se recorta o se funde al arrastrar la pieza `(ti, i)`: ella y su pareja, primero la tocada.
+    /// Con `alone` (Alt apretado, como en los editores), solo ella.
+    pub(super) fn dragged(&self, ti: usize, i: usize, alone: bool) -> Vec<(usize, usize)> {
+        if alone {
+            return vec![(ti, i)];
+        }
         let mut group = self.group(self.tracks[ti].clips[i].id);
         group.sort_by_key(|&at| at != (ti, i));
         group
-            .into_iter()
+    }
+
+    /// Puntos donde se engancha lo que se arrastra con el imán: los bordes y los fundidos de las piezas que no
+    /// se están arrastrando (`skip`).
+    pub(super) fn snap_points(&self, skip: &[(usize, usize)]) -> Vec<i64> {
+        let mut v = Vec::new();
+        for (ti, t) in self.tracks.iter().enumerate() {
+            for (i, p) in t.clips.iter().enumerate().filter(|&(i, _)| !skip.contains(&(ti, i))) {
+                let (a, b) = self.fade_handles(ti, i);
+                v.extend([p.start, p.end(), a, b]);
+            }
+        }
+        v
+    }
+
+    /// Empieza a recortar las piezas `parts` (ver `dragged`).
+    pub(super) fn start_trim(&self, parts: &[(usize, usize)]) -> Vec<Trimmed> {
+        parts
+            .iter()
+            .copied()
             .map(|(tj, j)| {
                 let orig = self.tracks[tj].clips[j].clone();
                 let max = self.loader.probe(&orig.path).map(|p| p.duration).unwrap_or(orig.src_out);
@@ -615,10 +638,10 @@ impl EditorApp {
         }
     }
 
-    /// Empieza a arrastrar la esquina de arriba (`out`: la derecha) de la pieza `(ti, i)`. Solo de esa: aunque
-    /// esté unida, la imagen y el sonido tienen cada uno sus fundidos (y siguen a la par: alargar el fundido
-    /// cruzado no cambia dónde cae cada momento del archivo).
-    pub(super) fn start_fade(&self, ti: usize, i: usize, out: bool) -> Faded {
+    /// Empieza a arrastrar la esquina de arriba (`out`: la derecha) de la pieza `(ti, i)`. Cada pieza tiene sus
+    /// fundidos: la imagen y el sonido unidos se arrastran juntos, pero con Alt se ajusta uno solo (siguen a la
+    /// par: alargar el fundido cruzado no cambia dónde cae cada momento del archivo).
+    pub(super) fn start_fade(&self, (ti, i): (usize, usize), out: bool) -> Faded {
         let t = &self.tracks[ti];
         let p = &t.clips[i];
         // Toca a la vecina si la pisa o queda a menos de un cuadro.
