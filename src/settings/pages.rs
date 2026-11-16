@@ -189,16 +189,31 @@ impl SettingsApp {
         section(ui, "Acerca de", |ui| {
             row(ui, "Versión", LABEL_W, |ui| {
                 ui.label(RichText::new(format!("Clippy {}", env!("CARGO_PKG_VERSION"))).color(TEXT));
-                if let Some((v, _)) = self.update.clone() {
-                    let busy = self.update_busy();
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| match self.update.clone() {
+                    Some((v, _)) => {
+                        let busy = self.update_busy();
                         let label = if busy { "Actualizando…".to_string() } else { format!("Actualizar a {v}") };
                         if ui.add_enabled_ui(!busy, |ui| button(ui, &label, Kind::Secondary)).inner.clicked() {
                             self.start_update();
                         }
-                    });
-                }
+                    }
+                    None => {
+                        let label = if self.checking { "Buscando…" } else { "Buscar actualizaciones" };
+                        if ui.add_enabled_ui(!self.checking, |ui| button(ui, label, Kind::Secondary)).inner.clicked() {
+                            self.start_check();
+                        }
+                    }
+                });
             });
+            self.finish_check(ui.ctx());
+            let note = match &*self.check.lock().unwrap() {
+                Some(Ok(None)) => Some("Tenés la última versión.".to_string()),
+                Some(Err(e)) => Some(format!("No se pudo buscar: {e}")),
+                _ => None,
+            };
+            if let Some(note) = note {
+                hint(ui, LABEL_W + 8.0, note);
+            }
             divider(ui);
             row(ui, "Datos y registro", LABEL_W, |ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -261,9 +276,9 @@ impl SettingsApp {
             );
             divider(ui);
             row(ui, "Memoria", LABEL_W, |ui| {
-                ui.label(RichText::new(format!("Hasta {} MB de RAM mientras graba", self.cfg.buffer_mb())).family(bold()).color(TEXT));
+                ui.label(RichText::new(format!("Unos {} MB de RAM mientras graba", self.cfg.typical_ram_mb())).family(bold()).color(TEXT));
             });
-            hint(ui, LABEL_W + 8.0, "Es el máximo: en juegos con mucho movimiento se acerca a esto; con la pantalla quieta, el video ocupa bastante menos.");
+            hint(ui, LABEL_W + 8.0, "Aproximado, como lo muestra el Administrador de tareas. Sube un poco con más segundos, más calidad o mucho movimiento en pantalla.");
             divider(ui);
             row(ui, "Carpeta", LABEL_W, |ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {

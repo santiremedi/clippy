@@ -176,20 +176,22 @@ impl Config {
         }
     }
 
+    /// RAM aproximada mientras graba (MB), como la muestra el Administrador de tareas: la app en sí
+    /// (unos 40 MB), el audio en crudo y el video. El encoder casi nunca llega al bitrate elegido
+    /// (solo con mucho movimiento), así que se cuenta una décima parte: da un número realista, no el máximo.
+    pub fn typical_ram_mb(&self) -> u32 {
+        let channels = self.game_audio as u32 + self.desktop_audio as u32 + self.mic_audio as u32;
+        let audio = channels * self.seconds * 192 / 1000;
+        let video = self.bitrate_mbps * self.seconds / 80;
+        (40 + audio + video).div_ceil(10) * 10
+    }
+
     pub fn hotkey_mut(&mut self, a: GlobalAction) -> (&mut u32, &mut u32) {
         match a {
             GlobalAction::SaveClip => (&mut self.hotkey_vk, &mut self.hotkey_mods),
             GlobalAction::ToggleRecording => (&mut self.toggle_vk, &mut self.toggle_mods),
             GlobalAction::OpenEditor => (&mut self.editor_vk, &mut self.editor_mods),
         }
-    }
-
-    /// RAM que ocupa el buffer como mucho (MB): el video usa el bitrate elegido cuando hay mucho
-    /// movimiento; con la pantalla quieta, el encoder gasta bastante menos.
-    pub fn buffer_mb(&self) -> u32 {
-        let video = self.bitrate_mbps * (self.seconds + 1) / 8;
-        let channels = self.game_audio as u32 + self.desktop_audio as u32 + self.mic_audio as u32;
-        video + channels * (self.seconds + 2) * 192 / 1000
     }
 }
 

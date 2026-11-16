@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Networking::WinHttp::*;
 
-use super::mode::{tray_running, Mode};
+use super::mode::{tray_running, Mode, Window};
 use crate::log::{app_dir, log};
 
 /// Repositorio público donde se publican las versiones (Releases).
@@ -68,16 +68,29 @@ fn check_if_due() {
     if now.saturating_sub(s.last_check) < DAY || now.saturating_sub(s.last_try) < HOUR {
         return;
     }
-    s.last_try = now;
-    match fetch_latest() {
-        Ok((tag, url)) => {
-            s.latest = Some(tag.trim_start_matches('v').to_string());
-            s.url = Some(url);
-            s.last_check = now;
-        }
-        Err(e) => log(&format!("actualizaciones: {e}")),
+    if let Err(e) = fetch_and_save(&mut s, now) {
+        log(&format!("actualizaciones: {e}"));
     }
-    save(&s);
+}
+
+/// Botón "Buscar actualizaciones": una consulta ya, sin esperar el día. Devuelve la versión nueva si hay.
+pub fn check_now() -> Result<Option<String>> {
+    let mut s = load();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    fetch_and_save(&mut s, now)?;
+    Ok(available().map(|(v, _)| v))
+}
+
+/// Consulta GitHub y guarda el resultado (el intento cuenta aunque falle).
+fn fetch_and_save(s: &mut State, now: u64) -> Result<()> {
+    s.last_try = now;
+    let r = fetch_latest().map(|(tag, url)| {
+        s.latest = Some(tag.trim_start_matches('v').to_string());
+        s.url = Some(url);
+        s.last_check = now;
+    });
+    save(s);
+    r
 }
 
 /// En segundo plano, mientras corra la grabadora: revisa cada hora si toca consultar y llama a
@@ -152,9 +165,10 @@ pub fn start_install(downloaded: &Path) -> Result<()> {
 
 /// Corre desde el .exe descargado: espera a que Clippy se cierre, lo reemplaza y lo vuelve a abrir.
 pub fn apply(target: &Path) -> i32 {
-    // Esperar a que la grabadora anterior termine (libera su "candado" de instancia única).
+    // Esperar a que se cierren la grabadora y la ventana principal: si la ventana sigue cerrándose
+    // cuando arranca la versión nueva, esta cree que ya hay una abierta y no se abre.
     for _ in 0..100 {
-        if !tray_running() {
+        if !tray_running() && !Window::Settings.running() {
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -181,11 +195,22 @@ pub fn apply(target: &Path) -> i32 {
 }
 
 /// Al arrancar: borrar restos de una actualización anterior.
+/// Justo después de actualizar, la versión vieja y la descarga todavía pueden estar abiertas
+/// (la ventana vieja cerrándose, el instalador terminando): se reintenta un rato en segundo plano.
 pub fn cleanup() {
+    let mut files = vec![downloaded_path()];
     if let Ok(me) = std::env::current_exe() {
-        let _ = std::fs::remove_file(old_path(&me));
+        files.push(old_path(&me));
     }
-    let _ = std::fs::remove_file(downloaded_path());
+    std::thread::spawn(move || {
+        for _ in 0..30 {
+            files.retain(|f| f.exists() && std::fs::remove_file(f).is_err());
+            if files.is_empty() {
+                return;
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    });
 }
 
 // --- HTTPS con WinHTTP (viene con Windows: no suma librerías) ------------------------
