@@ -615,68 +615,60 @@ impl EditorApp {
         }
     }
 
-    /// Empieza a arrastrar la esquina de arriba (`out`: la derecha) de la pieza `(ti, i)` y su pareja
-    /// (primero la tocada).
-    pub(super) fn start_fade(&self, ti: usize, i: usize, out: bool) -> Vec<Faded> {
-        let mut group = self.group(self.tracks[ti].clips[i].id);
-        group.sort_by_key(|&at| at != (ti, i));
-        group
-            .into_iter()
-            .map(|(tj, j)| {
-                let t = &self.tracks[tj];
-                let p = &t.clips[j];
-                // Toca a la vecina si la pisa o queda a menos de un cuadro.
-                let near = if out { t.clips.get(j + 1).filter(|n| n.start <= p.end() + UNKNOWN_FRAME / 2) } else { j.checked_sub(1).map(|k| &t.clips[k]).filter(|n| n.end() >= p.start - UNKNOWN_FRAME / 2) };
-                let max = self.loader.probe(&p.path).map(|q| q.duration).unwrap_or(p.src_out);
-                Faded { at: (tj, j), orig: p.clone(), ov: t.overlaps().iter().map(|f| f.0).collect(), neighbor: near.map(Piece::len), max }
-            })
-            .collect()
+    /// Empieza a arrastrar la esquina de arriba (`out`: la derecha) de la pieza `(ti, i)`. Solo de esa: aunque
+    /// esté unida, la imagen y el sonido tienen cada uno sus fundidos (y siguen a la par: alargar el fundido
+    /// cruzado no cambia dónde cae cada momento del archivo).
+    pub(super) fn start_fade(&self, ti: usize, i: usize, out: bool) -> Faded {
+        let t = &self.tracks[ti];
+        let p = &t.clips[i];
+        // Toca a la vecina si la pisa o queda a menos de un cuadro.
+        let near = if out { t.clips.get(i + 1).filter(|n| n.start <= p.end() + UNKNOWN_FRAME / 2) } else { i.checked_sub(1).map(|k| &t.clips[k]).filter(|n| n.end() >= p.start - UNKNOWN_FRAME / 2) };
+        let max = self.loader.probe(&p.path).map(|q| q.duration).unwrap_or(p.src_out);
+        Faded { at: (ti, i), orig: p.clone(), ov: t.overlaps().iter().map(|f| f.0).collect(), neighbor: near.map(Piece::len), max }
     }
 
-    /// Mueve la esquina de arriba (`out`: la derecha) de las piezas `dt` desde donde estaba.
-    pub(super) fn fade(&mut self, parts: &[Faded], out: bool, dt: i64) {
+    /// Mueve la esquina de arriba (`out`: la derecha) de la pieza `dt` desde donde estaba.
+    pub(super) fn fade(&mut self, f: &Faded, out: bool, dt: i64) {
         let magnet = self.prefs.magnet;
-        for f in parts {
-            let o = &f.orig;
-            // Hacia afuera de la pieza es positivo.
-            let d = if out { dt } else { -dt };
-            let (fade0, other) = if out { (o.fade_out, o.fade_in) } else { (o.fade_in, o.fade_out) };
-            let fade_max = (o.len() - other).max(0);
-            let track = &mut self.tracks[f.at.0];
-            let p = &mut track.clips[f.at.1];
-            let Some(nb_len) = f.neighbor else {
-                let v = (fade0 - d).clamp(0, fade_max);
-                if out {
-                    p.fade_out = v;
-                } else {
-                    p.fade_in = v;
-                }
-                continue;
-            };
-            // Índice de la unión con la vecina en `ov`.
-            let k = if out { f.at.1 + 1 } else { f.at.1 };
-            let ov0 = f.ov.get(k).copied().unwrap_or(0);
-            let room = if out { f.max - o.src_out } else { o.src_in };
-            // Positivo: cuánto se funde con la vecina; negativo: cuánto tarda en ir a negro.
-            let s = (ov0 - fade0 + d).clamp(-fade_max, (ov0 + room).min(nb_len / 2).max(ov0));
-            let grow = s.max(0) - ov0;
+        let o = &f.orig;
+        // Hacia afuera de la pieza es positivo.
+        let d = if out { dt } else { -dt };
+        let (fade0, other) = if out { (o.fade_out, o.fade_in) } else { (o.fade_in, o.fade_out) };
+        let fade_max = (o.len() - other).max(0);
+        let track = &mut self.tracks[f.at.0];
+        let p = &mut track.clips[f.at.1];
+        let Some(nb_len) = f.neighbor else {
+            let v = (fade0 - d).clamp(0, fade_max);
             if out {
-                p.src_out = o.src_out + grow;
-                p.fade_out = (-s).max(0);
+                p.fade_out = v;
             } else {
-                p.src_in = o.src_in - grow;
-                p.fade_in = (-s).max(0);
-                if !magnet {
-                    p.start = o.start - grow;
-                }
+                p.fade_in = v;
             }
-            if magnet {
-                let mut ov = f.ov.clone();
-                if let Some(x) = ov.get_mut(k) {
-                    *x = s.max(0);
-                }
-                track.relayout(&ov);
+            return;
+        };
+        // Índice de la unión con la vecina en `ov`.
+        let k = if out { f.at.1 + 1 } else { f.at.1 };
+        let ov0 = f.ov.get(k).copied().unwrap_or(0);
+        let room = if out { f.max - o.src_out } else { o.src_in };
+        // Positivo: cuánto se funde con la vecina; negativo: cuánto tarda en ir a negro.
+        let s = (ov0 - fade0 + d).clamp(-fade_max, (ov0 + room).min(nb_len / 2).max(ov0));
+        let grow = s.max(0) - ov0;
+        if out {
+            p.src_out = o.src_out + grow;
+            p.fade_out = (-s).max(0);
+        } else {
+            p.src_in = o.src_in - grow;
+            p.fade_in = (-s).max(0);
+            if !magnet {
+                p.start = o.start - grow;
             }
+        }
+        if magnet {
+            let mut ov = f.ov.clone();
+            if let Some(x) = ov.get_mut(k) {
+                *x = s.max(0);
+            }
+            track.relayout(&ov);
         }
     }
 

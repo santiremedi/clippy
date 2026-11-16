@@ -56,8 +56,8 @@ pub(super) enum Drag {
     /// de la pantalla) y `pps` queda fijo mientras dura: así el borde sigue al mouse aunque la línea se desplace o
     /// cambie de largo.
     Trim { parts: Vec<Trimmed>, left: bool, press_x: f32, pps: f32 },
-    /// Una esquina de arriba (`out`: la derecha) de una pieza y su pareja: el fundido de ese lado.
-    Fade { parts: Vec<Faded>, out: bool, press_x: f32, pps: f32 },
+    /// Una esquina de arriba (`out`: la derecha) de una pieza: el fundido de ese lado.
+    Fade { part: Faded, out: bool, press_x: f32, pps: f32 },
     Move { id: u64, grab_dx: f32 },
 }
 
@@ -931,7 +931,7 @@ impl EditorApp {
             self.drag_before = Some(self.tracks.clone());
             self.pause();
             self.drag = match hit(press.x, press.y) {
-                Some((ti, i, corner @ 2..)) => Drag::Fade { parts: self.start_fade(ti, i, corner == 3), out: corner == 3, press_x, pps },
+                Some((ti, i, corner @ 2..)) => Drag::Fade { part: self.start_fade(ti, i, corner == 3), out: corner == 3, press_x, pps },
                 Some((ti, i, side)) if side != 0 => Drag::Trim { parts: self.start_trim(ti, i), left: side < 0, press_x, pps },
                 Some((ti, i, _)) => Drag::Move { id: self.tracks[ti].clips[i].id, grab_dx: press.x - xs[ti][i].0 },
                 None => Drag::Scrub,
@@ -969,10 +969,10 @@ impl EditorApp {
                             self.last_seek = Instant::now();
                         }
                     }
-                    Drag::Fade { parts, out, press_x, .. } => {
-                        self.fade(&parts, out, ((h.x - rect.left() - press_x) / pps * 1e7) as i64);
+                    Drag::Fade { part, out, press_x, .. } => {
+                        self.fade(&part, out, ((h.x - rect.left() - press_x) / pps * 1e7) as i64);
                         if throttle {
-                            let (a, b) = self.fade_handles(parts[0].at.0, parts[0].at.1);
+                            let (a, b) = self.fade_handles(part.at.0, part.at.1);
                             self.seek(if out { b - self.frame_at_cursor() } else { a });
                             self.last_seek = Instant::now();
                         }
@@ -989,8 +989,8 @@ impl EditorApp {
                     let s = if left { p.start } else { p.end() - self.frame_len(&p.path) };
                     self.commit(before, s);
                 }
-                Drag::Fade { parts, out, .. } => {
-                    let (a, b) = self.fade_handles(parts[0].at.0, parts[0].at.1);
+                Drag::Fade { part, out, .. } => {
+                    let (a, b) = self.fade_handles(part.at.0, part.at.1);
                     self.commit(before, if out { b - self.frame_at_cursor() } else { a });
                 }
                 Drag::Move { id, grab_dx } => {
@@ -1150,8 +1150,8 @@ impl EditorApp {
         }
 
         // Mientras se arrastra una esquina, cuánto dura ese fundido.
-        if let (Drag::Fade { parts, out, .. }, Some(h)) = (&self.drag, pointer) {
-            let (crossed, len) = self.fade_len(&parts[0], *out);
+        if let (Drag::Fade { part, out, .. }, Some(h)) = (&self.drag, pointer) {
+            let (crossed, len) = self.fade_len(part, *out);
             let text = format!("{} {}", if crossed { "Fundido" } else if *out { "Se va en" } else { "Aparece en" }, fmt_len(len));
             let g = painter.layout_no_wrap(text, FontId::proportional(12.0), WHITE);
             let r = Rect::from_min_size(Pos2::new(h.x + 12.0, h.y - g.size().y - 12.0), g.size() + egui::vec2(12.0, 6.0));
