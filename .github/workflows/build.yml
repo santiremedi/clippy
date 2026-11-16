@@ -20,7 +20,8 @@ permissions:
 jobs:
   # PRs y main: verificar que compila (con y sin las pruebas) y los avisos de clippy.
   # En debug y sin LTO: varias veces más rápido que compilar el exe final.
-  check:
+  # Se llama "build" porque la protección de main pide ese check.
+  build:
     if: github.event_name != 'workflow_dispatch'
     runs-on: windows-latest
     steps:
