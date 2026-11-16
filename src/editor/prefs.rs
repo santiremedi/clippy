@@ -1,5 +1,5 @@
-//! Preferencias propias del editor (%APPDATA%\Clippy\editor.json): atajos de teclado y
-//! últimas opciones de exportación. Solo el editor las lee y las escribe.
+//! Preferencias propias del editor (%APPDATA%\Clippy\editor.json): atajos de teclado, últimas
+//! opciones de exportación, tamaño de los paneles y el imán. Solo el editor las lee y las escribe.
 
 use std::path::{Path, PathBuf};
 
@@ -24,8 +24,10 @@ pub(super) struct Prefs {
     pub(super) library_w: f32,
     pub(super) props_w: f32,
     pub(super) timeline_h: f32,
-    /// Parte del alto de las pistas que usa el video (el resto es del audio).
+    /// Parte del alto de las pistas que usan las de video (el resto es de las de audio).
     pub(super) lane_split: f32,
+    /// Imán: las piezas de cada pista quedan pegadas una detrás de la otra.
+    pub(super) magnet: bool,
 }
 
 impl Default for Prefs {
@@ -40,6 +42,7 @@ impl Default for Prefs {
             props_w: 290.0,
             timeline_h: 268.0,
             lane_split: 0.6,
+            magnet: true,
         }
     }
 }

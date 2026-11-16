@@ -35,6 +35,8 @@ pub enum Act {
     Duplicate,
     Delete,
     MuteClip,
+    Link,
+    Magnet,
     Undo,
     Redo,
     ZoomIn,
@@ -45,7 +47,7 @@ pub enum Act {
     Shortcuts,
 }
 
-pub const ALL: [Act; 19] = [
+pub const ALL: [Act; 21] = [
     Act::PlayPause,
     Act::PrevFrame,
     Act::NextFrame,
@@ -57,6 +59,8 @@ pub const ALL: [Act; 19] = [
     Act::Duplicate,
     Act::Delete,
     Act::MuteClip,
+    Act::Link,
+    Act::Magnet,
     Act::Undo,
     Act::Redo,
     Act::ZoomIn,
@@ -76,7 +80,7 @@ fn k(key: &str, ctrl: bool, shift: bool) -> Combo {
 impl Act {
     /// Cambia las piezas de la línea de tiempo (sus posiciones o su cantidad).
     pub fn edits_timeline(self) -> bool {
-        matches!(self, Act::Split | Act::Duplicate | Act::Delete | Act::MuteClip | Act::Undo | Act::Redo)
+        matches!(self, Act::Split | Act::Duplicate | Act::Delete | Act::MuteClip | Act::Link | Act::Undo | Act::Redo)
     }
 
     pub fn id(self) -> &'static str {
@@ -92,6 +96,8 @@ impl Act {
             Act::Duplicate => "duplicate",
             Act::Delete => "delete",
             Act::MuteClip => "mute_clip",
+            Act::Link => "link_audio",
+            Act::Magnet => "magnet",
             Act::Undo => "undo",
             Act::Redo => "redo",
             Act::ZoomIn => "zoom_in",
@@ -116,6 +122,8 @@ impl Act {
             Act::Duplicate => "Duplicar clip",
             Act::Delete => "Eliminar clip",
             Act::MuteClip => "Silenciar / activar sonido del clip",
+            Act::Link => "Separar o unir el audio y el video",
+            Act::Magnet => "Imán: pegar los clips solos",
             Act::Undo => "Deshacer",
             Act::Redo => "Rehacer",
             Act::ZoomIn => "Acercar línea de tiempo",
@@ -130,7 +138,7 @@ impl Act {
     pub fn group(self) -> &'static str {
         GROUPS[match self {
             Act::PlayPause | Act::PrevFrame | Act::NextFrame | Act::Back | Act::Forward | Act::ToStart | Act::ToEnd => 0,
-            Act::Split | Act::Duplicate | Act::Delete | Act::MuteClip | Act::Undo | Act::Redo => 1,
+            Act::Split | Act::Duplicate | Act::Delete | Act::MuteClip | Act::Link | Act::Magnet | Act::Undo | Act::Redo => 1,
             Act::ZoomIn | Act::ZoomOut | Act::ZoomFit => 2,
             Act::Import | Act::Export | Act::Shortcuts => 3,
         }]
@@ -149,6 +157,8 @@ impl Act {
             Act::Duplicate => k("D", true, false),
             Act::Delete => k("Delete", false, false),
             Act::MuteClip => k("M", false, false),
+            Act::Link => k("L", true, false),
+            Act::Magnet => k("N", false, false),
             Act::Undo => k("Z", true, false),
             Act::Redo => k("Y", true, false),
             Act::ZoomIn => k("Plus", true, false),

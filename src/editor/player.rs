@@ -3,7 +3,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -22,7 +22,7 @@ use crate::mf::{self, frames_at, Mf, FRAME_BYTES};
 pub struct Clock(Mutex<(bool, Instant, i64)>);
 
 impl Clock {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Clock(Mutex::new((false, Instant::now(), 0)))
     }
     pub fn pos(&self) -> i64 {
@@ -36,7 +36,7 @@ impl Clock {
     pub fn playing(&self) -> bool {
         self.0.lock().unwrap().0
     }
-    fn set(&self, pos: i64, playing: bool) {
+    pub fn set(&self, pos: i64, playing: bool) {
         *self.0.lock().unwrap() = (playing, Instant::now(), pos);
     }
     fn stop_at(&self, pos: i64) {
@@ -50,7 +50,6 @@ pub struct Shared {
     pub frame: Mutex<Option<Arc<egui::ColorImage>>>,
     pub gen: AtomicU64,
     pub error: Mutex<Option<String>>,
-    pub ended: AtomicBool,
 }
 
 enum VCmd {
@@ -69,25 +68,27 @@ pub struct Player {
     pub shared: Arc<Shared>,
     pub duration: i64,
     gain: Arc<AtomicU32>,
-    vtx: Sender<VCmd>,
+    vtx: Option<Sender<VCmd>>,
     atx: Option<Sender<ACmd>>,
 }
 
 impl Player {
-    pub fn open(path: PathBuf, probe: &media::Probe, ctx: egui::Context) -> Player {
+    /// Con `video` solo se decodifica la imagen (una pieza de una pista de video); sin él, solo el sonido.
+    pub fn open(path: PathBuf, probe: &media::Probe, ctx: egui::Context, video: bool) -> Player {
         let clock = Arc::new(Clock::new());
         let shared = Arc::new(Shared::default());
         // Vista previa a 960 px de ancho como máximo: alcanza y es liviana.
         let pw = probe.width.clamp(2, 960) & !1;
         let ph = ((pw as u64 * probe.height as u64 / probe.width.max(1) as u64) as u32).max(2) & !1;
 
-        let (vtx, vrx) = mpsc::channel();
-        {
+        let vtx = video.then(|| {
+            let (vtx, vrx) = mpsc::channel();
             let (path, clock, shared, ctx) = (path.clone(), clock.clone(), shared.clone(), ctx.clone());
             std::thread::spawn(move || video_thread(path, pw, ph, clock, vrx, shared, ctx));
-        }
+            vtx
+        });
         let gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
-        let atx = if probe.audio.is_some() {
+        let atx = if !video && probe.audio.is_some() {
             let (atx, arx) = mpsc::channel();
             let (path, gain) = (path.clone(), gain.clone());
             std::thread::spawn(move || audio_thread(path, arx, gain));
@@ -108,9 +109,8 @@ impl Player {
 
     pub fn play(&self) {
         let p = self.pos();
-        self.shared.ended.store(false, Ordering::Relaxed);
         self.clock.set(p, true);
-        let _ = self.vtx.send(VCmd::Play);
+        self.send(VCmd::Play);
         if let Some(a) = &self.atx {
             let _ = a.send(ACmd::Play(p));
         }
@@ -119,9 +119,15 @@ impl Player {
     pub fn pause(&self) {
         let p = self.pos();
         self.clock.stop_at(p);
-        let _ = self.vtx.send(VCmd::Pause);
+        self.send(VCmd::Pause);
         if let Some(a) = &self.atx {
             let _ = a.send(ACmd::Pause);
+        }
+    }
+
+    fn send(&self, c: VCmd) {
+        if let Some(v) = &self.vtx {
+            let _ = v.send(c);
         }
     }
 
@@ -134,7 +140,7 @@ impl Player {
         let t = t.clamp(0, self.duration);
         let playing = self.playing();
         self.clock.set(t, playing);
-        let _ = self.vtx.send(VCmd::Seek(t));
+        self.send(VCmd::Seek(t));
         if playing {
             if let Some(a) = &self.atx {
                 let _ = a.send(ACmd::Play(t));
@@ -316,8 +322,6 @@ fn video_thread(path: PathBuf, w: u32, h: u32, clock: Arc<Clock>, rx: Receiver<V
                 Ok(None) | Err(_) => {
                     playing = false;
                     clock.stop_at(clock.pos());
-                    shared.ended.store(true, Ordering::Relaxed);
-                    ctx.request_repaint();
                     continue;
                 }
             }

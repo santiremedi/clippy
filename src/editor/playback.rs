@@ -1,16 +1,52 @@
-//! Reproducción de la secuencia: un reproductor por archivo, cursor y vista previa.
+//! Reproducción: un reloj para la línea de tiempo y un reproductor por cada pieza que se ve o se oye
+//! en ese momento (o que está por empezar): uno muestra la imagen de una pieza de video, otro hace sonar una
+//! de audio. Los que se sueltan se guardan un rato para la próxima pieza del mismo archivo. Varias piezas
+//! suenan juntas: Windows mezcla su audio.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::time::Instant;
 
 use eframe::egui;
 
+use super::media::layers;
 use super::player::Player;
 use super::EditorApp;
 
 /// Cuadro de 60 fps, para cuando no se sabe el fps del archivo.
-const UNKNOWN_FRAME: i64 = 166_667;
+pub(super) const UNKNOWN_FRAME: i64 = 166_667;
+/// Mientras se reproduce, las piezas que empiezan dentro de este tiempo ya se abren y se buscan.
+const PREROLL: i64 = 3_000_000;
+/// Reproductores sin usar que se guardan para la próxima pieza del mismo archivo.
+const IDLE_MAX: usize = 4;
+
+/// Reproductor de una pieza (o, en `idle`, esperando otra del mismo archivo).
+pub(super) struct Voice {
+    piece: u64,
+    pub(super) path: PathBuf,
+    /// Muestra la imagen (si no, hace sonar el audio).
+    video: bool,
+    player: Player,
+    /// Ya arrancó a la par de la línea; si no, espera quieto en el inicio de la pieza.
+    live: bool,
+}
+
+/// Una imagen de la vista previa: la pieza y cuánto se ve (la de arriba de un fundido, menos de 1).
+pub(super) struct Layer {
+    pub(super) tex: egui::TextureHandle,
+    pub(super) alpha: f32,
+    src: (u64, u64),
+}
+
+/// Lo que necesita una pieza en este momento.
+struct Want {
+    id: u64,
+    path: PathBuf,
+    video: bool,
+    /// Está bajo el cursor (si no, está por empezar).
+    active: bool,
+    src: i64,
+    gain: f32,
+}
 
 impl EditorApp {
     /// Duración de un cuadro (100 ns) de ese archivo: los clips pueden ser de 30, 60 o 120 fps.
@@ -26,28 +62,7 @@ impl EditorApp {
 
     /// Duración de un cuadro de la pieza que está bajo el cursor de reproducción.
     pub(super) fn frame_at_cursor(&self) -> i64 {
-        self.locate(self.pos()).map_or(UNKNOWN_FRAME, |(i, _)| self.frame_len(&self.tl[i].path))
-    }
-
-    /// Si la pieza `i` es la que suena, le aplica su volumen ya. El reproductor es uno por archivo
-    /// y lo comparten las piezas de ese archivo: las demás toman su volumen al empezar a sonar.
-    pub(super) fn refresh_gain(&self, i: usize) {
-        if self.active != Some(i) {
-            return;
-        }
-        if let Some(p) = self.tl.get(i) {
-            if let Some(pl) = self.players.get(&p.path) {
-                pl.set_gain(p.eff_gain());
-            }
-        }
-    }
-
-    fn player(&mut self, path: &Path) -> Option<&Player> {
-        if !self.players.contains_key(path) {
-            let pr = self.loader.probe(path)?;
-            self.players.insert(path.to_path_buf(), Player::open(path.to_path_buf(), &pr, self.ctx.clone()));
-        }
-        self.players.get(path)
+        self.piece_at(self.pos()).map_or(UNKNOWN_FRAME, |(ti, i)| self.frame_len(&self.tracks[ti].clips[i].path))
     }
 
     pub(super) fn pos(&self) -> i64 {
@@ -55,70 +70,36 @@ impl EditorApp {
         if let Some(t) = self.scrub_t {
             return t;
         }
-        if let Some(i) = self.active {
-            if let (Some(p), Some(start)) = (self.tl.get(i), self.starts().get(i)) {
-                if let Some(pl) = self.players.get(&p.path) {
-                    return start + (pl.pos() - p.src_in).clamp(0, p.len());
-                }
-            }
-        }
-        self.pos_hint.clamp(0, self.total())
+        self.clock.pos().clamp(0, self.total())
     }
 
     pub(super) fn seek(&mut self, t: i64) {
         let t = t.clamp(0, self.total());
-        self.pos_hint = t;
-        self.prerolled = None;
-        let Some((i, st)) = self.locate(t) else {
-            self.active = None;
-            return;
-        };
-        if let Some(old) = self.active.filter(|&o| o != i).and_then(|o| self.tl.get(o)) {
-            if old.path != self.tl[i].path {
-                if let Some(pl) = self.players.get(&old.path) {
-                    pl.pause();
-                }
-            }
-        }
-        let piece = self.tl[i].clone();
-        let playing = self.playing;
-        if let Some(pl) = self.player(&piece.path) {
-            pl.set_gain(piece.eff_gain());
-            pl.seek(st);
-            if playing && !pl.playing() {
-                pl.play();
-            }
-        }
-        self.active = Some(i);
+        self.clock.set(t, self.playing);
+        self.sync(true);
     }
 
     fn play(&mut self) {
-        if self.tl.is_empty() {
+        if self.is_empty() {
             return;
         }
         let mut t = self.pos();
-        let last = self.tl.last().map_or(UNKNOWN_FRAME, |p| self.frame_len(&p.path));
+        let last = self.piece_at(self.total() - 1).map_or(UNKNOWN_FRAME, |(ti, i)| self.frame_len(&self.tracks[ti].clips[i].path));
         if t >= self.total() - last {
             t = 0;
         }
         self.playing = true;
-        self.seek(t);
-        if let Some(p) = self.active.and_then(|i| self.tl.get(i)).cloned() {
-            if let Some(pl) = self.players.get(&p.path) {
-                pl.play();
-            }
-        }
+        self.clock.set(t, true);
+        self.sync(true);
     }
 
     pub(super) fn pause(&mut self) {
         let pos = self.pos();
-        if let Some(p) = self.active.and_then(|i| self.tl.get(i)) {
-            if let Some(pl) = self.players.get(&p.path) {
-                pl.pause();
-            }
-        }
         self.playing = false;
-        self.pos_hint = pos;
+        self.clock.set(pos, false);
+        for v in &self.voices {
+            v.player.pause();
+        }
     }
 
     pub(super) fn toggle_play(&mut self) {
@@ -129,77 +110,136 @@ impl EditorApp {
         }
     }
 
-    /// Avanza a la siguiente pieza cuando termina la actual (y prepara la siguiente antes).
+    /// En cada cuadro: frenar al final y acomodar los reproductores a lo que hay bajo el cursor.
     pub(super) fn tick(&mut self) {
-        if !self.playing {
-            return;
+        if self.playing && self.pos() >= self.total() {
+            self.pause();
         }
-        let Some(i) = self.active else {
-            self.playing = false;
-            return;
-        };
-        let Some(piece) = self.tl.get(i).cloned() else {
-            self.playing = false;
-            return;
-        };
-        let Some(pl) = self.players.get(&piece.path) else { return };
-        let src = pl.pos();
-        let ended = src >= piece.src_out - self.frame_len(&piece.path) / 2 || (!pl.playing() && pl.shared.ended.load(Ordering::Relaxed));
-        if let Some(next) = self.tl.get(i + 1).cloned() {
-            if piece.src_out - src < 6_000_000 && self.prerolled != Some(i + 1) && next.path != piece.path {
-                if let Some(np) = self.player(&next.path) {
-                    np.set_gain(next.eff_gain());
-                    np.seek(next.src_in);
+        self.sync(false);
+    }
+
+    /// Abre, ubica y suelta reproductores según lo que se ve y se oye en el cursor (y lo que está por
+    /// empezar); pone el volumen de cada uno con sus fundidos y anota qué muestra la vista previa.
+    /// `reseek`: el cursor saltó, todos se vuelven a buscar.
+    fn sync(&mut self, reseek: bool) {
+        let t = self.pos();
+        let playing = self.playing;
+        // Lo mismo que se exporta: las pistas de video visibles y lo que suena, con sus fundidos.
+        let edit = self.edit();
+        let mut want = Vec::new();
+        let lists = edit.video.iter().map(|l| (l, true)).chain(edit.audio.iter().map(|l| (l, false)));
+        for (list, video) in lists {
+            for c in list {
+                let active = c.covers(t);
+                if !active && !(playing && c.start > t && c.start - t < PREROLL) {
+                    continue;
                 }
-                self.prerolled = Some(i + 1);
+                if !video && (c.gain <= 0.0 || !self.has_audio(&c.path)) {
+                    continue;
+                }
+                let gain = if !video && active { c.gain_at(t) } else { 0.0 };
+                let src = if active { c.src_in + t - c.start } else { c.src_in };
+                want.push(Want { id: c.id, path: c.path.clone(), video, active, src, gain });
             }
         }
-        if !ended {
-            return;
+
+        // Soltar lo que ya no hace falta.
+        let mut i = 0;
+        while i < self.voices.len() {
+            if want.iter().any(|w| w.id == self.voices[i].piece) {
+                i += 1;
+                continue;
+            }
+            let v = self.voices.remove(i);
+            v.player.pause();
+            self.idle.push(v);
         }
-        if let Some(pl) = self.players.get(&piece.path) {
-            pl.pause();
+        if self.idle.len() > IDLE_MAX {
+            self.idle.drain(..self.idle.len() - IDLE_MAX);
         }
-        match self.tl.get(i + 1).cloned() {
-            Some(next) => {
-                let pre = self.prerolled == Some(i + 1);
-                if let Some(np) = self.player(&next.path) {
-                    np.set_gain(next.eff_gain());
-                    if !pre || next.path == piece.path {
-                        np.seek(next.src_in);
+
+        for w in want {
+            let (vi, fresh) = match self.voices.iter().position(|v| v.piece == w.id) {
+                Some(i) => (i, false),
+                None => {
+                    let reuse = self.idle.iter().position(|v| v.path == w.path && v.video == w.video);
+                    let mut v = match reuse {
+                        Some(k) => self.idle.remove(k),
+                        None => {
+                            let Some(pr) = self.loader.probe(&w.path) else { continue };
+                            let player = Player::open(w.path.clone(), &pr, self.ctx.clone(), w.video);
+                            Voice { piece: 0, path: w.path.clone(), video: w.video, player, live: false }
+                        }
+                    };
+                    v.piece = w.id;
+                    self.voices.push(v);
+                    (self.voices.len() - 1, true)
+                }
+            };
+            let v = &mut self.voices[vi];
+            if fresh || reseek || (v.live && !w.active) {
+                v.player.seek(w.src);
+                if w.active && playing {
+                    if !v.player.playing() {
+                        v.player.play();
                     }
-                    np.play();
+                } else {
+                    v.player.pause();
                 }
-                self.active = Some(i + 1);
-                self.prerolled = None;
+                v.live = w.active;
+            } else if w.active && !v.live {
+                // Llegó su momento: ya está buscada en el inicio de la pieza.
+                if playing {
+                    v.player.play();
+                }
+                v.live = true;
             }
-            None => {
-                self.playing = false;
-                self.pos_hint = self.total();
-            }
+            v.player.set_gain(w.gain);
+        }
+
+        // Vista previa: las capas que se ven en el cursor, de abajo hacia arriba sobre negro.
+        let shown: Vec<(u64, f32)> = layers(&edit.video, t).into_iter().map(|(ti, i, a)| (edit.video[ti][i].id, a)).collect();
+        // Al llegar al final queda la última imagen.
+        if !shown.is_empty() || t < self.total() {
+            self.shown = shown;
         }
     }
 
     pub(super) fn update_texture(&mut self) {
-        let Some(p) = self.active.and_then(|i| self.tl.get(i)) else {
-            if self.tl.is_empty() {
-                self.tex = None;
-            }
-            return;
-        };
-        let Some(pl) = self.players.get(&p.path) else { return };
-        let gen = pl.shared.gen.load(Ordering::Relaxed);
-        if self.tex_src.0.as_deref() == Some(p.path.as_path()) && self.tex_src.1 == gen {
+        if self.is_empty() {
+            self.layers.clear();
             return;
         }
-        let frame = pl.shared.frame.lock().unwrap().clone();
-        if let Some(img) = frame {
-            match &mut self.tex {
-                Some(t) => t.set(img, egui::TextureOptions::LINEAR),
-                None => self.tex = Some(self.ctx.load_texture("preview", img, egui::TextureOptions::LINEAR)),
+        self.layers.truncate(self.shown.len());
+        for (k, &(id, alpha)) in self.shown.iter().enumerate() {
+            let Some(v) = self.voices.iter().find(|v| v.piece == id) else { continue };
+            let src = (id, v.player.shared.gen.load(Ordering::Relaxed));
+            if let Some(l) = self.layers.get_mut(k) {
+                l.alpha = alpha;
+                if l.src == src {
+                    continue;
+                }
             }
-            self.tex_src = (Some(p.path.clone()), gen);
+            let Some(img) = v.player.shared.frame.lock().unwrap().clone() else { continue };
+            let n = self.layers.len();
+            match self.layers.get_mut(k) {
+                Some(l) => {
+                    l.tex.set(img, egui::TextureOptions::LINEAR);
+                    l.src = src;
+                }
+                None if k == n => {
+                    let tex = self.ctx.load_texture(format!("preview{k}"), img, egui::TextureOptions::LINEAR);
+                    self.layers.push(Layer { tex, alpha, src });
+                }
+                None => {}
+            }
         }
+    }
+
+    /// El error del reproductor de lo que se está mostrando, si no pudo abrir el archivo.
+    pub(super) fn preview_error(&self) -> Option<String> {
+        let &(id, _) = self.shown.last()?;
+        self.voices.iter().find(|v| v.piece == id).and_then(|v| v.player.shared.error.lock().unwrap().clone())
     }
 
     pub(super) fn step(&mut self, dt: i64) {
@@ -208,20 +248,5 @@ impl EditorApp {
         }
         let t = self.pos() + dt;
         self.seek(t);
-    }
-
-    /// Muestra un cuadro de una pieza mientras se recorta.
-    pub(super) fn preview_source(&mut self, i: usize, src_t: i64) {
-        let p = self.tl[i].clone();
-        if let Some(old) = self.active.and_then(|o| self.tl.get(o)).filter(|o| o.path != p.path) {
-            if let Some(pl) = self.players.get(&old.path) {
-                pl.pause();
-            }
-        }
-        if let Some(pl) = self.player(&p.path) {
-            pl.seek(src_t);
-        }
-        self.active = Some(i);
-        self.last_seek = Instant::now();
     }
 }

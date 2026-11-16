@@ -63,12 +63,13 @@ src/
   settings/        ventana principal (mod.rs: estado; pages.rs: páginas)
   editor/          editor de clips (proceso aparte)
     mod.rs         ventana y bucle principal
-    timeline.rs    piezas, cortar, deshacer
-    playback.rs    reproducción de la secuencia
+    timeline.rs    pistas y piezas (video y audio unidos), imán, fundidos, deshacer
+    playback.rs    reproducción: un reproductor por pieza que se ve o se oye, capas y fundidos
     export.rs      diálogo y trabajo de exportación
     panels.rs      paneles y pistas
-    prefs.rs       editor.json (atajos y últimas opciones de exportación)
-    shortcuts.rs, library.rs, media.rs, player.rs, devtools.rs
+    prefs.rs       editor.json (atajos, últimas opciones de exportación, paneles, imán)
+    media.rs       exportar: copia sin recodificar o capas fundidas por GPU, mezcla de audio
+    shortcuts.rs, library.rs, player.rs, devtools.rs
   ui_kit/          estilo y widgets, ventanas nativas, íconos, sonidos
     watch.rs       despierta una ventana cuando algo cambia afuera (sin repintar en reposo)
 ```

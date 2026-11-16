@@ -38,6 +38,8 @@ pub const HOVER_DIM: Color32 = Color32::from_black_alpha(90);
 /// Pistas de la línea de tiempo y su forma de onda.
 pub const TRACK_VIDEO: Color32 = Color32::from_rgb(28, 28, 28);
 pub const TRACK_AUDIO: Color32 = Color32::from_rgb(22, 22, 22);
+/// Fondo de una pista de la línea de tiempo (donde no hay clips).
+pub const TRACK_LANE: Color32 = Color32::from_rgb(13, 13, 13);
 pub const WAVE: Color32 = Color32::from_gray(200);
 
 // --- Movimiento -------------------------------------------------------------------------
@@ -242,6 +244,12 @@ pub enum Glyph {
     /// Más y menos (agregar videos, zoom).
     Plus,
     Minus,
+    /// Ojo (ver u ocultar una pista).
+    Eye,
+    /// Imán (los clips se pegan solos).
+    Magnet,
+    /// Cuadro de video sobre una onda (separar o unir el audio y el video).
+    Detach,
 }
 
 /// Ancho del ícono y espacio hasta el texto.
@@ -305,7 +313,40 @@ fn glyph_shapes(g: Glyph, c: Pos2, col: Color32) -> Vec<Shape> {
         ],
         Glyph::Plus => vec![Shape::line_segment([p(-0.75, 0.0), p(0.75, 0.0)], st), Shape::line_segment([p(0.0, -0.75), p(0.0, 0.75)], st)],
         Glyph::Minus => vec![Shape::line_segment([p(-0.75, 0.0), p(0.75, 0.0)], st)],
+        Glyph::Eye => vec![
+            Shape::closed_line(vec![p(-1.0, 0.0), p(-0.55, -0.5), p(0.0, -0.68), p(0.55, -0.5), p(1.0, 0.0), p(0.55, 0.5), p(0.0, 0.68), p(-0.55, 0.5)], st),
+            Shape::circle_stroke(p(0.0, 0.0), 0.28 * s, st),
+        ],
+        Glyph::Magnet => vec![
+            Shape::line(vec![p(-0.75, -0.95), p(-0.75, 0.15), p(-0.6, 0.6), p(-0.25, 0.88), p(0.25, 0.88), p(0.6, 0.6), p(0.75, 0.15), p(0.75, -0.95)], st),
+            Shape::line_segment([p(-1.0, -0.45), p(-0.5, -0.45)], st),
+            Shape::line_segment([p(0.5, -0.45), p(1.0, -0.45)], st),
+        ],
+        Glyph::Detach => vec![
+            Shape::rect_stroke(Rect::from_min_max(p(-1.0, -0.95), p(1.0, -0.15)), 1.5, st),
+            Shape::line(vec![p(-1.0, 0.6), p(-0.6, 0.3), p(-0.2, 0.9), p(0.2, 0.3), p(0.6, 0.9), p(1.0, 0.6)], st),
+        ],
     }
+}
+
+/// Botón chico de solo ícono para algo que se prende y se apaga (ver una pista, su sonido).
+/// Apagado, el ícono se ve tachado y más tenue. `tip` dice qué hace.
+pub fn icon_toggle(ui: &mut egui::Ui, glyph: Glyph, on: bool, tip: &str) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let fg = if !on { MUTED } else if resp.hovered() { TEXT } else { ICON };
+        let mut shapes = Vec::new();
+        if resp.hovered() {
+            shapes.push(Shape::rect_filled(rect, 5.0, CONTROL_HOVER));
+        }
+        shapes.extend(glyph_shapes(glyph, rect.center(), fg));
+        if !on {
+            let d = egui::vec2(GLYPH_W / 2.0 + 1.0, GLYPH_W / 2.0 + 1.0);
+            shapes.push(Shape::line_segment([rect.center() - d, rect.center() + d], Stroke::new(1.6_f32, fg)));
+        }
+        paint_pressed(ui, rect.center(), press(ui, &resp), PRESS_DEPTH_ICON, shapes);
+    }
+    resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text(tip)
 }
 
 /// Botón con un ícono delante del texto; los dos quedan centrados juntos.

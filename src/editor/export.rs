@@ -8,9 +8,8 @@ use eframe::egui::{self, Align, Layout, RichText};
 
 use crate::log::file_stamp;
 use crate::ui_kit::theme::*;
-use super::media::{Progress, Segment};
+use super::media::Progress;
 use crate::mf::Mf;
-use super::library;
 use super::media;
 use super::EditorApp;
 
@@ -86,7 +85,7 @@ pub(super) struct ExportJob {
 impl EditorApp {
     /// Abre el diálogo de exportación (con las últimas opciones usadas).
     pub(super) fn export(&mut self) {
-        if self.tl.is_empty() || self.job.is_some() {
+        if self.is_empty() || self.job.is_some() {
             return;
         }
         self.pause();
@@ -102,9 +101,9 @@ impl EditorApp {
 
     /// Lo que va a salir con las opciones del diálogo.
     fn export_plan(&self, d: &ExportDialog) -> Option<ExportPlan> {
-        let first = self.tl.first()?;
-        let src = self.loader.probe(&first.path)?;
-        let total_s = (self.total() as f64 / 1e7).max(0.1);
+        let edit = self.edit();
+        let src = self.loader.probe(&edit.first_video()?.path)?;
+        let total_s = (edit.len() as f64 / 1e7).max(0.1);
         let src_fps = src.fps().max(1.0);
         let (sw, sh) = (src.width.max(2), src.height.max(2));
         let oh = if d.height == 0 || d.height >= sh { sh } else { d.height } & !1;
@@ -112,10 +111,12 @@ impl EditorApp {
         let ofps = if d.fps == 0 || d.fps as f64 >= src_fps - 0.5 { src_fps } else { d.fps as f64 };
         let original = d.height == 0 && d.fps == 0 && d.quality == Quality::Recommended;
 
-        // ¿Se puede copiar sin recodificar? Mismo formato en todas las partes y cortes en fotogramas clave.
+        // ¿Se puede copiar sin recodificar? Una sola pista de piezas pegadas, del mismo formato y con
+        // cortes en fotogramas clave.
         let info = self.loader.info.lock().unwrap();
-        let mut copy = Some(original);
-        for p in &self.tl {
+        let parts = edit.copy_parts();
+        let mut copy = Some(original && parts.is_some());
+        for p in parts.unwrap_or_default() {
             let i = info.get(&p.path);
             let same = i.and_then(|i| i.probe.as_ref()).is_some_and(|q| q.same_format(&src));
             if !same {
@@ -134,13 +135,13 @@ impl EditorApp {
                 }
             }
         }
-        let copy_size: f64 = self
-            .tl
+        let copy_size: f64 = parts
+            .unwrap_or_default()
             .iter()
             .map(|p| {
                 let size = self.assets.iter().find(|a| a.path == p.path).map(|a| a.size).unwrap_or(0) as f64;
                 let dur = info.get(&p.path).and_then(|i| i.probe.as_ref()).map(|q| q.duration).unwrap_or(1).max(1) as f64;
-                size * p.len() as f64 / dur
+                size * (p.src_out - p.src_in) as f64 / dur
             })
             .sum();
         drop(info);
@@ -173,7 +174,7 @@ impl EditorApp {
 
     pub(super) fn export_dialog(&mut self, ctx: &egui::Context) {
         let Some(mut d) = self.export_dlg.take() else { return };
-        let src = self.tl.first().and_then(|p| self.loader.probe(&p.path));
+        let src = self.edit().first_video().and_then(|c| self.loader.probe(&c.path));
         let (src_h, src_fps) = src.as_ref().map(|s| (s.height, s.fps().round() as u32)).unwrap_or((1080, 60));
         let plan = self.export_plan(&d);
         let max_h = (ctx.screen_rect().height() - 240.0).max(200.0);
@@ -278,7 +279,7 @@ impl EditorApp {
                             }
                         }
                         None => {
-                            ui.label(RichText::new("No se pudo leer el primer clip.").color(DANGER));
+                            ui.label(RichText::new("No hay video para exportar: mostrá una pista de video o agregá un clip.").color(DANGER));
                         }
                     });
                 });
@@ -334,11 +335,7 @@ impl EditorApp {
             out = d.dir.join(format!("{clean} ({n}).mp4"));
             n += 1;
         }
-        let segs: Vec<Segment> = self
-            .tl
-            .iter()
-            .map(|p| Segment { path: p.path.clone(), name: library::pretty_name(&p.path), start: p.src_in, end: p.src_out, gain: p.eff_gain() })
-            .collect();
+        let edit = self.edit();
         let target = (!plan.original).then_some(media::Target {
             height: d.height,
             fps: d.fps,
@@ -351,7 +348,7 @@ impl EditorApp {
             let (p, out, ctx) = (progress.clone(), out.clone(), self.ctx.clone());
             std::thread::spawn(move || {
                 let _mf = Mf::init();
-                let r = media::export(&segs, &out, &opts, &p);
+                let r = media::export(&edit, &out, &opts, &p);
                 if let Err(e) = &r {
                     crate::log::log(&format!("exportar: {e:?}"));
                 }

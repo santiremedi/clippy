@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use eframe::egui::text::LayoutJob;
-use eframe::egui::{self, Align, Align2, Color32, CursorIcon, FontId, Layout, Pos2, Rect, RichText, Sense, Shape, Stroke, Vec2};
+use eframe::egui::{self, Align, Align2, Color32, CursorIcon, FontId, Layout, Pos2, Rangef, Rect, RichText, Sense, Shape, Stroke, Vec2};
 
 use crate::ui_kit::theme::*;
 use crate::ui_kit::window::open_folder;
@@ -14,17 +14,19 @@ use super::library::Asset;
 use super::shortcuts::Act;
 use super::shortcuts;
 use super::library;
-use super::timeline::{MIN_LEN, Piece};
+use super::media::Curve;
+use super::timeline::{Faded, Piece, TrackKind, Trimmed, MAX_TRACKS};
 use super::EditorApp;
 
 const PAD: f32 = 16.0;
 
-const GUTTER: f32 = 74.0;
+/// Columna de la izquierda, con el nombre y los botones de cada pista.
+const GUTTER: f32 = 108.0;
 
 const RULER_H: f32 = 26.0;
 
 const LANE_GAP: f32 = 6.0;
-/// Alto mínimo de la pista de video y de la de audio al arrastrar el borde entre las dos.
+/// Alto mínimo de una pista al arrastrar el borde entre las de video y las de audio.
 const LANE_MIN: f32 = 32.0;
 
 /// Lugar debajo de las pistas para la barra de desplazamiento.
@@ -32,8 +34,10 @@ const SCROLLBAR_H: f32 = 12.0;
 
 /// Agarradera de un borde de clip, hacia adentro (en un clip corto, un tercio de su ancho).
 const GRIP: f32 = 8.0;
-/// Margen extra hacia afuera, solo en las dos puntas de la línea.
+/// Margen extra hacia afuera, donde el borde no toca otro clip.
 const GRIP_OUT: f32 = 7.0;
+/// Esquina de arriba de un clip para los fundidos: alto de la franja y ancho de la agarradera.
+const FADE_GRIP: f32 = 12.0;
 /// Arrastrando a menos de esto de un costado de la vista, la línea se desplaza sola (hasta AUTO_SCROLL px/s).
 const EDGE: f32 = 48.0;
 const AUTO_SCROLL: f32 = 900.0;
@@ -48,64 +52,106 @@ const CARD_TEXT_H: f32 = 42.0;
 pub(super) enum Drag {
     None,
     Scrub,
-    /// `press_x` se mide desde el inicio de la línea (no de la pantalla) y `pps` queda fijo mientras dura:
-    /// así el borde sigue al mouse aunque la línea se desplace o cambie de largo.
-    TrimIn { i: usize, orig: Piece, press_x: f32, pps: f32 },
-    TrimOut { i: usize, orig: Piece, press_x: f32, pps: f32, max: i64 },
-    Move { i: usize, grab_dx: f32 },
+    /// Un borde (`left`: el izquierdo) de una pieza y su pareja. `press_x` se mide desde el inicio de la línea (no
+    /// de la pantalla) y `pps` queda fijo mientras dura: así el borde sigue al mouse aunque la línea se desplace o
+    /// cambie de largo.
+    Trim { parts: Vec<Trimmed>, left: bool, press_x: f32, pps: f32 },
+    /// Una esquina de arriba (`out`: la derecha) de una pieza y su pareja: el fundido de ese lado.
+    Fade { parts: Vec<Faded>, out: bool, press_x: f32, pps: f32 },
+    Move { id: u64, grab_dx: f32 },
 }
 
-/// Índice donde quedaría la pieza `i` si su centro está en `center_x`.
-fn insert_index(xs: &[(f32, f32)], i: usize, center_x: f32) -> usize {
-    let mut idx = 0;
-    for (j, &(a, b)) in xs.iter().enumerate() {
-        if j == i {
-            continue;
-        }
-        if center_x > (a + b) / 2.0 {
-            idx = j + 1;
-        }
-    }
-    idx
-}
-
+/// Una pieza en la línea de tiempo: de `a` a `b` en x, dentro de la franja `row` de su pista. En una pista de
+/// video se ven las miniaturas; en una de audio, la forma de onda.
 #[allow(clippy::too_many_arguments)]
-fn draw_piece(painter: &egui::Painter, p: &Piece, info: Option<&library::Info>, a: f32, b: f32, vlane: Rect, alane: Rect, pps: f32, selected: bool, alpha: f32) {
-    let vr = Rect::from_min_max(Pos2::new(a + 1.0, vlane.top()), Pos2::new(b - 1.0, vlane.bottom()));
-    let ar = Rect::from_min_max(Pos2::new(a + 1.0, alane.top()), Pos2::new(b - 1.0, alane.bottom()));
-    let fade = |c: Color32| c.gamma_multiply(alpha);
-    painter.rect_filled(vr, 6.0, fade(TRACK_VIDEO));
-    painter.rect_filled(ar, 6.0, fade(TRACK_AUDIO));
-
-    // Miniaturas
-    let clip = painter.with_clip_rect(vr.shrink(1.0).intersect(painter.clip_rect()));
-    if let Some(info) = info {
-        if !info.thumbs.is_empty() {
-            let tile_w = (vr.height() * 16.0 / 9.0).floor();
-            let mut x = vr.left();
-            while x < vr.right() {
-                let t = p.src_in + ((x - vr.left() + tile_w / 2.0) / pps * 1e7) as i64;
+fn draw_piece(painter: &egui::Painter, p: &Piece, info: Option<&library::Info>, (a, b): (f32, f32), row: Rect, video: bool, pps: f32, selected: bool, alpha: f32, xfade: (i64, i64)) {
+    let r = Rect::from_min_max(Pos2::new(a + 1.0, row.top()), Pos2::new(b - 1.0, row.bottom()));
+    painter.rect_filled(r, 6.0, (if video { TRACK_VIDEO } else { TRACK_AUDIO }).gamma_multiply(alpha));
+    if video {
+        // Miniaturas
+        let clip = painter.with_clip_rect(r.shrink(1.0).intersect(painter.clip_rect()));
+        if let Some(info) = info.filter(|i| !i.thumbs.is_empty()) {
+            let tile_w = (r.height() * 16.0 / 9.0).floor().max(8.0);
+            let mut x = r.left();
+            while x < r.right() {
+                let t = p.src_in + ((x - r.left() + tile_w / 2.0) / pps * 1e7) as i64;
                 let k = info.thumbs.partition_point(|(tt, _)| *tt <= t).saturating_sub(1);
                 let tex = &info.thumbs[k].1;
-                let r = Rect::from_min_size(Pos2::new(x, vr.top()), egui::vec2(tile_w, vr.height()));
-                clip.image(tex.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE.gamma_multiply(alpha));
+                let tile = Rect::from_min_size(Pos2::new(x, r.top()), egui::vec2(tile_w, r.height()));
+                clip.image(tex.id(), tile, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE.gamma_multiply(alpha));
                 x += tile_w;
             }
         }
+    } else {
+        draw_wave(painter, p, info, r, pps, alpha);
     }
-    // Etiqueta
-    if vr.width() > 70.0 {
+    // Fundidos a negro (o a silencio): lo que todavía no se ve o no se oye, oscuro sobre la curva.
+    let curve = if video { Curve::Linear } else { p.curve };
+    for (out, fade, crossed) in [(false, p.fade_in, xfade.0 > 0), (true, p.fade_out, xfade.1 > 0)] {
+        let w = fade as f32 / 1e7 * pps;
+        if crossed || w < 1.0 {
+            continue;
+        }
+        // Del lado de afuera el nivel es 0 (abajo); hacia adentro sube hasta 1 (arriba).
+        let at = |k: f32| {
+            let x = if out { r.right() - w * k } else { r.left() + w * k };
+            Pos2::new(x, r.bottom() - r.height() * curve.shape(k))
+        };
+        let corner = Pos2::new(if out { r.right() } else { r.left() }, r.top());
+        let pts: Vec<Pos2> = (0..=16).map(|k| at(k as f32 / 16.0)).collect();
+        let mut mesh = egui::Mesh::default();
+        let shade = BLACK.gamma_multiply(0.55 * alpha);
+        mesh.colored_vertex(corner, shade);
+        for q in &pts {
+            mesh.colored_vertex(*q, shade);
+        }
+        for k in 1..pts.len() as u32 {
+            mesh.add_triangle(0, k, k + 1);
+        }
+        painter.with_clip_rect(r.intersect(painter.clip_rect())).add(Shape::mesh(mesh));
+        painter.add(Shape::line(pts, Stroke::new(1.0_f32, WHITE.gamma_multiply(0.8 * alpha))));
+    }
+    // Etiqueta: en la imagen, y en el sonido solo si va suelto (si no, ya la tiene su pareja).
+    if (video || p.link == 0) && r.width() > 70.0 && r.height() >= 22.0 {
         let label = format!("{}  ·  {}", library::pretty_name(&p.path), fmt_len(p.len()));
-        let g = one_line(painter, label, FontId::proportional(11.5), vr.width() - 22.0);
-        let lr = Rect::from_min_size(vr.min + egui::vec2(6.0, 6.0), g.size() + egui::vec2(10.0, 4.0));
-        painter.rect_filled(lr, 4.0, BADGE);
-        painter.galley(lr.min + egui::vec2(5.0, 2.0), g, WHITE);
+        let g = one_line(painter, label, FontId::proportional(11.5), r.width() - 22.0);
+        let badge = Rect::from_min_size(r.min + egui::vec2(6.0, 4.0), g.size() + egui::vec2(10.0, 4.0));
+        painter.rect_filled(badge, 4.0, BADGE);
+        painter.galley(badge.min + egui::vec2(5.0, 2.0), g, WHITE.gamma_multiply(alpha.max(0.6)));
     }
 
-    // Forma de onda
+    // Borde y agarraderas
+    if selected {
+        painter.rect_stroke(r, 6.0, Stroke::new(2.0_f32, WHITE));
+        for x in [r.left() + 3.0, r.right() - 3.0] {
+            let h = Rect::from_center_size(Pos2::new(x, r.center().y), egui::vec2(6.0, r.height()));
+            painter.rect_filled(h, 3.0, WHITE);
+            painter.line_segment([Pos2::new(x, r.center().y - 8.0), Pos2::new(x, r.center().y + 8.0)], Stroke::new(1.0_f32, BLACK));
+        }
+    } else {
+        painter.rect_stroke(r, 6.0, Stroke::new(1.0_f32, LINE));
+    }
+}
+
+/// Agarraderas de las esquinas de arriba de una pieza (x de cada una), dentro de `r`.
+fn draw_corners(painter: &egui::Painter, (cin, cout): (f32, f32), r: Rect) {
+    for c in [Pos2::new(cin.max(r.left()) + 4.0, r.top() + 4.0), Pos2::new(cout.min(r.right()) - 4.0, r.top() + 4.0)] {
+        let h = Rect::from_center_size(c, egui::vec2(7.0, 7.0));
+        painter.rect_filled(h, 2.0, WHITE);
+        painter.rect_stroke(h, 2.0, Stroke::new(1.0_f32, BLACK));
+    }
+}
+
+/// Forma de onda del audio de la pieza en `ar`.
+fn draw_wave(painter: &egui::Painter, p: &Piece, info: Option<&library::Info>, ar: Rect, pps: f32, alpha: f32) {
     let clip = painter.with_clip_rect(ar.shrink(1.0).intersect(painter.clip_rect()));
     let mid = ar.center().y;
-    let half = ar.height() / 2.0 - 5.0;
+    let half = (ar.height() / 2.0 - 4.0).max(1.0);
+    let note = |text: &str| {
+        if ar.width() > 80.0 && ar.height() >= 18.0 {
+            clip.text(Pos2::new(ar.left() + 8.0, mid), Align2::LEFT_CENTER, text, FontId::proportional(11.5), MUTED);
+        }
+    };
     match info.and_then(|i| i.wave.as_ref()) {
         Some(w) if !p.muted => {
             // Una barra por píxel de pantalla, alineada a la grilla (sin huecos ni rayas al arrastrar).
@@ -137,40 +183,23 @@ fn draw_piece(painter: &egui::Painter, p: &Piece, info: Option<&library::Info>, 
         }
         Some(_) => {
             clip.hline(ar.x_range(), mid, Stroke::new(1.0_f32, MUTED));
-            if ar.width() > 80.0 {
-                clip.text(Pos2::new(ar.left() + 8.0, mid), Align2::LEFT_CENTER, "Silenciado", FontId::proportional(11.5), MUTED);
-            }
+            note("Silenciado");
         }
-        None => {
-            if ar.width() > 80.0 {
-                clip.text(Pos2::new(ar.left() + 8.0, mid), Align2::LEFT_CENTER, "Cargando audio…", FontId::proportional(11.5), MUTED);
-            }
-        }
-    }
-
-    // Borde y agarraderas
-    let outer = Rect::from_min_max(vr.min, Pos2::new(vr.right(), ar.bottom()));
-    if selected {
-        painter.rect_stroke(vr, 6.0, Stroke::new(2.0_f32, WHITE));
-        painter.rect_stroke(ar, 6.0, Stroke::new(2.0_f32, WHITE));
-        for x in [vr.left() + 3.0, vr.right() - 3.0] {
-            let h = Rect::from_center_size(Pos2::new(x, outer.center().y), egui::vec2(6.0, outer.height()));
-            painter.rect_filled(h, 3.0, WHITE);
-            painter.line_segment([Pos2::new(x, outer.center().y - 8.0), Pos2::new(x, outer.center().y + 8.0)], Stroke::new(1.0_f32, BLACK));
-        }
-    } else {
-        painter.rect_stroke(vr, 6.0, Stroke::new(1.0_f32, LINE));
-        painter.rect_stroke(ar, 6.0, Stroke::new(1.0_f32, LINE));
+        None => note("Cargando audio…"),
     }
 }
 
-/// Alto de las pistas de video y de audio cuando todo (regla incluida) mide `tracks_h`. `split` es la
-/// parte del alto que usa el video (la elige el usuario arrastrando el borde entre las dos pistas).
-fn lanes(tracks_h: f32, split: f32) -> (f32, f32) {
-    let avail = (tracks_h - RULER_H - 2.0 * LANE_GAP).max(0.0);
-    let min = LANE_MIN.min(avail / 2.0);
-    let video = (avail * split).clamp(min, avail - min);
-    (video, avail - video)
+/// Alto de cada pista de video y de cada pista de audio cuando todas, regla incluida, miden `h`. `split` es la
+/// parte del alto que usan las de video si también hay de audio (la elige el usuario arrastrando el borde).
+fn lanes(h: f32, split: f32, nv: usize, na: usize) -> (f32, f32) {
+    let avail = (h - RULER_H - (nv + na) as f32 * LANE_GAP).max(0.0);
+    let (fv, fa) = (nv.max(1) as f32, na as f32);
+    if na == 0 {
+        return (avail / fv, 0.0);
+    }
+    let min = LANE_MIN.min(avail / (fv + fa));
+    let video = (avail * split).clamp(min * fv, avail - min * fa);
+    (video / fv, (avail - video) / fa)
 }
 
 /// Regla: "0:12" en los segundos enteros y "0:12.5" en los medios.
@@ -275,7 +304,7 @@ impl EditorApp {
                             .text(RichText::new(format!("Exportando… {:.0}%", p * 100.0)).color(BLACK)),
                     );
                 } else {
-                    let enabled = !self.tl.is_empty();
+                    let enabled = !self.is_empty();
                     let r = ui.add_enabled_ui(enabled, |ui| icon_button(ui, Glyph::Export, "Exportar video", Kind::Primary, egui::vec2(164.0, 36.0))).inner;
                     if r.clicked() {
                         self.export();
@@ -338,7 +367,7 @@ impl EditorApp {
             let gap = 10.0;
             let w = ((ui.available_width() - gap) / 2.0).floor();
             let card = egui::vec2(w, (w * 9.0 / 16.0).round() + CARD_TEXT_H);
-            let used: HashSet<&Path> = self.tl.iter().map(|p| p.path.as_path()).collect();
+            let used: HashSet<&Path> = self.tracks.iter().flat_map(|t| t.clips.iter().map(|p| p.path.as_path())).collect();
             // Solo se arman las filas que se ven: la carpeta puede tener cientos de clips.
             egui::ScrollArea::vertical()
                 .id_salt("lib")
@@ -391,12 +420,13 @@ impl EditorApp {
         }
     }
 
+
     pub(super) fn preview(&mut self, ui: &mut egui::Ui) {
         let rect = ui.available_rect_before_wrap();
         let resp = ui.allocate_rect(rect, Sense::click());
         let p = ui.painter();
         p.rect_filled(rect, 8.0, Color32::BLACK);
-        if self.tl.is_empty() {
+        if self.is_empty() {
             p.text(rect.center() - egui::vec2(0.0, 12.0), Align2::CENTER_CENTER, "Tu video aparece acá", FontId::proportional(20.0), TEXT);
             p.text(
                 rect.center() + egui::vec2(0.0, 16.0),
@@ -407,21 +437,19 @@ impl EditorApp {
             );
             return;
         }
-        let err = self
-            .active
-            .and_then(|i| self.tl.get(i))
-            .and_then(|pc| self.players.get(&pc.path))
-            .and_then(|pl| pl.shared.error.lock().unwrap().clone());
-        if let Some(e) = err {
+        if let Some(e) = self.preview_error() {
             let mut job = LayoutJob::simple(e, FontId::proportional(14.0), MUTED, (rect.width() - 48.0).clamp(120.0, 480.0));
             job.halign = Align::Center;
             let g = p.layout_job(job);
             p.galley(Pos2::new(rect.center().x, rect.center().y - g.size().y / 2.0), g, MUTED);
-        } else if let Some(t) = &self.tex {
-            let s = t.size_vec2();
-            let scale = (rect.width() / s.x).min(rect.height() / s.y);
-            let img = Rect::from_center_size(rect.center(), s * scale);
-            p.image(t.id(), img, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+        } else {
+            // Donde dos piezas se funden, la de arriba va encima con su transparencia.
+            for l in &self.layers {
+                let s = l.tex.size_vec2();
+                let scale = (rect.width() / s.x).min(rect.height() / s.y);
+                let img = Rect::from_center_size(rect.center(), s * scale);
+                p.image(l.tex.id(), img, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE.gamma_multiply(l.alpha));
+            }
         }
         if resp.clicked() {
             self.toggle_play();
@@ -431,7 +459,7 @@ impl EditorApp {
     pub(super) fn props_panel(&mut self, ui: &mut egui::Ui) {
         ui.label(RichText::new("Clip").family(bold()).size(17.0).color(TEXT));
         ui.add_space(6.0);
-        let Some(i) = self.selected.and_then(|id| self.index_of(id)) else {
+        let Some((ti, i)) = self.selection() else {
             ui.label(RichText::new("Tocá un clip en la línea de tiempo para editarlo.").color(MUTED));
             ui.add_space(18.0);
             caption(ui, "Atajos");
@@ -449,14 +477,20 @@ impl EditorApp {
             }
             ui.add_space(14.0);
             caption(ui, "Recortar");
-            ui.label(RichText::new("Arrastrá los bordes de un clip en la línea de tiempo. Arrastralo del medio para cambiarlo de lugar.").size(13.0).color(MUTED));
+            ui.label(RichText::new("Arrastrá los bordes de un clip en la línea de tiempo. Arrastralo del medio para cambiarlo de lugar o de pista.").size(13.0).color(MUTED));
+            ui.add_space(14.0);
+            caption(ui, "Fundidos");
+            ui.label(
+                RichText::new("Arrastrá una esquina de arriba de un clip para que aparezca desde negro o se vaya a negro. Si toca a otro clip, esa esquina hace que se fundan uno en el otro.")
+                    .size(13.0)
+                    .color(MUTED),
+            );
             return;
         };
-        let p = self.tl[i].clone();
-        let start = self.starts()[i];
-        ui.label(RichText::new(library::pretty_name(&p.path)).color(TEXT));
+        let p = self.tracks[ti].clips[i].clone();
+        ui.add(egui::Label::new(RichText::new(library::pretty_name(&p.path)).color(TEXT)).truncate());
         ui.label(
-            RichText::new(format!("Dura {}  ·  en la línea {}", fmt_time(p.len()), fmt_time(start)))
+            RichText::new(format!("{}  ·  dura {}  ·  empieza en {}", self.track_name(ti), fmt_time(p.len()), fmt_time(p.start)))
                 .size(12.5)
                 .color(MUTED),
         );
@@ -466,46 +500,76 @@ impl EditorApp {
         ui.add_space(14.0);
 
         caption(ui, "Audio de este clip");
-        let before = self.tl.clone();
-        let mut on = !p.muted;
-        let mut vol = (p.gain * 100.0).round() as u32;
-        let mut changed = false;
-        let mut start_edit = false;
-        ui.horizontal(|ui| {
-            let r = toggle(ui, &mut on).on_hover_text(if on { "Silenciar" } else { "Activar sonido" });
-            if r.changed() {
-                changed = true;
-                start_edit = true;
+        let audio = self.selected_audio();
+        if !self.has_audio(&p.path) {
+            ui.label(RichText::new("Este clip no tiene audio.").size(13.0).color(MUTED));
+        } else if audio.is_none() {
+            ui.label(RichText::new("Está separado: lo encontrás en una pista de audio.").size(13.0).color(MUTED));
+        } else if let Some((ta, ia)) = audio {
+            let p = self.tracks[ta].clips[ia].clone();
+            let before = self.tracks.clone();
+            let mut on = !p.muted;
+            let mut vol = (p.gain * 100.0).round() as u32;
+            let mut changed = false;
+            let mut start_edit = false;
+            ui.horizontal(|ui| {
+                let r = toggle(ui, &mut on).on_hover_text(if on { "Silenciar" } else { "Activar sonido" });
+                if r.changed() {
+                    changed = true;
+                    start_edit = true;
+                }
+                ui.label(RichText::new(if on { "Con sonido" } else { "Silenciado" }).color(if on { TEXT } else { MUTED }));
+            });
+            ui.add_enabled_ui(on, |ui| {
+                ui.spacing_mut().slider_width = ui.available_width() - 70.0;
+                let r = ui.add(egui::Slider::new(&mut vol, 0..=200).suffix(" %"));
+                if r.changed() {
+                    changed = true;
+                }
+                if r.drag_started() || (r.changed() && !r.dragged()) {
+                    start_edit = true;
+                }
+            });
+            if changed {
+                self.dirty = true;
+                if start_edit {
+                    self.record_undo(before.clone());
+                }
+                let c = &mut self.tracks[ta].clips[ia];
+                c.muted = !on;
+                c.gain = vol as f32 / 100.0;
             }
-            ui.label(RichText::new(if on { "Con sonido" } else { "Silenciado" }).color(if on { TEXT } else { MUTED }));
-        });
-        ui.add_enabled_ui(on, |ui| {
-            ui.spacing_mut().slider_width = ui.available_width() - 70.0;
-            let r = ui.add(egui::Slider::new(&mut vol, 0..=200).suffix(" %"));
-            if r.changed() {
-                changed = true;
-            }
-            if r.drag_started() || (r.changed() && !r.dragged()) {
-                start_edit = true;
-            }
-        });
-        if changed {
-            self.dirty = true;
-            if start_edit {
+            ui.add_space(6.0);
+            ui.label(RichText::new("Curva de los fundidos").size(12.5).color(MUTED));
+            let mut curve = p.curve;
+            let r = ui.scope(|ui| seg(ui, &mut curve, &[(Curve::Even, "Pareja"), (Curve::Linear, "Lineal"), (Curve::Smooth, "Suave")]));
+            r.response.on_hover_text("Pareja: al cruzarse con otro clip el volumen no baja. Lineal: en línea recta. Suave: arranca y termina despacio.");
+            if r.inner {
                 self.record_undo(before);
+                self.tracks[ta].clips[ia].curve = curve;
             }
-            self.tl[i].muted = !on;
-            self.tl[i].gain = vol as f32 / 100.0;
-            self.refresh_gain(i);
         }
         ui.add_space(18.0);
         caption(ui, "Acciones");
-        for act in [Act::Split, Act::Duplicate, Act::MuteClip, Act::Delete] {
-            let text = format!("{}   ·   {}", act.label(), shortcuts::short(&self.prefs.keys, act));
+        let mut acts = vec![Act::Split, Act::Duplicate];
+        if audio.is_some() {
+            acts.push(Act::MuteClip);
+        }
+        if self.can_link() {
+            acts.push(Act::Link);
+        }
+        acts.push(Act::Delete);
+        for act in acts {
+            let label = match act {
+                Act::Link => self.link_label(),
+                _ => act.label(),
+            };
+            let text = format!("{label}   ·   {}", shortcuts::short(&self.prefs.keys, act));
             let glyph = match act {
                 Act::Split => Glyph::Scissors,
                 Act::Duplicate => Glyph::Duplicate,
                 Act::MuteClip => Glyph::Speaker,
+                Act::Link => Glyph::Detach,
                 _ => Glyph::Trash,
             };
             if button_fit(ui, Some(glyph), &text, Kind::Secondary, egui::vec2(ui.available_width(), 36.0)).clicked() {
@@ -520,12 +584,13 @@ impl EditorApp {
         // Barra de herramientas
         let pos = self.pos();
         let total = self.total();
-        let has_sel = self.selected.and_then(|id| self.index_of(id)).is_some();
+        let has_sel = self.selection().is_some();
+        let empty = self.is_empty();
         ui.horizontal(|ui| {
             ui.set_height(40.0);
             let third = ui.available_width() / 3.0;
             ui.allocate_ui_with_layout(egui::vec2(third, 40.0), Layout::left_to_right(Align::Center), |ui| {
-                ui.add_enabled_ui(!self.tl.is_empty(), |ui| {
+                ui.add_enabled_ui(!empty, |ui| {
                     if icon_button(ui, Glyph::Scissors, "Dividir", Kind::Secondary, Vec2::ZERO).on_hover_text(format!("Cortar en el cursor ({})", shortcuts::short(&self.prefs.keys, Act::Split))).clicked() {
                         self.split();
                     }
@@ -535,13 +600,19 @@ impl EditorApp {
                         self.delete_selected();
                     }
                 });
+                ui.add_enabled_ui(self.can_link(), |ui| {
+                    let tip = format!("{} ({})", self.link_label(), shortcuts::short(&self.prefs.keys, Act::Link));
+                    if icon_only_button(ui, Glyph::Detach, Kind::Secondary, &tip).clicked() {
+                        self.toggle_link();
+                    }
+                });
             });
             ui.allocate_ui_with_layout(egui::vec2(third, 40.0), Layout::left_to_right(Align::Center), |ui| {
                 let time = format!("{}  /  {}", fmt_time(pos), fmt_time(total));
                 let tw = ui.painter().layout_no_wrap(time.clone(), FontId::proportional(15.0), TEXT).size().x;
                 let group = 36.0 + 12.0 + tw;
                 ui.add_space(((third - group) / 2.0).max(0.0));
-                ui.add_enabled_ui(!self.tl.is_empty(), |ui| {
+                ui.add_enabled_ui(!empty, |ui| {
                     if play_button(ui, self.playing, 36.0).on_hover_text(format!("Reproducir / pausar ({})", shortcuts::short(&self.prefs.keys, Act::PlayPause))).clicked() {
                         self.toggle_play();
                     }
@@ -557,7 +628,7 @@ impl EditorApp {
                 if icon_only_button(ui, Glyph::Plus, Kind::Ghost, &tip).clicked() {
                     self.run_action(Act::ZoomIn);
                 }
-                ui.spacing_mut().slider_width = 110.0;
+                ui.spacing_mut().slider_width = 90.0;
                 let mut zoom = self.zoom;
                 if ui.add(egui::Slider::new(&mut zoom, 1.0..=ZOOM_MAX).logarithmic(true).show_value(false)).changed() {
                     self.zoom_to = Some((zoom, None));
@@ -567,6 +638,17 @@ impl EditorApp {
                     self.run_action(Act::ZoomOut);
                 }
                 ui.label(RichText::new("Zoom").size(13.0).color(MUTED));
+                ui.add_space(8.0);
+                let magnet = self.prefs.magnet;
+                let key = shortcuts::short(&self.prefs.keys, Act::Magnet);
+                let tip = if magnet {
+                    format!("Imán prendido: los clips se pegan solos ({key})")
+                } else {
+                    format!("Imán apagado: los clips quedan donde los soltás y, si se superponen, se funden ({key})")
+                };
+                if icon_only_button(ui, Glyph::Magnet, if magnet { Kind::Secondary } else { Kind::Ghost }, &tip).clicked() {
+                    self.run_action(Act::Magnet);
+                }
             });
         });
         ui.add_space(6.0);
@@ -576,14 +658,79 @@ impl EditorApp {
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
             let (g, _) = ui.allocate_exact_size(egui::vec2(GUTTER, tracks_h), Sense::hover());
-            let (video_h, audio_h) = lanes(tracks_h, self.prefs.lane_split);
-            let p = ui.painter();
-            let vy = g.top() + RULER_H + LANE_GAP;
-            let ay = vy + video_h + LANE_GAP;
-            p.text(Pos2::new(g.left() + 4.0, vy + video_h / 2.0), Align2::LEFT_CENTER, "Video", FontId::proportional(13.0), MUTED);
-            p.text(Pos2::new(g.left() + 4.0, ay + audio_h / 2.0), Align2::LEFT_CENTER, "Audio", FontId::proportional(13.0), MUTED);
+            self.track_headers(ui, g);
             self.tracks(ui, tracks_h);
         });
+    }
+
+    /// Franja vertical de cada pista, de arriba hacia abajo, si todo (regla incluida) empieza en `top` y mide `h`.
+    fn rows(&self, top: f32, h: f32) -> Vec<(usize, Rangef)> {
+        let (vh, ah) = lanes(h, self.prefs.lane_split, self.count(TrackKind::Video), self.count(TrackKind::Audio));
+        let mut y = top + RULER_H;
+        self.display_order()
+            .into_iter()
+            .map(|ti| {
+                let rh = if self.tracks[ti].kind == TrackKind::Video { vh } else { ah };
+                y += LANE_GAP + rh;
+                (ti, Rangef::new(y - rh, y))
+            })
+            .collect()
+    }
+
+    /// Columna de la izquierda: el botón para agregar pistas y, en cada una, su nombre y los botones para verla
+    /// y oírla. Con el botón derecho sobre una pista se la quita.
+    fn track_headers(&mut self, ui: &mut egui::Ui, g: Rect) {
+        let size = egui::vec2(GUTTER - 10.0, RULER_H - 2.0);
+        let r = ui.put(Rect::from_min_size(g.min + egui::vec2(0.0, 1.0), size), |ui: &mut egui::Ui| icon_button(ui, Glyph::Plus, "Pista", Kind::Ghost, size));
+        let menu = ui.id().with("add_track");
+        if r.clicked() {
+            ui.memory_mut(|m| m.toggle_popup(menu));
+        }
+        let mut add = None;
+        egui::popup_below_widget(ui, menu, &r, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+            ui.set_min_width(150.0);
+            for (kind, label) in [(TrackKind::Video, "Pista de video"), (TrackKind::Audio, "Pista de audio")] {
+                let b = ui.add_enabled(self.count(kind) < MAX_TRACKS, egui::Button::new(label));
+                if b.clicked() {
+                    add = Some(kind);
+                }
+                b.on_disabled_hover_text(format!("Hasta {MAX_TRACKS} pistas de cada tipo"));
+            }
+        });
+        // Qué tocaron: (pista, false = ocultar o silenciar, true = quitar).
+        let mut act = None;
+        let one_video = self.count(TrackKind::Video) == 1;
+        for (ti, yr) in self.rows(g.top(), g.height()) {
+            let t = &self.tracks[ti];
+            let row = Rect::from_x_y_ranges(g.x_range(), yr);
+            let removable = t.kind == TrackKind::Audio || !one_video;
+            ui.interact(row, ui.id().with(("track", t.id)), Sense::click()).context_menu(|ui| {
+                let b = ui.add_enabled(removable, egui::Button::new("Quitar pista")).on_disabled_hover_text("Siempre queda al menos una pista de video");
+                if b.clicked() {
+                    act = Some((ti, true));
+                    ui.close_menu();
+                }
+            });
+            let x = row.right() - 22.0;
+            let (glyph, on, tip) = match t.kind {
+                TrackKind::Video => (Glyph::Eye, !t.hidden, if t.hidden { "Mostrar la pista" } else { "Ocultar la pista" }),
+                TrackKind::Audio => (Glyph::Speaker, !t.muted, if t.muted { "Activar el sonido de la pista" } else { "Silenciar la pista" }),
+            };
+            let at = Rect::from_center_size(Pos2::new(x, row.center().y), Vec2::splat(24.0));
+            if ui.put(at, |ui: &mut egui::Ui| icon_toggle(ui, glyph, on, tip)).clicked() {
+                act = Some((ti, false));
+            }
+            let name = one_line(ui.painter(), self.track_name(ti), FontId::proportional(12.5), x - 16.0 - row.left());
+            ui.painter().galley(Pos2::new(row.left() + 4.0, row.center().y - name.size().y / 2.0), name, MUTED);
+        }
+        match act {
+            Some((ti, false)) => self.toggle_track(ti),
+            Some((ti, true)) => self.remove_track(ti),
+            None => {}
+        }
+        if let Some(k) = add {
+            self.add_track(k);
+        }
     }
 
     /// Acerca (k > 1) o aleja la línea de tiempo. Se aplica al dibujarla, con el cursor de reproducción quieto.
@@ -599,7 +746,7 @@ impl EditorApp {
         let total_s = (total as f32 / 1e7).max(1.0);
         let fit = ((view_w - 2.0 * PAD) / total_s).max(1.0);
         let frozen = match self.drag {
-            Drag::TrimIn { pps, .. } | Drag::TrimOut { pps, .. } => Some(pps),
+            Drag::Trim { pps, .. } | Drag::Fade { pps, .. } => Some(pps),
             _ => None,
         };
 
@@ -662,24 +809,34 @@ impl EditorApp {
         self.scroll_x = out.state.offset.x;
     }
 
-    /// Dónde se ve cada pieza (x de inicio y fin), con `tx` de tiempo a x. Durante un recorte por la izquierda
-    /// el borde derecho queda quieto; recién soltado un clip, cada pieza se desliza desde donde se veía.
-    fn piece_xs(&mut self, ui: &egui::Ui, tx: impl Fn(i64) -> f32) -> Vec<(f32, f32)> {
-        let mut xs: Vec<(f32, f32)> = self.tl.iter().zip(self.starts()).map(|(p, s)| (tx(s), tx(s + p.len()))).collect();
-        if let Drag::TrimIn { i, orig, .. } = &self.drag {
-            let shift = tx(self.tl[*i].src_in) - tx(orig.src_in);
-            for x in xs.iter_mut().skip(*i) {
-                x.0 += shift;
-                x.1 += shift;
+    /// Dónde se ve cada pieza (x de inicio y fin, por pista), con `tx` de tiempo a x. Con el imán, durante un
+    /// recorte por la izquierda el borde derecho queda quieto; recién soltado un clip, cada pieza se desliza
+    /// desde donde se veía.
+    fn piece_xs(&mut self, ui: &egui::Ui, tx: impl Fn(i64) -> f32) -> Vec<Vec<(f32, f32)>> {
+        let mut xs: Vec<Vec<(f32, f32)>> = self.tracks.iter().map(|t| t.clips.iter().map(|p| (tx(p.start), tx(p.end()))).collect()).collect();
+        if let Drag::Trim { parts, left: true, .. } = &self.drag {
+            if self.prefs.magnet {
+                for t in parts {
+                    let (ti, i) = t.at;
+                    let shift = tx(self.tracks[ti].clips[i].src_in) - tx(t.orig.src_in);
+                    for x in xs[ti].iter_mut().skip(i) {
+                        x.0 += shift;
+                        x.1 += shift;
+                    }
+                }
             }
         }
         if let Some((t0, from)) = self.settle.take() {
             let p = ((ui.input(|i| i.time) - t0) as f32 / T_SETTLE).min(1.0);
-            if p < 1.0 && from.len() == xs.len() {
+            if p < 1.0 {
                 let k = 1.0 - ease_out(p);
-                for (x, d) in xs.iter_mut().zip(&from) {
-                    x.0 += d * k;
-                    x.1 += d * k;
+                for (t, row) in self.tracks.iter().zip(xs.iter_mut()) {
+                    for (pc, x) in t.clips.iter().zip(row.iter_mut()) {
+                        if let Some(&(_, d)) = from.iter().find(|(id, _)| *id == pc.id) {
+                            x.0 += d * k;
+                            x.1 += d * k;
+                        }
+                    }
                 }
                 self.settle = Some((t0, from));
                 ui.ctx().request_repaint();
@@ -693,42 +850,70 @@ impl EditorApp {
         let tx = |t: i64| x0 + t as f32 / 1e7 * pps;
         let xt = |x: f32| ((x - x0) / pps * 1e7) as i64;
         let ruler = Rect::from_min_size(rect.min, egui::vec2(rect.width(), RULER_H));
-        let vtop = ruler.bottom() + LANE_GAP;
-        // Borde entre video y audio: se arrastra (como el de los paneles) y el alto se reparte al instante.
-        // Toma el clic y el arrastre de esa franja, así no se mueve el cursor ni un clip debajo.
-        let (video_h, _) = lanes(rect.height(), self.prefs.lane_split);
-        let split_rect = Rect::from_min_max(Pos2::new(rect.left(), vtop + video_h - 2.0), Pos2::new(rect.right(), vtop + video_h + LANE_GAP + 2.0));
-        let split = ui.interact(split_rect, ui.id().with("lane_split"), Sense::click_and_drag());
-        if let Some(p) = split.interact_pointer_pos().filter(|_| split.dragged()) {
-            let (v, a) = lanes(rect.height(), (p.y - vtop - LANE_GAP / 2.0) / (rect.height() - RULER_H - 2.0 * LANE_GAP).max(1.0));
-            self.prefs.lane_split = v / (v + a).max(1.0);
-        }
-        if split.drag_stopped() {
-            self.prefs.save();
-        }
-        let on_split = split.hovered() || split.dragged();
-        let (video_h, audio_h) = lanes(rect.height(), self.prefs.lane_split);
-        let vlane = Rect::from_min_size(Pos2::new(rect.left(), vtop), egui::vec2(rect.width(), video_h));
-        let alane = Rect::from_min_size(Pos2::new(rect.left(), vlane.bottom() + LANE_GAP), egui::vec2(rect.width(), audio_h));
+        let (nv, na) = (self.count(TrackKind::Video), self.count(TrackKind::Audio));
+        let mut rows = self.rows(rect.top(), rect.height());
+        // Borde entre las pistas de video y las de audio: se arrastra (como el de los paneles) y el alto se reparte
+        // al instante. Toma el clic y el arrastre de esa franja, así no se mueve el cursor ni un clip debajo.
+        let split = (na > 0).then(|| {
+            let y = rows[nv - 1].1.max;
+            let band = Rect::from_min_max(Pos2::new(rect.left(), y - 2.0), Pos2::new(rect.right(), y + LANE_GAP + 2.0));
+            let r = ui.interact(band, ui.id().with("lane_split"), Sense::click_and_drag());
+            if let Some(p) = r.interact_pointer_pos().filter(|_| r.dragged()) {
+                let avail = (rect.height() - RULER_H - (nv + na) as f32 * LANE_GAP).max(1.0);
+                let video = p.y - ruler.bottom() - nv as f32 * LANE_GAP - LANE_GAP / 2.0;
+                let (v, a) = lanes(rect.height(), video / avail, nv, na);
+                self.prefs.lane_split = v * nv as f32 / (v * nv as f32 + a * na as f32).max(1.0);
+                rows = self.rows(rect.top(), rect.height());
+            }
+            if r.drag_stopped() {
+                self.prefs.save();
+            }
+            r
+        });
+        let on_split = split.as_ref().is_some_and(|r| r.hovered() || r.dragged());
+        let lanes_bottom = rows.last().map_or(ruler.bottom(), |r| r.1.max);
+        let row_of = |ti: usize| rows.iter().find(|r| r.0 == ti).map(|r| r.1);
         let xs = self.piece_xs(ui, tx);
 
         // --- Interacción ---
         let pointer = resp.interact_pointer_pos().or(resp.hover_pos());
-        let last = xs.len().saturating_sub(1);
-        // Qué hay en (x, y): pieza y -1 = borde izquierdo, 0 = medio, 1 = borde derecho.
-        let hit = |x: f32, y: f32| -> Option<(usize, i32)> {
-            if y < vlane.top() || y > alane.bottom() {
-                return None;
+        // Esquinas de arriba de cada pieza, en x.
+        let corners: Vec<Vec<(f32, f32)>> = (0..self.tracks.len())
+            .map(|ti| {
+                (0..self.tracks[ti].clips.len())
+                    .map(|i| {
+                        let (a, b) = self.fade_handles(ti, i);
+                        (tx(a), tx(b))
+                    })
+                    .collect()
+            })
+            .collect();
+        // Qué hay en (x, y): pista, pieza y -1 = borde izquierdo, 0 = medio, 1 = borde derecho, 2 y 3 = esquinas
+        // de arriba (fundidos). Donde dos se superponen manda la de arriba (la que empieza después).
+        let hit = |x: f32, y: f32| -> Option<(usize, usize, i32)> {
+            let &(ti, yr) = rows.iter().find(|(_, yr)| yr.contains(y))?;
+            let row = &xs[ti];
+            if y <= yr.min + FADE_GRIP {
+                for i in (0..row.len()).rev() {
+                    let (cin, cout) = corners[ti][i];
+                    if (x - cout).abs() <= FADE_GRIP / 2.0 && x <= row[i].1 + 2.0 {
+                        return Some((ti, i, 3));
+                    }
+                    if (x - cin).abs() <= FADE_GRIP / 2.0 && x >= row[i].0 - 2.0 {
+                        return Some((ti, i, 2));
+                    }
+                }
             }
-            xs.iter().enumerate().find_map(|(i, &(a, b))| {
-                // Entre dos clips, cada lado del corte es del clip que está de ese lado.
-                let lo = if i == 0 { a - GRIP_OUT } else { a };
-                let hi = if i == last { b + GRIP_OUT } else { b };
+            (0..row.len()).rev().find_map(|i| {
+                let (a, b) = row[i];
+                // Entre dos clips pegados, cada lado del corte es del clip que está de ese lado.
+                let lo = if i == 0 || row[i - 1].1 < a - 1.0 { a - GRIP_OUT } else { a };
+                let hi = if i + 1 == row.len() || row[i + 1].0 > b + 1.0 { b + GRIP_OUT } else { b };
                 if x < lo || x > hi {
                     return None;
                 }
                 let g = ((b - a) / 3.0).min(GRIP);
-                Some((i, if x <= a + g { -1 } else if x >= b - g { 1 } else { 0 }))
+                Some((ti, i, if x <= a + g { -1 } else if x >= b - g { 1 } else { 0 }))
             })
         };
         // Apretar en la regla o fuera de los clips lleva el cursor ahí en el acto, y desde ahí se arrastra.
@@ -743,19 +928,16 @@ impl EditorApp {
         if resp.drag_started() && matches!(self.drag, Drag::None) {
             let press = ui.input(|i| i.pointer.press_origin()).or(pointer).unwrap_or_default();
             let press_x = press.x - rect.left();
-            self.drag_before = Some(self.tl.clone());
+            self.drag_before = Some(self.tracks.clone());
             self.pause();
             self.drag = match hit(press.x, press.y) {
-                Some((i, -1)) => Drag::TrimIn { i, orig: self.tl[i].clone(), press_x, pps },
-                Some((i, 1)) => {
-                    let max = self.loader.probe(&self.tl[i].path).map(|p| p.duration).unwrap_or(self.tl[i].src_out);
-                    Drag::TrimOut { i, orig: self.tl[i].clone(), press_x, pps, max }
-                }
-                Some((i, _)) => Drag::Move { i, grab_dx: press.x - xs[i].0 },
+                Some((ti, i, corner @ 2..)) => Drag::Fade { parts: self.start_fade(ti, i, corner == 3), out: corner == 3, press_x, pps },
+                Some((ti, i, side)) if side != 0 => Drag::Trim { parts: self.start_trim(ti, i), left: side < 0, press_x, pps },
+                Some((ti, i, _)) => Drag::Move { id: self.tracks[ti].clips[i].id, grab_dx: press.x - xs[ti][i].0 },
                 None => Drag::Scrub,
             };
-            if let Drag::TrimIn { i, .. } | Drag::TrimOut { i, .. } | Drag::Move { i, .. } = &self.drag {
-                self.selected = Some(self.tl[*i].id);
+            if let Some((ti, i, _)) = hit(press.x, press.y) {
+                self.selected = Some(self.tracks[ti].clips[i].id);
             }
         }
         if resp.is_pointer_button_down_on() {
@@ -769,7 +951,7 @@ impl EditorApp {
                             self.scrub_t = Some(t);
                             ui.ctx().request_repaint(); // la hora de la barra se dibujó antes que esto
                         }
-                        if t != self.pos_hint {
+                        if t != self.clock.pos() {
                             if pressed || throttle {
                                 self.seek(t);
                                 self.last_seek = Instant::now();
@@ -778,18 +960,21 @@ impl EditorApp {
                             }
                         }
                     }
-                    Drag::TrimIn { i, orig, press_x, .. } => {
-                        let dt = ((h.x - rect.left() - press_x) / pps * 1e7) as i64;
-                        self.tl[i].src_in = (orig.src_in + dt).clamp(0, orig.src_out - MIN_LEN);
+                    Drag::Trim { parts, left, press_x, .. } => {
+                        self.trim(&parts, left, ((h.x - rect.left() - press_x) / pps * 1e7) as i64);
                         if throttle {
-                            self.preview_source(i, self.tl[i].src_in);
+                            let p = &self.tracks[parts[0].at.0].clips[parts[0].at.1];
+                            let t = if left { p.start } else { p.end() - self.frame_len(&p.path) };
+                            self.seek(t);
+                            self.last_seek = Instant::now();
                         }
                     }
-                    Drag::TrimOut { i, orig, press_x, max, .. } => {
-                        let dt = ((h.x - rect.left() - press_x) / pps * 1e7) as i64;
-                        self.tl[i].src_out = (orig.src_out + dt).clamp(orig.src_in + MIN_LEN, max);
+                    Drag::Fade { parts, out, press_x, .. } => {
+                        self.fade(&parts, out, ((h.x - rect.left() - press_x) / pps * 1e7) as i64);
                         if throttle {
-                            self.preview_source(i, self.tl[i].src_out - self.frame_len(&self.tl[i].path));
+                            let (a, b) = self.fade_handles(parts[0].at.0, parts[0].at.1);
+                            self.seek(if out { b - self.frame_at_cursor() } else { a });
+                            self.last_seek = Instant::now();
                         }
                     }
                     Drag::Move { .. } | Drag::None => {}
@@ -799,32 +984,38 @@ impl EditorApp {
             // Se soltó (o Esc cortó el arrastre).
             let before = self.drag_before.take();
             match std::mem::replace(&mut self.drag, Drag::None) {
-                Drag::TrimIn { i, .. } => {
-                    let s = self.starts()[i];
+                Drag::Trim { parts, left, .. } => {
+                    let p = &self.tracks[parts[0].at.0].clips[parts[0].at.1];
+                    let s = if left { p.start } else { p.end() - self.frame_len(&p.path) };
                     self.commit(before, s);
                 }
-                Drag::TrimOut { i, .. } => {
-                    let s = self.starts()[i] + self.tl[i].len() - self.frame_len(&self.tl[i].path);
-                    self.commit(before, s);
+                Drag::Fade { parts, out, .. } => {
+                    let (a, b) = self.fade_handles(parts[0].at.0, parts[0].at.1);
+                    self.commit(before, if out { b - self.frame_at_cursor() } else { a });
                 }
-                Drag::Move { i, grab_dx } => {
-                    if let Some(h) = pointer {
+                Drag::Move { id, grab_dx } => {
+                    if let (Some(h), Some((ti, _))) = (pointer, self.find(id)) {
                         let a = h.x - grab_dx;
-                        let target = insert_index(&xs, i, a + (xs[i].1 - xs[i].0) / 2.0);
-                        let t = if target > i { target - 1 } else { target };
-                        // Dónde se ve cada pieza al soltar (la arrastrada, bajo el mouse), en el orden nuevo.
-                        let mut was: Vec<f32> = xs.iter().map(|x| x.0).collect();
-                        was[i] = a;
-                        if t != i {
-                            let p = self.tl.remove(i);
-                            self.tl.insert(t, p);
-                            let w = was.remove(i);
-                            was.insert(t, w);
-                            let s = self.starts()[t];
+                        // Va a la pista del mismo tipo que esté bajo el mouse (si no, se queda en la suya).
+                        let kind = self.tracks[ti].kind;
+                        let to = rows.iter().find(|(k, yr)| yr.contains(h.y) && self.tracks[*k].kind == kind).map_or(ti, |r| r.0);
+                        // Dónde se ve cada pieza al soltar (la arrastrada, bajo el mouse).
+                        let mut was: Vec<(u64, f32)> = Vec::new();
+                        for (t, row) in self.tracks.iter().zip(&xs) {
+                            was.extend(t.clips.iter().zip(row).map(|(p, x)| (p.id, x.0)));
+                        }
+                        if let Some(w) = was.iter_mut().find(|w| w.0 == id) {
+                            w.1 = a;
+                        }
+                        if self.drop_piece(id, to, xt(a)) {
+                            let s = self.find(id).map_or(0, |(ti, i)| self.tracks[ti].clips[i].start);
                             self.commit(before, s);
                         }
                         if !reduced_motion() {
-                            let from = self.starts().iter().zip(&was).map(|(&s, &w)| w - tx(s)).collect();
+                            let mut from = Vec::new();
+                            for t in &self.tracks {
+                                from.extend(t.clips.iter().filter_map(|p| was.iter().find(|w| w.0 == p.id).map(|w| (p.id, w.1 - tx(p.start)))));
+                            }
                             self.settle = Some((ui.input(|i| i.time), from));
                         }
                     }
@@ -832,7 +1023,7 @@ impl EditorApp {
                 Drag::Scrub | Drag::None => {
                     let t = pointer.map_or(self.pos(), |h| xt(h.x)).clamp(0, self.total());
                     self.scrub_t = None;
-                    if t != self.pos_hint {
+                    if t != self.clock.pos() {
                         self.seek(t);
                     }
                 }
@@ -841,9 +1032,9 @@ impl EditorApp {
         let cursor = match &self.drag {
             _ if on_split => Some(CursorIcon::ResizeVertical),
             Drag::Move { .. } => Some(CursorIcon::Grabbing),
-            Drag::TrimIn { .. } | Drag::TrimOut { .. } => Some(CursorIcon::ResizeHorizontal),
+            Drag::Trim { .. } | Drag::Fade { .. } => Some(CursorIcon::ResizeHorizontal),
             Drag::Scrub | Drag::None => resp.hover_pos().and_then(|h| match hit(h.x, h.y) {
-                Some((_, 0)) => Some(CursorIcon::Grab),
+                Some((_, _, 0)) => Some(CursorIcon::Grab),
                 Some(_) => Some(CursorIcon::ResizeHorizontal),
                 None => ruler.contains(h).then_some(CursorIcon::PointingHand),
             }),
@@ -854,19 +1045,19 @@ impl EditorApp {
         if resp.clicked() {
             if let Some(h) = pointer {
                 match hit(h.x, h.y) {
-                    Some((i, _)) => self.selected = Some(self.tl[i].id),
+                    Some((ti, i, _)) => self.selected = Some(self.tracks[ti].clips[i].id),
                     None if !ruler.contains(h) => self.selected = None,
                     None => {}
                 }
                 let t = xt(h.x).clamp(0, self.total());
-                if t != self.pos_hint {
+                if t != self.clock.pos() {
                     self.seek(t);
                 }
             }
         }
 
         // --- Dibujo ---
-        // Soltar pudo cambiar la línea (orden, largos): se dibuja como quedó.
+        // Soltar pudo cambiar la línea (orden, largos, pistas): se dibuja como quedó.
         let xs = self.piece_xs(ui, tx);
         let painter = ui.painter_at(rect);
         // Regla
@@ -885,47 +1076,99 @@ impl EditorApp {
             s += step;
         }
         painter.hline(rect.x_range(), ruler.bottom(), Stroke::new(1.0_f32, LINE));
+        for (_, yr) in &rows {
+            painter.rect_filled(Rect::from_x_y_ranges(rect.x_range(), *yr), 4.0, TRACK_LANE);
+        }
 
-        if self.tl.is_empty() {
-            let r = Rect::from_min_max(Pos2::new(x0, vlane.top()), Pos2::new(rect.right() - PAD, alane.bottom()));
+        if self.is_empty() {
+            let r = Rect::from_min_max(Pos2::new(x0, ruler.bottom() + LANE_GAP), Pos2::new(rect.right() - PAD, lanes_bottom));
             painter.rect_stroke(r, 8.0, Stroke::new(1.0_f32, CONTROL_HOVER));
             painter.text(r.center(), Align2::CENTER_CENTER, "Hacé clic en un video de la biblioteca o arrastralo acá", FontId::proportional(14.0), MUTED);
             return;
         }
 
+        let hovered = resp.hover_pos().and_then(|h| hit(h.x, h.y)).map(|(ti, i, _)| self.tracks[ti].clips[i].id);
         let info = self.loader.info.clone();
         let info = info.lock().unwrap();
-        let moving = if let Drag::Move { i, .. } = self.drag { Some(i) } else { None };
-        for (i, p) in self.tl.iter().enumerate() {
-            if Some(i) == moving {
-                continue;
+        let moving = if let Drag::Move { id, .. } = self.drag { self.group(id) } else { Vec::new() };
+        for (ti, t) in self.tracks.iter().enumerate() {
+            let Some(yr) = row_of(ti) else { continue };
+            let row = Rect::from_x_y_ranges(rect.x_range(), yr);
+            let video = t.kind == TrackKind::Video;
+            // Lo que no se ve (pista oculta) o no se oye (pista muda) queda tenue.
+            let alpha = if t.hidden || t.muted { 0.4 } else { 1.0 };
+            let overlaps = t.overlaps();
+            for (i, (p, &x)) in t.clips.iter().zip(&xs[ti]).enumerate() {
+                if !moving.contains(&(ti, i)) {
+                    draw_piece(&painter, p, info.get(&p.path), x, row, video, pps, self.is_selected(p), alpha, overlaps[i]);
+                }
             }
-            let (a, b) = xs[i];
-            draw_piece(&painter, p, info.get(&p.path), a, b, vlane, alane, pps, self.selected == Some(p.id), 1.0);
+            // Fundidos cruzados: una cruz sobre lo que se superponen.
+            for (i, &(fin, _)) in overlaps.iter().enumerate() {
+                if fin <= 0 || moving.contains(&(ti, i)) {
+                    continue;
+                }
+                let a = xs[ti][i].0;
+                let r = Rect::from_min_max(Pos2::new(a, row.top() + 1.0), Pos2::new(a + fin as f32 / 1e7 * pps, row.bottom() - 1.0));
+                painter.rect_filled(r, 0.0, WHITE.gamma_multiply(0.12));
+                let st = Stroke::new(1.0_f32, WHITE.gamma_multiply(0.7));
+                painter.line_segment([r.left_bottom(), r.right_top()], st);
+                painter.line_segment([r.left_top(), r.right_bottom()], st);
+            }
+            // Agarraderas de los fundidos, encima de todo: en lo elegido y bajo el mouse.
+            for (i, p) in t.clips.iter().enumerate() {
+                if !moving.contains(&(ti, i)) && (self.is_selected(p) || hovered == Some(p.id)) {
+                    draw_corners(&painter, corners[ti][i], Rect::from_x_y_ranges(Rangef::new(xs[ti][i].0 + 1.0, xs[ti][i].1 - 1.0), yr));
+                }
+            }
         }
-        // Pieza que se está moviendo: sigue al mouse y una barra marca dónde va a quedar.
-        if let (Some(i), Some(h)) = (moving, pointer) {
-            if let Drag::Move { grab_dx, .. } = self.drag {
-                let w = xs[i].1 - xs[i].0;
-                let a = h.x - grab_dx;
-                let target = insert_index(&xs, i, a + w / 2.0);
-                let bar_x = if target < xs.len() { xs[target].0 } else { xs.last().map(|x| x.1).unwrap_or(x0) };
-                painter.rect_filled(Rect::from_center_size(Pos2::new(bar_x - 1.0, (vlane.top() + alane.bottom()) / 2.0), egui::vec2(3.0, alane.bottom() - vlane.top() + 6.0)), 1.5, WHITE);
-                let p = &self.tl[i];
-                let lift = egui::vec2(0.0, -4.0);
-                draw_piece(&painter, p, info.get(&p.path), a, a + w, vlane.translate(lift), alane.translate(lift), pps, true, 0.75);
+        // Pieza que se está moviendo (con su pareja): sigue al mouse, en la pista donde caería. Con el imán, una
+        // barra marca dónde va a quedar.
+        let moved = if let Drag::Move { id, grab_dx } = self.drag { self.find(id).map(|at| (id, grab_dx, at)) } else { None };
+        if let (Some((id, grab_dx, (ti, i))), Some(h)) = (moved, pointer) {
+            let kind = self.tracks[ti].kind;
+            let to = rows.iter().find(|(k, yr)| yr.contains(h.y) && self.tracks[*k].kind == kind).map_or(ti, |r| r.0);
+            let dx = h.x - grab_dx - xs[ti][i].0;
+            for &(tj, j) in &moving {
+                let p = &self.tracks[tj].clips[j];
+                let dest = if p.id == id { to } else { tj };
+                let (a, b) = (xs[tj][j].0 + dx, xs[tj][j].1 + dx);
+                let row = Rect::from_x_y_ranges(rect.x_range(), row_of(dest).unwrap_or(rows[0].1));
+                if self.prefs.magnet {
+                    let center = xt((a + b) / 2.0);
+                    let others: Vec<usize> = (0..self.tracks[dest].clips.len()).filter(|&k| !moving.contains(&(dest, k))).collect();
+                    let k = others.iter().filter(|&&k| self.tracks[dest].clips[k].start + self.tracks[dest].clips[k].len() / 2 < center).count();
+                    let bar_x = match others.get(k) {
+                        Some(&k) => xs[dest][k].0,
+                        None => others.last().map_or(x0, |&k| xs[dest][k].1),
+                    };
+                    painter.rect_filled(Rect::from_center_size(Pos2::new(bar_x - 1.0, row.center().y), egui::vec2(3.0, row.height() + 6.0)), 1.5, WHITE);
+                }
+                let video = self.tracks[dest].kind == TrackKind::Video;
+                draw_piece(&painter, p, info.get(&p.path), (a, b), row.translate(egui::vec2(0.0, -4.0)), video, pps, true, 0.75, self.tracks[tj].overlaps()[j]);
             }
         }
 
-        // El borde entre pistas se marca con el mouse encima (sin fundido) y más claro mientras se arrastra.
-        if on_split {
-            let y = vlane.bottom() + LANE_GAP / 2.0;
-            painter.hline(rect.x_range(), y, Stroke::new(2.0_f32, if split.dragged() { TEXT } else { BORDER }));
+        // Mientras se arrastra una esquina, cuánto dura ese fundido.
+        if let (Drag::Fade { parts, out, .. }, Some(h)) = (&self.drag, pointer) {
+            let (crossed, len) = self.fade_len(&parts[0], *out);
+            let text = format!("{} {}", if crossed { "Fundido" } else if *out { "Se va en" } else { "Aparece en" }, fmt_len(len));
+            let g = painter.layout_no_wrap(text, FontId::proportional(12.0), WHITE);
+            let r = Rect::from_min_size(Pos2::new(h.x + 12.0, h.y - g.size().y - 12.0), g.size() + egui::vec2(12.0, 6.0));
+            painter.rect_filled(r, 4.0, BADGE);
+            painter.galley(r.min + egui::vec2(6.0, 3.0), g, WHITE);
+        }
+
+        // El borde entre las pistas de video y las de audio se marca con el mouse encima (sin fundido) y más
+        // claro mientras se arrastra.
+        if let Some(r) = split.filter(|_| on_split) {
+            let y = rows[nv - 1].1.max + LANE_GAP / 2.0;
+            painter.hline(rect.x_range(), y, Stroke::new(2.0_f32, if r.dragged() { TEXT } else { BORDER }));
         }
 
         // Cursor de reproducción
         let px = tx(self.pos());
-        painter.line_segment([Pos2::new(px, ruler.top() + 6.0), Pos2::new(px, alane.bottom())], Stroke::new(2.0_f32, WHITE));
+        painter.line_segment([Pos2::new(px, ruler.top() + 6.0), Pos2::new(px, lanes_bottom)], Stroke::new(2.0_f32, WHITE));
         painter.rect_filled(Rect::from_center_size(Pos2::new(px, ruler.top() + 8.0), egui::vec2(12.0, 14.0)), 3.0, WHITE);
     }
 }

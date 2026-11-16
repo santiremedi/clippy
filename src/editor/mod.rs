@@ -1,6 +1,6 @@
 //! Editor de clips estilo CapCut (proceso aparte: `clippy.exe --editor`).
 //! Biblioteca a la izquierda, vista previa al centro, propiedades a la derecha y
-//! línea de tiempo abajo con pista de video (miniaturas) y de audio (forma de onda).
+//! línea de tiempo abajo con pistas de video (miniaturas) y de audio (forma de onda).
 //! Al cerrar la ventana el proceso termina.
 
 mod library;
@@ -15,7 +15,6 @@ mod timeline;
 #[cfg(feature = "devtools")]
 pub mod devtools;
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -32,8 +31,9 @@ use crate::ui_kit::window::{maximize_once, single_instance, window_options};
 use shortcuts::Act;
 use library::{Asset, Loader};
 use prefs::Prefs;
-use player::Player;
-use timeline::Piece;
+use player::Clock;
+use playback::{Layer, Voice};
+use timeline::{Track, TrackKind};
 use export::{ExportDialog, ExportJob};
 use panels::Drag;
 
@@ -70,19 +70,20 @@ struct EditorApp {
     /// Avisa cuando cambia la carpeta de clips o la config (por ejemplo, un clip recién guardado).
     watcher: Watcher,
 
-    tl: Vec<Piece>,
+    tracks: Vec<Track>,
     next_id: u64,
     selected: Option<u64>,
-    undo: Vec<Vec<Piece>>,
-    redo: Vec<Vec<Piece>>,
+    undo: Vec<Vec<Track>>,
+    redo: Vec<Vec<Track>>,
 
-    players: HashMap<PathBuf, Player>,
-    active: Option<usize>,
+    /// Dónde está el cursor de reproducción y si avanza.
+    clock: Clock,
     playing: bool,
-    prerolled: Option<usize>,
-    pos_hint: i64,
-    tex: Option<egui::TextureHandle>,
-    tex_src: (Option<PathBuf>, u64),
+    voices: Vec<Voice>,
+    idle: Vec<Voice>,
+    /// Piezas que muestra la vista previa (de abajo hacia arriba) y cuánto se ve cada una.
+    shown: Vec<(u64, f32)>,
+    layers: Vec<Layer>,
 
     zoom: f32,
     /// Zoom pedido (botones, deslizador, teclado o Ctrl + rueda); se aplica al dibujar la línea de tiempo,
@@ -91,12 +92,12 @@ struct EditorApp {
     scroll_x: f32,
     set_scroll: Option<f32>,
     drag: Drag,
-    drag_before: Option<Vec<Piece>>,
+    drag_before: Option<Vec<Track>>,
     last_seek: Instant,
     /// Mientras se arrastra el cursor de reproducción: el tiempo bajo el mouse.
     scrub_t: Option<i64>,
     /// Recién soltado un clip en otro lugar: cuándo y cuántos px le faltan a cada pieza para llegar.
-    settle: Option<(f64, Vec<f32>)>,
+    settle: Option<(f64, Vec<(u64, f32)>)>,
 
     job: Option<ExportJob>,
     message: Option<(bool, String, Option<PathBuf>)>,
@@ -194,18 +195,17 @@ impl EditorApp {
             assets: Vec::new(),
             imported,
             watcher,
-            tl: Vec::new(),
-            next_id: 1,
+            tracks: vec![Track::new(1, TrackKind::Video), Track::new(2, TrackKind::Audio)],
+            next_id: 2,
             selected: None,
             undo: Vec::new(),
             redo: Vec::new(),
-            players: HashMap::new(),
-            active: None,
+            clock: Clock::new(),
             playing: false,
-            prerolled: None,
-            pos_hint: 0,
-            tex: None,
-            tex_src: (None, 0),
+            voices: Vec::new(),
+            idle: Vec::new(),
+            shown: Vec::new(),
+            layers: Vec::new(),
             zoom: 1.0,
             zoom_to: None,
             scroll_x: 0.0,
@@ -227,6 +227,8 @@ impl EditorApp {
             cfg_mtime: config::config_mtime(),
         };
         app.scan();
+        #[cfg(feature = "devtools")]
+        app.load_test_timeline();
         if let Some(f) = file {
             app.import(vec![f], true);
         }
@@ -294,6 +296,11 @@ impl EditorApp {
             Act::Duplicate => self.duplicate_selected(),
             Act::Delete => self.delete_selected(),
             Act::MuteClip => self.toggle_mute_selected(),
+            Act::Link => self.toggle_link(),
+            Act::Magnet => {
+                self.prefs.magnet = !self.prefs.magnet;
+                self.prefs.save();
+            }
             Act::Undo => self.undo(),
             Act::Redo => self.redo(),
             Act::ZoomIn => self.zoom_by(1.5),
@@ -373,7 +380,7 @@ impl EditorApp {
 
     /// Si hay cambios sin exportar (o se está exportando), preguntar antes de cerrar.
     fn close_guard(&mut self, ctx: &egui::Context) {
-        let risky = (self.dirty && !self.tl.is_empty()) || self.job.is_some();
+        let risky = (self.dirty && !self.is_empty()) || self.job.is_some();
         if ctx.input(|i| i.viewport().close_requested()) && risky && !self.allow_close {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.confirm_close = true;
