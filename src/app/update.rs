@@ -336,7 +336,6 @@ fn http_get(url: &str) -> Result<Vec<u8>> {
         )?;
         match status {
             200 => {}
-            // GitHub corta a las 60 consultas por hora por IP; con IP compartida (CGNAT, VPN) se llega rápido.
             403 | 429 => bail!("GitHub está limitando las consultas desde tu conexión. Probá de nuevo en un rato"),
             _ => bail!("el servidor respondió {status}"),
         }
