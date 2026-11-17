@@ -20,8 +20,20 @@ pub struct Packet {
     pub key: bool,
 }
 
+/// Cada cuánto se pide un fotograma clave (100 ns): permite recortar el buffer al segundo exacto.
+const KEY_EVERY: i64 = 10_000_000;
+
+/// Si pasa esto sin fotogramas clave, el buffer no se puede recortar ni el clip empezar bien (100 ns).
+const KEY_LATE: i64 = 5 * KEY_EVERY;
+
 pub struct Encoder {
     mft: IMFTransform,
+    api: Option<ICodecAPI>,
+    /// Antes de esto no se vuelve a pedir un fotograma clave a mano.
+    next_key: i64,
+    last_key: i64,
+    /// Ya se avisó en el log que el encoder no genera fotogramas clave.
+    warned_keys: bool,
     events: IMFMediaEventGenerator,
     _mgr: IMFDXGIDeviceManager,
     pub pending_input: u32,
@@ -51,13 +63,14 @@ impl Encoder {
             mgr.ResetDevice(device, token)?;
             mft.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, mgr.as_raw() as usize)?;
 
-            if let Ok(api) = mft.cast::<ICodecAPI>() {
+            let api = mft.cast::<ICodecAPI>().ok();
+            if let Some(api) = &api {
                 let set = |g: &GUID, v: VARIANT| {
                     let _ = api.SetValue(g, &v);
                 };
                 set(&CODECAPI_AVEncCommonRateControlMode, VARIANT::from(eAVEncCommonRateControlMode_UnconstrainedVBR.0 as u32));
                 set(&CODECAPI_AVEncCommonMeanBitRate, VARIANT::from(bitrate));
-                // Un fotograma clave por segundo: permite recortar el buffer al segundo exacto.
+                // Un fotograma clave por segundo (si no aparecen, `feed` los pide a mano: hay encoders que ignoran esto).
                 set(&CODECAPI_AVEncMPVGOPSize, VARIANT::from(fps));
                 set(&CODECAPI_AVEncMPVDefaultBPictureCount, VARIANT::from(0u32));
                 set(&CODECAPI_AVLowLatencyMode, VARIANT::from(true));
@@ -88,6 +101,10 @@ impl Encoder {
 
             Ok(Self {
                 mft,
+                api,
+                next_key: 0,
+                last_key: 0,
+                warned_keys: false,
                 events,
                 _mgr: mgr,
                 pending_input: 0,
@@ -162,7 +179,16 @@ impl Encoder {
             let data: Arc<[u8]> = std::slice::from_raw_parts(p, len as usize).into();
             mb.Unlock()?;
 
-            let key = clean || is_keyframe(&data);
+            // Un clip tiene que empezar en una imagen IDR: con otra imagen "limpia" (I sin IDR, que algunos
+            // encoders marcan igual) los reproductores muestran negro o verde hasta el próximo IDR.
+            // Si la salida no es Annex B no se puede mirar adentro y vale la marca del encoder.
+            let key = if is_annex_b(&data) { is_keyframe(&data) } else { clean };
+            if key {
+                self.last_key = pts;
+            } else if pts - self.last_key > KEY_LATE && !self.warned_keys {
+                self.warned_keys = true;
+                log(&format!("el encoder {} no genera fotogramas clave: los clips pueden salir negros o verdes", self.name));
+            }
             if key && self.seq_header.is_none() {
                 let ps = param_sets(&data);
                 if !ps.is_empty() {
@@ -176,6 +202,13 @@ impl Encoder {
 
     pub fn feed(&mut self, tex: &ID3D11Texture2D, pts: i64, dur: i64) -> Result<()> {
         unsafe {
+            // Solo si el encoder no generó uno solo (con margen: los paquetes salen unos cuadros después).
+            if pts >= self.next_key && pts - self.last_key > KEY_EVERY * 3 / 2 {
+                self.next_key = pts + KEY_EVERY;
+                if let Some(api) = &self.api {
+                    let _ = api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &VARIANT::from(1u32));
+                }
+            }
             let buf = MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, tex, 0, false)?;
             if let Ok(b2) = buf.cast::<IMF2DBuffer>() {
                 if let Ok(len) = b2.GetContiguousLength() {
@@ -314,6 +347,11 @@ fn nals(d: &[u8]) -> Vec<&[u8]> {
 
 fn nal_type(n: &[u8]) -> u8 {
     n[0] & 0x1f
+}
+
+/// ¿Empieza con un código de inicio (00 00 01 o 00 00 00 01)?
+fn is_annex_b(d: &[u8]) -> bool {
+    d.starts_with(&[0, 0, 1]) || d.starts_with(&[0, 0, 0, 1])
 }
 
 /// ¿Hay una imagen IDR (NAL 5)?
