@@ -47,8 +47,8 @@ pub(super) struct Piece {
     /// Cuánto tarda en aparecer desde negro (o silencio) y en irse.
     pub(super) fade_in: i64,
     pub(super) fade_out: i64,
-    /// Forma de los fundidos del sonido.
-    pub(super) curve: Curve,
+    /// Forma del fundido de entrada y del de salida (cada uno se elige con clic derecho sobre él).
+    pub(super) curves: (Curve, Curve),
 }
 
 impl Piece {
@@ -310,11 +310,12 @@ impl EditorApp {
         let vt = self.first_track(TrackKind::Video);
         let start = self.tracks[vt].end();
         let id = self.new_id();
-        let mut p = Piece { id, path: path.to_path_buf(), start, src_in: 0, src_out: pr.duration, gain: 1.0, muted: false, link: 0, fade_in: 0, fade_out: 0, curve: Curve::default() };
+        let mut p = Piece { id, path: path.to_path_buf(), start, src_in: 0, src_out: pr.duration, gain: 1.0, muted: false, link: 0, fade_in: 0, fade_out: 0, curves: (Curve::Linear, Curve::Linear) };
         if pr.audio.is_some() {
             p.link = self.new_id();
             let mut a = p.clone();
             a.id = self.new_id();
+            a.curves = (Curve::Even, Curve::Even);
             let at = self.first_track(TrackKind::Audio);
             self.tracks[at].put(a, false);
         }
@@ -480,6 +481,21 @@ impl EditorApp {
         self.tracks[tj].sort();
         let pos = self.pos();
         self.after_edit(pos);
+    }
+
+    /// Cambia la curva de los fundidos `targets` (pieza y si es el de salida).
+    pub(super) fn set_curve(&mut self, targets: &[(u64, bool)], curve: Curve) {
+        self.push_undo();
+        for &(id, out) in targets {
+            if let Some((ti, i)) = self.find(id) {
+                let c = &mut self.tracks[ti].clips[i].curves;
+                if out {
+                    c.1 = curve;
+                } else {
+                    c.0 = curve;
+                }
+            }
+        }
     }
 
     pub(super) fn add_track(&mut self, kind: TrackKind) {
@@ -731,7 +747,7 @@ impl EditorApp {
                 .map(|(p, xfade)| {
                     let gain = if t.sounds() { p.eff_gain() } else { 0.0 };
                     let fade = (p.fade_in, p.fade_out);
-                    Clip { id: p.id, path: p.path.clone(), start: p.start, src_in: p.src_in, src_out: p.src_out, fade, xfade, gain, curve: p.curve }
+                    Clip { id: p.id, path: p.path.clone(), start: p.start, src_in: p.src_in, src_out: p.src_out, fade, xfade, gain, curves: p.curves }
                 })
                 .collect();
             match t.kind {

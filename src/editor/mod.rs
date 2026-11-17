@@ -98,6 +98,8 @@ struct EditorApp {
     scrub_t: Option<i64>,
     /// Mientras se arrastra un borde o una esquina con el imán: el punto donde quedó enganchado.
     snap: Option<i64>,
+    /// Fundidos sobre los que se hizo clic derecho (pieza y si es el de salida): a qué se le cambia la curva.
+    curve_menu: Vec<(u64, bool)>,
     /// Recién soltado un clip en otro lugar: cuándo y cuántos px le faltan a cada pieza para llegar.
     settle: Option<(f64, Vec<(u64, f32)>)>,
 
@@ -217,6 +219,7 @@ impl EditorApp {
             last_seek: Instant::now(),
             scrub_t: None,
             snap: None,
+            curve_menu: Vec::new(),
             settle: None,
             job: None,
             message: None,

@@ -37,7 +37,7 @@ fn parts(args: &[String]) -> BTreeMap<String, Vec<Clip>> {
         let fade = (tok.next().map_or(0, secs), tok.next().map_or(0, secs));
         let start = at.unwrap_or_else(|| tracks.get(&names[0]).and_then(|l| l.last()).map_or(0, Clip::end));
         for n in names {
-            let clip = Clip { id: k as u64 + 1, path: PathBuf::from(&c[1]), start, src_in: secs(&c[2]), src_out: secs(&c[3]), fade, xfade: (0, 0), gain, curve: media::Curve::default() };
+            let clip = Clip { id: k as u64 + 1, path: PathBuf::from(&c[1]), start, src_in: secs(&c[2]), src_out: secs(&c[3]), fade, xfade: (0, 0), gain, curves: Default::default() };
             tracks.entry(n).or_default().push(clip);
         }
     }
@@ -72,7 +72,7 @@ impl EditorApp {
                 self.next_id += 1;
                 let link = if shared(c.id) { 1000 + c.id } else { 0 };
                 let (fade_in, fade_out) = c.fade;
-                let p = Piece { id: self.next_id, path: c.path.clone(), start: c.start, src_in: c.src_in, src_out: c.src_out, gain: c.gain, muted: false, link, fade_in, fade_out, curve: c.curve };
+                let p = Piece { id: self.next_id, path: c.path.clone(), start: c.start, src_in: c.src_in, src_out: c.src_out, gain: c.gain, muted: false, link, fade_in, fade_out, curves: c.curves };
                 self.tracks[ti].clips.push(p);
                 self.loader.want_strip(&c.path);
             }

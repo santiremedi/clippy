@@ -89,8 +89,8 @@ fn draw_piece(painter: &egui::Painter, p: &Piece, info: Option<&library::Info>, 
         draw_wave(painter, p, info, r, pps, alpha);
     }
     // Fundidos a negro (o a silencio): lo que todavía no se ve o no se oye, oscuro sobre la curva.
-    let curve = if video { Curve::Linear } else { p.curve };
     for (out, fade, crossed) in [(false, p.fade_in, xfade.0 > 0), (true, p.fade_out, xfade.1 > 0)] {
+        let curve = if out { p.curves.1 } else { p.curves.0 };
         let w = fade as f32 / 1e7 * pps;
         if crossed || w < 1.0 {
             continue;
@@ -488,7 +488,7 @@ impl EditorApp {
             ui.add_space(14.0);
             caption(ui, "Fundidos");
             ui.label(
-                RichText::new("Arrastrá una esquina de arriba de un clip para que aparezca desde negro o se vaya a negro. Si toca a otro clip, esa esquina hace que se fundan uno en el otro.")
+                RichText::new("Arrastrá una esquina de arriba de un clip para que aparezca desde negro o se vaya a negro. Si toca a otro clip, esa esquina hace que se fundan uno en el otro. Con clic derecho sobre un fundido elegís su curva.")
                     .size(13.0)
                     .color(MUTED),
             );
@@ -545,15 +545,6 @@ impl EditorApp {
                 let c = &mut self.tracks[ta].clips[ia];
                 c.muted = !on;
                 c.gain = vol as f32 / 100.0;
-            }
-            ui.add_space(6.0);
-            ui.label(RichText::new("Curva de los fundidos").size(12.5).color(MUTED));
-            let mut curve = p.curve;
-            let r = ui.scope(|ui| seg(ui, &mut curve, &[(Curve::Even, "Pareja"), (Curve::Linear, "Lineal"), (Curve::Smooth, "Suave")]));
-            r.response.on_hover_text("Pareja: al cruzarse con otro clip el volumen no baja. Lineal: en línea recta. Suave: arranca y termina despacio.");
-            if r.inner {
-                self.record_undo(before);
-                self.tracks[ta].clips[ia].curve = curve;
             }
         }
         ui.add_space(18.0);
@@ -746,6 +737,31 @@ impl EditorApp {
         let tol = (SNAP / pps * 1e7) as i64;
         self.snap = snaps.iter().copied().filter(|s| (s - from - dt).abs() <= tol).min_by_key(|s| (s - from - dt).abs());
         self.snap.map_or(dt, |s| s - from)
+    }
+
+    /// Los fundidos que hay en (x, y) en el tiempo `t`: el cruzado (los dos lados) o el de entrada o salida de
+    /// una pieza. Vacío si ahí no hay ninguno.
+    fn fade_at(&self, rows: &[(usize, Rangef)], xs: &[Vec<(f32, f32)>], x: f32, y: f32, t: i64) -> Vec<(u64, bool)> {
+        let Some(&(ti, _)) = rows.iter().find(|(_, yr)| yr.contains(y)) else { return Vec::new() };
+        let track = &self.tracks[ti];
+        let ov = track.overlaps();
+        for i in (0..track.clips.len()).rev() {
+            let p = &track.clips[i];
+            if x < xs[ti][i].0 || x > xs[ti][i].1 {
+                continue;
+            }
+            if ov[i].0 > 0 && t < p.start + ov[i].0 {
+                return vec![(track.clips[i - 1].id, true), (p.id, false)];
+            }
+            if t < p.start + p.fade_in.max(ov[i].0) {
+                return vec![(p.id, false)];
+            }
+            if t >= p.end() - p.fade_out {
+                return vec![(p.id, true)];
+            }
+            return Vec::new();
+        }
+        Vec::new()
     }
 
     /// Acerca (k > 1) o aleja la línea de tiempo. Se aplica al dibujarla, con el cursor de reproducción quieto.
@@ -1077,6 +1093,30 @@ impl EditorApp {
         if let Some(c) = cursor {
             ui.ctx().set_cursor_icon(c);
         }
+        // Clic derecho sobre un fundido: elegir su curva.
+        if resp.secondary_clicked() {
+            self.curve_menu = pointer.map_or(Vec::new(), |h| self.fade_at(&rows, &xs, h.x, h.y, xt(h.x)));
+        }
+        if !self.curve_menu.is_empty() {
+            resp.context_menu(|ui| {
+                let current = self.find(self.curve_menu[0].0).map(|(ti, i)| {
+                    let c = self.tracks[ti].clips[i].curves;
+                    if self.curve_menu[0].1 { c.1 } else { c.0 }
+                });
+                ui.label(RichText::new("Curva del fundido").size(12.5).color(MUTED));
+                for (c, label, tip) in [
+                    (Curve::Even, "Pareja", "Al cruzarse dos sonidos el volumen no baja"),
+                    (Curve::Linear, "Lineal", "En línea recta"),
+                    (Curve::Smooth, "Suave", "Arranca y termina despacio"),
+                ] {
+                    if ui.add(egui::Button::new(label).selected(current == Some(c))).on_hover_text(tip).clicked() {
+                        let targets = self.curve_menu.clone();
+                        self.set_curve(&targets, c);
+                        ui.close_menu();
+                    }
+                }
+            });
+        }
         if resp.clicked() {
             if let Some(h) = pointer {
                 match hit(h.x, h.y) {
@@ -1146,9 +1186,20 @@ impl EditorApp {
                 let a = xs[ti][i].0;
                 let r = Rect::from_min_max(Pos2::new(a, row.top() + 1.0), Pos2::new(a + fin as f32 / 1e7 * pps, row.bottom() - 1.0));
                 painter.rect_filled(r, 0.0, WHITE.gamma_multiply(0.12));
+                // La que entra sube con su curva y la que sale baja con la suya.
                 let st = Stroke::new(1.0_f32, WHITE.gamma_multiply(0.7));
-                painter.line_segment([r.left_bottom(), r.right_top()], st);
-                painter.line_segment([r.left_top(), r.right_bottom()], st);
+                let (cin, cout) = (t.clips[i].curves.0, t.clips[i - 1].curves.1);
+                let line = |c: Curve, up: bool| -> Vec<Pos2> {
+                    (0..=16)
+                        .map(|k| {
+                            let x = k as f32 / 16.0;
+                            let v = c.shape(if up { x } else { 1.0 - x });
+                            Pos2::new(r.left() + r.width() * x, r.bottom() - r.height() * v)
+                        })
+                        .collect()
+                };
+                painter.add(Shape::line(line(cin, true), st));
+                painter.add(Shape::line(line(cout, false), st));
             }
             // Agarraderas de los fundidos, encima de todo: en lo elegido y bajo el mouse.
             for (i, p) in t.clips.iter().enumerate() {

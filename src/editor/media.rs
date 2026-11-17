@@ -206,7 +206,8 @@ pub struct Clip {
     pub xfade: (i64, i64),
     /// Volumen de su audio (0 = mudo).
     pub gain: f32,
-    pub curve: Curve,
+    /// Forma del fundido de entrada y del de salida.
+    pub curves: (Curve, Curve),
 }
 
 /// Forma de los fundidos del audio.
@@ -251,12 +252,13 @@ impl Clip {
     /// Cuánto se ve (0 a 1) en `t`: aparece de a poco (desde negro o sobre la anterior) y se va a negro. Al
     /// fundirse con la siguiente no se apaga: la siguiente le aparece encima.
     pub fn alpha(&self, t: i64) -> f32 {
-        ramp(t - self.start, self.fade.0.max(self.xfade.0)) * ramp(self.end() - t, self.fade.1)
+        let (cin, cout) = self.curves;
+        cin.shape(ramp(t - self.start, self.fade.0.max(self.xfade.0))) * cout.shape(ramp(self.end() - t, self.fade.1))
     }
-    /// Volumen en `t` con sus fundidos (de entrada, de salida y cruzados), con la forma de su curva.
+    /// Volumen en `t` con sus fundidos (de entrada, de salida y cruzados), cada uno con la forma de su curva.
     pub fn gain_at(&self, t: i64) -> f32 {
-        let w = |d, f| self.curve.shape(ramp(d, f));
-        self.gain * w(t - self.start, self.fade.0.max(self.xfade.0)) * w(self.end() - t, self.fade.1.max(self.xfade.1))
+        let (cin, cout) = self.curves;
+        self.gain * cin.shape(ramp(t - self.start, self.fade.0.max(self.xfade.0))) * cout.shape(ramp(self.end() - t, self.fade.1.max(self.xfade.1)))
     }
     fn name(&self) -> String {
         self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
