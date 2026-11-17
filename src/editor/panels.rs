@@ -1,6 +1,6 @@
 //! Paneles de la ventana: barra superior, biblioteca, vista previa, propiedades y pistas.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -65,24 +65,37 @@ pub(super) enum Drag {
 }
 
 /// Una pieza en la línea de tiempo: de `a` a `b` en x, dentro de la franja `row` de su pista. En una pista de
-/// video se ven las miniaturas; en una de audio, la forma de onda.
+/// video se ven las miniaturas; en una de audio, la forma de onda. Devuelve los tramos del archivo de los
+/// cuadros visibles que todavía no tienen miniatura (quedan vacíos hasta que llega), para pedirlos primero.
 #[allow(clippy::too_many_arguments)]
-fn draw_piece(painter: &egui::Painter, p: &Piece, info: Option<&library::Info>, (a, b): (f32, f32), row: Rect, video: bool, pps: f32, selected: bool, alpha: f32, xfade: (i64, i64)) {
+fn draw_piece(painter: &egui::Painter, p: &Piece, info: Option<&library::Info>, (a, b): (f32, f32), row: Rect, video: bool, pps: f32, selected: bool, alpha: f32, xfade: (i64, i64)) -> Vec<(i64, i64)> {
     let r = Rect::from_min_max(Pos2::new(a + 1.0, row.top()), Pos2::new(b - 1.0, row.bottom()));
     painter.rect_filled(r, 6.0, (if video { TRACK_VIDEO } else { TRACK_AUDIO }).gamma_multiply(alpha));
+    let mut missing = Vec::new();
     if video {
-        // Miniaturas
+        // Miniaturas: en cada cuadro, la más cercana a su centro de las que caen en lo que el cuadro abarca
+        // (o a menos de un paso de la tira, si el cuadro abarca menos que eso).
         let clip = painter.with_clip_rect(r.shrink(1.0).intersect(painter.clip_rect()));
-        if let Some(info) = info.filter(|i| !i.thumbs.is_empty()) {
-            let tile_w = (r.height() * 16.0 / 9.0).floor().max(8.0);
-            let mut x = r.left();
-            while x < r.right() {
-                let t = p.src_in + ((x - r.left() + tile_w / 2.0) / pps * 1e7) as i64;
-                let k = info.thumbs.partition_point(|(tt, _)| *tt <= t).saturating_sub(1);
-                let tex = &info.thumbs[k].1;
-                let tile = Rect::from_min_size(Pos2::new(x, r.top()), egui::vec2(tile_w, r.height()));
-                clip.image(tex.id(), tile, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE.gamma_multiply(alpha));
-                x += tile_w;
+        let thumbs = info.map_or(&[][..], |i| &i.thumbs);
+        let step = info.and_then(|i| i.probe.as_ref()).map_or(0, |pr| library::strip_step(pr.duration));
+        let tile_w = (r.height() * 16.0 / 9.0).floor().max(8.0);
+        let mut x = r.left();
+        while x < r.right() {
+            let tile = Rect::from_min_size(Pos2::new(x, r.top()), egui::vec2(tile_w, r.height()));
+            x += tile_w;
+            if !tile.intersects(clip.clip_rect()) {
+                continue;
+            }
+            let at = |x: f32| p.src_in + ((x - r.left()) / pps * 1e7) as i64;
+            let (lo, t, hi) = (at(tile.left()), at(tile.center().x), at(tile.right()));
+            let reach = (t - lo).max(step);
+            let k = thumbs.partition_point(|(tt, _)| *tt < t);
+            let near = [k.checked_sub(1), Some(k)].into_iter().flatten().filter_map(|k| thumbs.get(k)).min_by_key(|(tt, _)| (tt - t).abs());
+            match near.filter(|(tt, _)| (tt - t).abs() <= reach) {
+                Some((_, tex)) => {
+                    clip.image(tex.id(), tile, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE.gamma_multiply(alpha));
+                }
+                None => missing.push((lo, hi)),
             }
         }
     } else {
@@ -134,6 +147,7 @@ fn draw_piece(painter: &egui::Painter, p: &Piece, info: Option<&library::Info>, 
     } else {
         painter.rect_stroke(r, 6.0, Stroke::new(1.0_f32, LINE));
     }
+    missing
 }
 
 /// Agarraderas de las esquinas de arriba de una pieza (x de cada una), dentro de `r`.
@@ -1164,7 +1178,9 @@ impl EditorApp {
 
         let hovered = resp.hover_pos().and_then(|h| hit(h.x, h.y)).map(|(ti, i, _)| self.tracks[ti].clips[i].id);
         let info = self.loader.info.clone();
-        let info = info.lock().unwrap();
+        let mut info = info.lock().unwrap();
+        // Cuadros de la tira que se ven y todavía no tienen miniatura, por archivo.
+        let mut missing: HashMap<PathBuf, Vec<(i64, i64)>> = HashMap::new();
         let moving = if let Drag::Move { id, .. } = self.drag { self.group(id) } else { Vec::new() };
         for (ti, t) in self.tracks.iter().enumerate() {
             let Some(yr) = row_of(ti) else { continue };
@@ -1175,7 +1191,8 @@ impl EditorApp {
             let overlaps = t.overlaps();
             for (i, (p, &x)) in t.clips.iter().zip(&xs[ti]).enumerate() {
                 if !moving.contains(&(ti, i)) {
-                    draw_piece(&painter, p, info.get(&p.path), x, row, video, pps, self.is_selected(p), alpha, overlaps[i]);
+                    let m = draw_piece(&painter, p, info.get(&p.path), x, row, video, pps, self.is_selected(p), alpha, overlaps[i]);
+                    missing.entry(p.path.clone()).or_default().extend(m);
                 }
             }
             // Fundidos cruzados: una cruz sobre lo que se superponen.
@@ -1231,7 +1248,13 @@ impl EditorApp {
                     painter.rect_filled(Rect::from_center_size(Pos2::new(bar_x - 1.0, row.center().y), egui::vec2(3.0, row.height() + 6.0)), 1.5, WHITE);
                 }
                 let video = self.tracks[dest].kind == TrackKind::Video;
-                draw_piece(&painter, p, info.get(&p.path), (a, b), row.translate(egui::vec2(0.0, -4.0)), video, pps, true, 0.75, self.tracks[tj].overlaps()[j]);
+                let m = draw_piece(&painter, p, info.get(&p.path), (a, b), row.translate(egui::vec2(0.0, -4.0)), video, pps, true, 0.75, self.tracks[tj].overlaps()[j]);
+                missing.entry(p.path.clone()).or_default().extend(m);
+            }
+        }
+        for (path, m) in missing {
+            if let Some(e) = info.get_mut(&path) {
+                e.wanted = m;
             }
         }
 

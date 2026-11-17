@@ -29,12 +29,16 @@ pub const ANY: u32 = MF_SOURCE_READER_ANY_STREAM.0 as u32;
 pub const SOURCE: u32 = MF_SOURCE_READER_MEDIASOURCE.0 as u32;
 pub const EOS: u32 = MF_SOURCE_READERF_ENDOFSTREAM.0 as u32;
 
-pub unsafe fn reader(path: &Path, video_processing: bool, d3d: Option<&IMFDXGIDeviceManager>) -> Result<IMFSourceReader> {
+/// `low_latency`: el decodificador entrega cada cuadro apenas lo tiene (para cuadros sueltos).
+pub unsafe fn reader(path: &Path, video_processing: bool, d3d: Option<&IMFDXGIDeviceManager>, low_latency: bool) -> Result<IMFSourceReader> {
     let mut a = None;
     MFCreateAttributes(&mut a, 4)?;
     let a = a.unwrap();
     if video_processing {
         a.SetUINT32(&MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, 1)?;
+    }
+    if low_latency {
+        a.SetUINT32(&MF_LOW_LATENCY, 1)?;
     }
     if let Some(m) = d3d {
         a.SetUnknown(&MF_SOURCE_READER_D3D_MANAGER, m)?;
@@ -126,7 +130,7 @@ impl Probe {
 
 pub fn probe(path: &Path) -> Result<Probe> {
     unsafe {
-        let r = reader(path, false, None)?;
+        let r = reader(path, false, None, false)?;
         let duration = r
             .GetPresentationAttribute(SOURCE, &MF_PD_DURATION)
             .ok()
@@ -165,7 +169,7 @@ pub fn keyframes(path: &Path) -> Result<Vec<i64>> {
         return Ok(k);
     }
     unsafe {
-        let r = reader(path, false, None)?;
+        let r = reader(path, false, None, false)?;
         r.SetStreamSelection(ANY, false)?;
         r.SetStreamSelection(VIDEO, true)?;
         let mut v = Vec::new();
@@ -500,7 +504,7 @@ unsafe fn video_index(r: &IMFSourceReader) -> u32 {
 /// Copia el video de `parts` tal cual. El audio también se copia si es justo el de esas piezas
 /// (`plain_audio`); si no, se mezcla lo que suena y se vuelve a codificar.
 unsafe fn export_copy(edit: &Edit, parts: &[Clip], info: &Probe, out: &Path, prog: &Progress, plain_audio: bool) -> Result<()> {
-    let first = reader(&parts[0].path, false, None)?;
+    let first = reader(&parts[0].path, false, None, false)?;
     let vt = clone_type(&first.GetNativeMediaType(VIDEO, 0)?)?;
     let at = match (info.audio, plain_audio) {
         (Some(_), true) => Some(clone_type(&first.GetNativeMediaType(AUDIO, 0)?)?),
@@ -527,7 +531,7 @@ unsafe fn export_copy(edit: &Edit, parts: &[Clip], info: &Probe, out: &Path, pro
     let mut offset = 0i64;
     let mut done = 0i64;
     for seg in parts {
-        let r = reader(&seg.path, false, None)?;
+        let r = reader(&seg.path, false, None, false)?;
         let vidx = video_index(&r);
         if a_s.is_none() {
             let _ = r.SetStreamSelection(AUDIO, false);
@@ -633,7 +637,7 @@ struct Pcm {
 
 impl Pcm {
     unsafe fn open(path: &Path, from: i64) -> Result<Pcm> {
-        let r = reader(path, false, None)?;
+        let r = reader(path, false, None, false)?;
         r.SetStreamSelection(ANY, false)?;
         r.SetStreamSelection(AUDIO, true)?;
         r.SetCurrentMediaType(AUDIO, None, &pcm_type()?)?;
@@ -741,7 +745,7 @@ impl Mixer {
 /// Forma de onda del audio del archivo (decodifica solo el audio, una vez; después va a la caché).
 pub fn waveform(path: &Path) -> Result<Wave> {
     unsafe {
-        let r = reader(path, false, None)?;
+        let r = reader(path, false, None, false)?;
         r.SetStreamSelection(ANY, false)?;
         r.SetStreamSelection(AUDIO, true)?;
         r.SetCurrentMediaType(AUDIO, None, &pcm_type()?)?;
@@ -779,7 +783,7 @@ struct Frames {
 
 impl Frames {
     unsafe fn open(c: &Clip, from: i64, (tw, th): (u32, u32), gpu: Option<&IMFDXGIDeviceManager>) -> Result<Frames> {
-        let r = reader(&c.path, true, gpu)?;
+        let r = reader(&c.path, true, gpu, false)?;
         r.SetStreamSelection(ANY, false)?;
         r.SetStreamSelection(VIDEO, true)?;
         let t = MFCreateMediaType()?;

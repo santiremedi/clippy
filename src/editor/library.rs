@@ -29,7 +29,11 @@ pub struct Info {
     pub probe: Option<Probe>,
     pub error: Option<String>,
     pub cover: Option<egui::TextureHandle>,
+    /// Miniaturas de la tira, ordenadas por tiempo (van llegando salteadas: primero las que se ven).
     pub thumbs: Vec<(i64, egui::TextureHandle)>,
+    /// Tramos del archivo que la línea de tiempo muestra sin miniatura (uno por cuadro, de izquierda a
+    /// derecha): de cada uno se hace primero la que cueste menos.
+    pub wanted: Vec<(i64, i64)>,
     pub wave: Option<Wave>,
     pub keyframes: Option<Vec<i64>>,
     /// Tamaño y fecha del archivo cuando se leyó: si cambian, se vuelve a leer.
@@ -155,7 +159,7 @@ fn ensure_probe(p: &Path, info: &Mutex<HashMap<PathBuf, Info>>) -> Option<Probe>
 fn cover(p: &Path, info: &Mutex<HashMap<PathBuf, Info>>, ctx: &egui::Context) {
     let Some(pr) = ensure_probe(p, info) else { return };
     let (w, h) = fit(&pr, 256);
-    let Ok(mut v) = Video::open(p, w, h) else { return };
+    let Ok(mut v) = Video::open(p, w, h, true) else { return };
     let t = (pr.duration / 2).min(10_000_000);
     if let Ok(Some(img)) = v.frame_at(t) {
         let tex = ctx.load_texture(format!("cover:{}", p.display()), img, egui::TextureOptions::LINEAR);
@@ -163,37 +167,98 @@ fn cover(p: &Path, info: &Mutex<HashMap<PathBuf, Info>>, ctx: &egui::Context) {
     }
 }
 
-fn strip(p: &Path, info: &Mutex<HashMap<PathBuf, Info>>, ctx: &egui::Context) {
+fn strip(p: &Path, info: &Arc<Mutex<HashMap<PathBuf, Info>>>, ctx: &egui::Context) {
     let Some(pr) = ensure_probe(p, info) else { return };
-    // Primero lo rápido: forma de onda y fotogramas clave (de la caché si ya se calcularon).
+    // Fotogramas clave y forma de onda, de la caché si ya se calcularon. Si no, los claves salen enseguida
+    // del índice del archivo; la forma de onda decodifica todo el audio (segundos), así que va en otro
+    // hilo y las miniaturas no la esperan.
     let (wave, kf) = match crate::clipcache::load(p) {
-        Some(c) => c,
-        None => {
-            let kf = media::keyframes(p).unwrap_or_default();
-            let wave = media::waveform(p).unwrap_or_default();
-            crate::clipcache::save(p, &wave, &kf);
-            (wave, kf)
-        }
+        Some((w, k)) => (Some(w), k),
+        None => (None, media::keyframes(p).unwrap_or_default()),
     };
     {
         let mut i = info.lock().unwrap();
         let e = i.entry(p.to_path_buf()).or_default();
-        e.wave = Some(wave);
-        e.keyframes = Some(kf);
+        e.keyframes = Some(kf.clone());
+        if wave.is_some() {
+            e.wave = wave;
+        } else {
+            let (p, info, ctx, kf) = (p.to_path_buf(), info.clone(), ctx.clone(), kf.clone());
+            std::thread::spawn(move || {
+                let _mf = Mf::init();
+                let wave = media::waveform(&p).unwrap_or_default();
+                crate::clipcache::save(&p, &wave, &kf);
+                info.lock().unwrap().entry(p).or_default().wave = Some(wave);
+                ctx.request_repaint();
+            });
+        }
     }
     ctx.request_repaint();
-    // Después las miniaturas, que van apareciendo de a una.
+    // Las miniaturas van apareciendo de a una: primero las que pide la pantalla.
     let (w, h) = fit(&pr, 160);
-    if let Ok(mut v) = Video::open(p, w, h) {
-        let step = (pr.duration / 150).max(10_000_000);
-        let mut t = 0;
-        while t < pr.duration {
-            if let Ok(Some(img)) = v.frame_at(t) {
-                let tex = ctx.load_texture(format!("strip:{}:{t}", p.display()), img, egui::TextureOptions::LINEAR);
-                info.lock().unwrap().entry(p.to_path_buf()).or_default().thumbs.push((t, tex));
-                ctx.request_repaint();
-            }
-            t += step;
+    if let Ok(mut v) = Video::open(p, w, h, true) {
+        let wanted = || info.lock().unwrap().get(p).map(|e| e.wanted.clone()).unwrap_or_default();
+        strip_frames(&mut v, pr.duration, &kf, wanted, |t, img| {
+            let tex = ctx.load_texture(format!("strip:{}:{t}", p.display()), img, egui::TextureOptions::LINEAR);
+            let mut i = info.lock().unwrap();
+            let thumbs = &mut i.entry(p.to_path_buf()).or_default().thumbs;
+            thumbs.insert(thumbs.partition_point(|(tt, _)| *tt < t), (t, tex));
+            ctx.request_repaint();
+        });
+    }
+}
+
+/// Distancia entre miniaturas de la tira de un clip de esa duración: una por segundo, 150 como mucho.
+pub fn strip_step(duration: i64) -> i64 {
+    (duration / 150).max(10_000_000)
+}
+
+/// Cuánto después de un fotograma clave se pide el cuadro: el índice del archivo da su tiempo redondeado
+/// y sin el corrimiento de los cuadros B, y pedirlo justo encima podría hacer buscar desde el clave anterior.
+const KEY_MARGIN: i64 = 500_000; // 50 ms
+
+/// Miniaturas de la tira: una cada `strip_step`. Si hay un fotograma clave a menos de medio paso se usa ese
+/// (se decodifica un solo cuadro). Antes de cada una se mira `wanted` (los tramos que la pantalla muestra sin
+/// miniatura) y se hace primero, del primero de esos tramos, la que menos cuadros hay que decodificar para
+/// sacar. Si no falta ninguno, se sigue en orden desde la anterior sin volver a buscar.
+pub(super) fn strip_frames(v: &mut Video, duration: i64, keys: &[i64], wanted: impl Fn() -> Vec<(i64, i64)>, mut each: impl FnMut(i64, egui::ColorImage)) {
+    let step = strip_step(duration);
+    // Plan: el tiempo de cada miniatura y el fotograma clave anterior a él.
+    let mut plan: Vec<(i64, i64)> = Vec::new();
+    let mut t = 0;
+    while t < duration {
+        let prev = plan.last().map_or(i64::MIN, |p| p.0);
+        let from = keys.partition_point(|&k| k <= t - step / 2);
+        let near = keys[from..].iter().copied().take_while(|&k| k < t + step / 2).filter(|&k| k > prev).min_by_key(|&k| (k - t).abs());
+        let at = near.map_or(t, |k| (k + KEY_MARGIN).min(duration - 1));
+        // Sin índice de claves no se sabe hasta dónde conviene seguir leyendo: se busca cada vez.
+        let key = keys[..keys.partition_point(|&k| k <= at)].last().copied().unwrap_or(at);
+        plan.push((at, key));
+        t += step;
+    }
+    let mut done = vec![false; plan.len()];
+    // La que conviene hacer para un tramo: la más barata de las que caen adentro (la que está sobre un
+    // fotograma clave sale de un cuadro); si el tramo es más angosto que el paso, la más cercana.
+    let pick = |(lo, hi): (i64, i64), done: &[bool]| {
+        let (a, b) = (plan.partition_point(|p| p.0 < lo), plan.partition_point(|p| p.0 <= hi));
+        if a < b {
+            return (a..b).filter(|&i| !done[i]).min_by_key(|&i| plan[i].0 - plan[i].1);
+        }
+        let c = (lo + hi) / 2;
+        let i = if a > 0 && (a == plan.len() || c - plan[a - 1].0 < plan[a].0 - c) { a - 1 } else { a };
+        (i < plan.len() && !done[i]).then_some(i)
+    };
+    let mut next = 0;
+    loop {
+        let urgent = wanted().into_iter().find_map(|r| pick(r, &done));
+        while next < plan.len() && done[next] {
+            next += 1;
+        }
+        let Some(i) = urgent.or((next < plan.len()).then_some(next)) else { break };
+        done[i] = true;
+        let (at, key) = plan[i];
+        if let Ok(Some(img)) = v.frame_ahead(at, key) {
+            each(at, img);
         }
     }
 }

@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 
+use super::library;
 use super::media::{self, Clip, Edit, Progress};
 use crate::mf::Mf;
 use super::player::{self, Player};
@@ -137,30 +138,18 @@ pub fn test_cli(args: &[String]) -> i32 {
             let c = crate::clipcache::load(&path);
             println!("caché: {} en {:?}", if c.is_some() { "encontrada" } else { "no hay" }, t.elapsed());
             let t = Instant::now();
-            let mut v = player::Video::open(&path, 160, 90).unwrap();
+            let mut v = player::Video::open(&path, 160, 90, true).unwrap();
             println!("abrir decodificador: {:?}", t.elapsed());
             let t = Instant::now();
             let mut n = 0;
-            let mut s = 0;
-            while s < pr.duration {
-                if v.frame_at(s).ok().flatten().is_some() {
-                    n += 1;
-                }
-                s += 10_000_000;
-            }
+            library::strip_frames(&mut v, pr.duration, &k, Vec::new, |_, _| n += 1);
             println!("{n} miniaturas (GPU): {:?}", t.elapsed());
             let t = Instant::now();
             let mut v = player::Video::open_cpu(&path, 160, 90).unwrap();
             println!("abrir decodificador CPU: {:?}", t.elapsed());
             let t = Instant::now();
-            let mut s = 0;
             n = 0;
-            while s < pr.duration {
-                if v.frame_at(s).ok().flatten().is_some() {
-                    n += 1;
-                }
-                s += 10_000_000;
-            }
+            library::strip_frames(&mut v, pr.duration, &k, Vec::new, |_, _| n += 1);
             println!("{n} miniaturas (CPU): {:?}", t.elapsed());
             0
         }
