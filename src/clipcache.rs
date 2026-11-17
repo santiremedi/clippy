@@ -131,7 +131,8 @@ fn cache_dir() -> PathBuf {
     app_dir().join("cache")
 }
 
-fn cache_file(p: &Path) -> PathBuf {
+/// Archivo de la caché de `p` (mientras `p` existe: su ruta canónica es la clave).
+pub fn cache_file(p: &Path) -> PathBuf {
     // Ruta canónica: la misma clave aunque la ruta venga escrita con otras barras o mayúsculas.
     let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     // FNV-1a: da lo mismo en cualquier versión de Rust (el hash de la biblioteca estándar puede cambiar).

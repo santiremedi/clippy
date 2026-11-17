@@ -196,10 +196,13 @@ pub struct Clip {
     /// La pieza de la línea de tiempo de la que sale (0 si no sale de una).
     pub id: u64,
     pub path: PathBuf,
-    /// Dónde empieza en la línea de tiempo.
+    /// Dónde empieza en la línea de tiempo y cuánto dura ahí.
     pub start: i64,
+    pub len: i64,
+    /// Dónde empieza en el archivo.
     pub src_in: i64,
-    pub src_out: i64,
+    /// Cuánto del archivo pasa en cada instante de la línea (ver `src_at`).
+    pub speed: f64,
     /// Cuánto tarda en aparecer desde negro (o silencio) y en irse.
     pub fade: (i64, i64),
     /// Fundido cruzado con la pieza anterior y con la siguiente de su pista: lo que se superponen.
@@ -208,6 +211,143 @@ pub struct Clip {
     pub gain: f32,
     /// Forma del fundido de entrada y del de salida.
     pub curves: (Curve, Curve),
+    /// Cómo se ve su imagen en el lienzo.
+    pub frame: Frame,
+}
+
+/// Velocidades que se pueden elegir. 0 no está: es la de una imagen congelada.
+pub const SPEED_MIN: f64 = 0.1;
+pub const SPEED_MAX: f64 = 10.0;
+
+/// El instante del archivo que se ve (o se oye) en `t` de la línea, para una pieza que empieza en `start` y en el
+/// archivo en `src_in`: 1 = velocidad normal, 2 = el doble de rápido, 0 = una imagen congelada.
+pub fn src_at(start: i64, src_in: i64, speed: f64, t: i64) -> i64 {
+    src_in + ((t - start) as f64 * speed).round() as i64
+}
+
+/// Proporción del lienzo (ancho, alto).
+pub type Ratio = (u32, u32);
+
+/// Tamaño (px, pares) del video que sale: con la proporción `ratio` (o la del primer clip, `first`) y como lado
+/// corto el del primer clip, o `short` si es más chico (0 = como el original).
+pub fn canvas_size(first: (u32, u32), ratio: Option<Ratio>, short: u32) -> (u32, u32) {
+    let (sw, sh) = (first.0.max(2) as u64, first.1.max(2) as u64);
+    let (rw, rh) = ratio.map_or((sw, sh), |(w, h)| (w.max(1) as u64, h.max(1) as u64));
+    let base = sw.min(sh);
+    let s = if short == 0 || short as u64 >= base { base } else { short as u64 };
+    let (w, h) = if rw >= rh { (s * rw / rh, s) } else { (s, s * rh / rw) };
+    ((w as u32).max(2) & !1, (h as u32).max(2) & !1)
+}
+
+/// Misma forma (proporción) a menos de un píxel.
+pub fn same_shape((aw, ah): (u32, u32), (bw, bh): (u32, u32)) -> bool {
+    (aw as f64 * bh as f64 / ah.max(1) as f64 - bw as f64).abs() < 1.0
+}
+
+/// Cómo se ve la imagen de una pieza: girada, espejada, recortada y si llena el lienzo o entra entera.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Frame {
+    /// Cuartos de vuelta en el sentido del reloj (0 a 3).
+    pub turns: u8,
+    /// Espejada de izquierda a derecha (ya girada).
+    pub flip: bool,
+    /// Lo que se ve del cuadro del archivo, de 0 a 1: izquierda, arriba, derecha, abajo.
+    pub crop: [f32; 4],
+    /// Llena el lienzo (lo que sobra queda afuera) en vez de entrar entera con bordes negros.
+    pub fill: bool,
+}
+
+impl Default for Frame {
+    fn default() -> Self {
+        Frame { turns: 0, flip: false, crop: [0.0, 0.0, 1.0, 1.0], fill: false }
+    }
+}
+
+/// Dónde cae una imagen en el lienzo: el rectángulo (px; izquierda, arriba, derecha, abajo) y el punto del cuadro
+/// del archivo (0 a 1) que se ve en cada esquina (arriba a la izquierda, arriba a la derecha, abajo a la derecha,
+/// abajo a la izquierda).
+#[derive(Clone, Copy, Debug)]
+pub struct Placed {
+    pub dst: [f32; 4],
+    pub uv: [[f32; 2]; 4],
+}
+
+impl Placed {
+    /// La parte del cuadro del archivo que se ve (0 a 1; izquierda, arriba, derecha, abajo).
+    pub fn src_rect(&self) -> [f32; 4] {
+        let xs = self.uv.map(|p| p[0]);
+        let ys = self.uv.map(|p| p[1]);
+        let (min, max) = (|v: [f32; 4]| v.into_iter().fold(f32::MAX, f32::min), |v: [f32; 4]| v.into_iter().fold(f32::MIN, f32::max));
+        [min(xs), min(ys), max(xs), max(ys)]
+    }
+
+    /// El punto del archivo (0 a 1) que se ve en (fx, fy) del rectángulo (0 a 1). Como los giros son de a un cuarto
+    /// de vuelta, mezclar las esquinas da el punto exacto.
+    pub fn uv_at(&self, fx: f32, fy: f32) -> [f32; 2] {
+        let lerp = |a: [f32; 2], b: [f32; 2], k: f32| [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k];
+        lerp(lerp(self.uv[0], self.uv[1], fx), lerp(self.uv[3], self.uv[2], fx), fy)
+    }
+}
+
+impl Frame {
+    /// Sin girar, espejar ni recortar: si el archivo tiene la forma del lienzo, se ve tal cual.
+    pub fn is_plain(&self) -> bool {
+        Frame { fill: false, ..*self } == Frame::default()
+    }
+
+    /// El punto del cuadro del archivo (0 a 1) que se ve en (u, v) de la imagen ya recortada, girada y espejada.
+    pub fn source(&self, u: f32, v: f32) -> [f32; 2] {
+        let u = if self.flip { 1.0 - u } else { u };
+        let (x, y) = match self.turns % 4 {
+            0 => (u, v),
+            1 => (v, 1.0 - u),
+            2 => (1.0 - u, 1.0 - v),
+            _ => (1.0 - v, u),
+        };
+        let [l, t, r, b] = self.crop;
+        [l + x * (r - l), t + y * (b - t)]
+    }
+
+    /// Al revés que `source` sin recortar: dónde queda (0 a 1) en la imagen girada y espejada el punto (x, y) del
+    /// cuadro del archivo.
+    pub fn view(&self, x: f32, y: f32) -> [f32; 2] {
+        let (u, v) = match self.turns % 4 {
+            0 => (x, y),
+            1 => (1.0 - y, x),
+            2 => (1.0 - x, 1.0 - y),
+            _ => (y, 1.0 - x),
+        };
+        [if self.flip { 1.0 - u } else { u }, v]
+    }
+
+    /// Tamaño (px) de la imagen recortada y girada de un archivo de `w`×`h`.
+    pub fn view_size(&self, (w, h): (f32, f32)) -> (f32, f32) {
+        let [l, t, r, b] = self.crop;
+        let (cw, ch) = ((r - l) * w, (b - t) * h);
+        if self.turns % 2 == 1 {
+            (ch, cw)
+        } else {
+            (cw, ch)
+        }
+    }
+
+    /// Dónde va, en un lienzo de `canvas` px, la imagen de un archivo de `src` px: centrada, entera o llenándolo.
+    /// Solo la parte que queda adentro del lienzo; None si no se ve nada.
+    pub fn place(&self, src: (f32, f32), canvas: (f32, f32)) -> Option<Placed> {
+        let (vw, vh) = self.view_size(src);
+        if vw < 1.0 || vh < 1.0 {
+            return None;
+        }
+        let s = if self.fill { (canvas.0 / vw).max(canvas.1 / vh) } else { (canvas.0 / vw).min(canvas.1 / vh) };
+        let (dw, dh) = (vw * s, vh * s);
+        let (x0, y0) = ((canvas.0 - dw) / 2.0, (canvas.1 - dh) / 2.0);
+        let (l, t, r, b) = (x0.max(0.0), y0.max(0.0), (x0 + dw).min(canvas.0), (y0 + dh).min(canvas.1));
+        if r - l < 0.5 || b - t < 0.5 {
+            return None;
+        }
+        let (u0, v0, u1, v1) = ((l - x0) / dw, (t - y0) / dh, (r - x0) / dw, (b - y0) / dh);
+        Some(Placed { dst: [l, t, r, b], uv: [self.source(u0, v0), self.source(u1, v0), self.source(u1, v1), self.source(u0, v1)] })
+    }
 }
 
 /// Forma de los fundidos del audio.
@@ -244,7 +384,13 @@ pub fn ramp(d: i64, f: i64) -> f32 {
 
 impl Clip {
     pub fn end(&self) -> i64 {
-        self.start + self.src_out - self.src_in
+        self.start + self.len
+    }
+    pub fn src_at(&self, t: i64) -> i64 {
+        src_at(self.start, self.src_in, self.speed, t)
+    }
+    pub fn src_out(&self) -> i64 {
+        self.src_at(self.end())
     }
     pub fn covers(&self, t: i64) -> bool {
         self.start <= t && t < self.end()
@@ -272,6 +418,8 @@ pub struct Edit {
     pub video: Vec<Vec<Clip>>,
     /// Lo que suena, por pista.
     pub audio: Vec<Vec<Clip>>,
+    /// Proporción del lienzo; None = la del primer clip.
+    pub ratio: Option<Ratio>,
 }
 
 impl Edit {
@@ -284,9 +432,13 @@ impl Edit {
         self.video.iter().flatten().min_by_key(|c| c.start)
     }
 
-    /// Si el video es una sola pista de piezas pegadas desde el inicio, sin fundidos y sin nada que
-    /// suene después del final, esas piezas: se pueden copiar sin recodificar.
-    pub fn copy_parts(&self) -> Option<&[Clip]> {
+    /// Si el video es una sola pista de piezas pegadas desde el inicio, a velocidad normal, sin fundidos, sin
+    /// tocar su imagen, en un lienzo con la forma del primer clip (`first`, su tamaño) y sin nada que suene
+    /// después del final, esas piezas: se pueden copiar sin recodificar.
+    pub fn copy_parts(&self, first: (u32, u32)) -> Option<&[Clip]> {
+        if self.ratio.is_some_and(|r| !same_shape(first, r)) {
+            return None;
+        }
         let mut used = self.video.iter().filter(|t| !t.is_empty());
         let parts = used.next()?;
         if used.next().is_some() {
@@ -294,7 +446,7 @@ impl Edit {
         }
         let mut t = 0;
         for c in parts {
-            if (c.start - t).abs() > 2_000 || c.fade != (0, 0) || c.xfade != (0, 0) {
+            if (c.start - t).abs() > 2_000 || c.fade != (0, 0) || c.xfade != (0, 0) || c.speed != 1.0 || !c.frame.is_plain() {
                 return None;
             }
             t = c.end();
@@ -305,7 +457,10 @@ impl Edit {
     /// Lo que suena es justo el audio de `parts`, sin cambios: se puede copiar tal cual.
     fn plain_audio(&self, parts: &[Clip]) -> bool {
         let same = |a: &Clip, v: &Clip| {
-            a.path == v.path && (a.start, a.src_in, a.src_out, a.fade, a.xfade) == (v.start, v.src_in, v.src_out, (0, 0), (0, 0)) && (a.gain - 1.0).abs() < 0.001
+            a.path == v.path
+                && (a.start, a.src_in, a.len, a.fade, a.xfade) == (v.start, v.src_in, v.len, (0, 0), (0, 0))
+                && a.speed == 1.0
+                && (a.gain - 1.0).abs() < 0.001
         };
         let mut used = self.audio.iter().filter(|t| !t.is_empty());
         used.next().is_some_and(|a| a.len() == parts.len() && a.iter().zip(parts).all(|(a, v)| same(a, v))) && used.next().is_none()
@@ -413,10 +568,12 @@ pub fn export(edit: &Edit, out: &Path, opts: &ExportOpts, prog: &Progress) -> Re
         let edit = Edit {
             video: edit.video.clone(),
             audio: edit.audio.iter().map(|t| t.iter().filter(|c| probes[&c.path].audio.is_some()).cloned().collect()).collect(),
+            ratio: edit.ratio,
         };
         let info = &probes[&first.path];
+        let size = (info.width, info.height);
         let mut keys = HashMap::new();
-        let copy = edit.copy_parts().filter(|parts| {
+        let copy = edit.copy_parts(size).filter(|parts| {
             opts.target.is_none()
                 && parts.iter().all(|c| probes[&c.path].same_format(info))
                 && parts.iter().all(|c| on_keyframe(keys.entry(&c.path).or_insert_with(|| keyframes(&c.path).unwrap_or_default()), c.src_in))
@@ -426,7 +583,7 @@ pub fn export(edit: &Edit, out: &Path, opts: &ExportOpts, prog: &Progress) -> Re
             export_copy(&edit, parts, info, &tmp, prog, plain)?;
             return Ok(if plain { "sin recodificar: instantáneo y sin pérdida" } else { "video sin recodificar, audio ajustado" }.to_string());
         }
-        let why = if opts.target.is_none() && edit.copy_parts().is_some() { "renderizado con la GPU para cortar exacto" } else { "renderizado con la GPU" };
+        let why = if opts.target.is_none() && edit.copy_parts(size).is_some() { "renderizado con la GPU para cortar exacto" } else { "renderizado con la GPU" };
         // Todo en la GPU; si esa placa o ese archivo no se dejan, se decodifica por CPU (con devtools,
         // CLIPPY_CPU=1 fuerza ese camino para probarlo).
         let gpu = d3d_manager().ok().filter(|_| !cfg!(feature = "devtools") || std::env::var_os("CLIPPY_CPU").is_none());
@@ -577,14 +734,14 @@ unsafe fn export_copy(edit: &Edit, parts: &[Clip], info: &Probe, out: &Path, pro
                     base = Some(ts);
                     if let Some(a_s) = a_s {
                         for (asmp, ats) in pending_audio.drain(..) {
-                            if ats >= ts && ats < seg.src_out {
+                            if ats >= ts && ats < seg.src_out() {
                                 asmp.SetSampleTime(ats - ts + offset)?;
                                 w.WriteSample(a_s, &asmp)?;
                             }
                         }
                     }
                 }
-                if ts >= seg.src_out {
+                if ts >= seg.src_out() {
                     vdone = true;
                     continue;
                 }
@@ -601,7 +758,7 @@ unsafe fn export_copy(edit: &Edit, parts: &[Clip], info: &Probe, out: &Path, pro
                 match base {
                     None => pending_audio.push((s, ts)),
                     Some(b) => {
-                        if ts >= seg.src_out {
+                        if ts >= seg.src_out() {
                             adone = true;
                         } else if ts >= b {
                             s.SetSampleTime(ts - b + offset)?;
@@ -641,11 +798,14 @@ impl Pcm {
         Ok(Pcm { r, buf: Vec::new(), at: frames_at(from), eos: false })
     }
 
-    /// Suma a `out` (estéreo) los cuadros del archivo desde `from`, con el volumen `gain(k)` en el
-    /// cuadro `k`. Donde el archivo no tiene audio queda silencio. `from` nunca retrocede.
-    unsafe fn mix(&mut self, from: i64, out: &mut [f32], gain: impl Fn(i64) -> f32) -> Result<()> {
+    /// Suma a `out` (estéreo) el audio del archivo desde el cuadro `from` (puede caer entre dos), avanzando
+    /// `speed` cuadros del archivo por cada uno de la salida (más rápido suena más agudo, como una cinta), con el
+    /// volumen `gain(k)` en el cuadro `k` de la salida. Donde el archivo no tiene audio queda silencio. `from`
+    /// nunca retrocede.
+    unsafe fn mix(&mut self, from: f64, speed: f64, out: &mut [f32], gain: impl Fn(i64) -> f32) -> Result<()> {
         let n = (out.len() / 2) as i64;
-        while !self.eos && self.at + self.buf.len() as i64 / 2 < from + n {
+        let last = (from + n as f64 * speed).floor() as i64;
+        while !self.eos && self.at + self.buf.len() as i64 / 2 < last + 2 {
             let (mut flags, mut ts, mut s) = (0u32, 0i64, None);
             if self.r.ReadSample(AUDIO, 0, None, Some(&mut flags), Some(&mut ts), Some(&mut s)).is_err() {
                 self.eos = true;
@@ -665,20 +825,25 @@ impl Pcm {
                 self.eos = true;
             }
         }
+        let have = self.buf.len() as i64 / 2;
         for k in 0..n {
-            let i = from + k - self.at;
-            if i < 0 {
+            let pos = from + k as f64 * speed - self.at as f64;
+            if pos < 0.0 {
                 continue;
             }
-            let i = i as usize * 2;
-            if i + 1 >= self.buf.len() {
+            let i = pos.floor() as i64;
+            if i >= have {
                 break;
             }
+            // Entre dos cuadros del archivo, la mezcla de los dos.
+            let (a, b, f) = (i as usize * 2, (i + 1).min(have - 1) as usize * 2, (pos - i as f64) as f32);
             let g = gain(k);
-            out[k as usize * 2] += self.buf[i] as f32 * g;
-            out[k as usize * 2 + 1] += self.buf[i + 1] as f32 * g;
+            for ch in 0..2 {
+                let v = self.buf[a + ch] as f32 * (1.0 - f) + self.buf[b + ch] as f32 * f;
+                out[k as usize * 2 + ch] += v * g;
+            }
         }
-        let used = (from + n - self.at).clamp(0, self.buf.len() as i64 / 2);
+        let used = (last - self.at).clamp(0, have);
         self.buf.drain(..used as usize * 2);
         self.at += used;
         Ok(())
@@ -715,7 +880,7 @@ impl Mixer {
                 }
                 let (lo, hi) = (f.max(a), (f + n).min(b));
                 if pcm.is_none() {
-                    match Pcm::open(&c.path, c.src_in + time_of(lo - a)) {
+                    match Pcm::open(&c.path, c.src_at(c.start + time_of(lo - a))) {
                         Ok(p) => *pcm = Some(p),
                         Err(e) => {
                             crate::log::log(&format!("exportar: sin audio de {} ({e:?})", c.name()));
@@ -727,7 +892,8 @@ impl Mixer {
                 let c = &*c;
                 let gain = |k: i64| c.gain_at(c.start + time_of(lo + k - a));
                 if let Some(p) = pcm {
-                    p.mix(frames_at(c.src_in) + lo - a, &mut acc[((lo - f) * 2) as usize..((hi - f) * 2) as usize], gain)?;
+                    let from = frames_at(c.src_in) as f64 + (lo - a) as f64 * c.speed;
+                    p.mix(from, c.speed, &mut acc[((lo - f) * 2) as usize..((hi - f) * 2) as usize], gain)?;
                 }
             }
             let bytes: Vec<u8> = acc.iter().flat_map(|v| (v.clamp(i16::MIN as f32, i16::MAX as f32) as i16).to_le_bytes()).collect();
@@ -764,17 +930,20 @@ pub fn waveform(path: &Path) -> Result<Wave> {
     }
 }
 
-/// Video de una pieza decodificado en orden, ya al tamaño de la salida (NV12).
+/// Video de una pieza decodificado en orden, en NV12: del tamaño de la salida si se ve tal cual; si no, del
+/// tamaño del archivo, para recortarlo, girarlo y ubicarlo en el lienzo.
 struct Frames {
     r: IMFSourceReader,
     /// El cuadro que se ve ahora y el siguiente (tiempo del archivo y muestra).
     cur: Option<(i64, IMFSample)>,
     next: Option<(i64, IMFSample)>,
     eos: bool,
+    /// Tamaño de los cuadros que entrega.
+    size: (u32, u32),
     alloc_h: u32,
     stride: i32,
-    /// Tiempo del último cuadro que se escribió tal cual (no se repite).
-    written: Option<i64>,
+    /// El último cuadro que se escribió tal cual (tiempo del archivo) y cuándo (tiempo de la salida).
+    written: Option<(i64, i64)>,
 }
 
 impl Frames {
@@ -797,7 +966,7 @@ impl Frames {
         let alloc_h = unpack(cur.GetUINT64(&MF_MT_FRAME_SIZE).unwrap_or(pack(tw, th))).1.max(th);
         let stride = cur.GetUINT32(&MF_MT_DEFAULT_STRIDE).map(|v| v as i32).unwrap_or(tw as i32);
         seek(&r, from)?;
-        Ok(Frames { r, cur: None, next: None, eos: false, alloc_h, stride, written: None })
+        Ok(Frames { r, cur: None, next: None, eos: false, size: (tw, th), alloc_h, stride, written: None })
     }
 
     /// Avanza hasta el cuadro que se ve en `src` (tiempo del archivo, con `tol` de margen).
@@ -826,15 +995,19 @@ impl Frames {
     }
 
     /// El cuadro actual en NV12 compacto, para fundirlo o escribirlo desde la CPU.
-    unsafe fn bytes(&self, (w, h): (u32, u32)) -> Result<Vec<u8>> {
+    unsafe fn bytes(&self) -> Result<Vec<u8>> {
         let s = self.sample().ok_or_else(|| anyhow!("sin cuadro"))?;
-        nv12_bytes(s, w, h, self.alloc_h, self.stride)
+        nv12_bytes(s, self.size.0, self.size.1, self.alloc_h, self.stride)
     }
 }
 
-/// Procesador de video de la GPU para los cuadros que no salen tal cual del decodificador: el fundido
-/// de dos (dos entradas, la de arriba con transparencia) y el negro de los huecos. Sin shaders.
-struct Blender {
+/// `D3D11_VIDEO_COLOR` del negro en YCbCr (Y = 16, U = V = 128).
+const VP_BLACK: D3D11_VIDEO_COLOR = D3D11_VIDEO_COLOR { Anonymous: D3D11_VIDEO_COLOR_0 { YCbCr: D3D11_VIDEO_COLOR_YCbCrA { Y: 16.0 / 255.0, Cb: 0.5, Cr: 0.5, A: 1.0 } } };
+
+/// Procesador de video de la GPU (sin shaders) para los cuadros que no salen tal cual del decodificador: ubicar
+/// uno en el lienzo (recortado, girado, espejado y escalado, con negro alrededor), fundir dos (el de arriba con
+/// transparencia) y el negro de los huecos. Recibe cuadros de un solo tamaño (`in_size`).
+struct Vp {
     dev: ID3D11Device,
     ctx: ID3D11DeviceContext,
     vdev: ID3D11VideoDevice,
@@ -843,11 +1016,14 @@ struct Blender {
     vp: ID3D11VideoProcessor,
     inputs: Vec<(ID3D11Texture2D, ID3D11VideoProcessorInputView)>,
     black: ID3D11Texture2D,
-    size: (u32, u32),
+    /// Lo que sabe hacer (`D3D11_VIDEO_PROCESSOR_FEATURE_CAPS`).
+    caps: u32,
+    in_size: (u32, u32),
+    out_size: (u32, u32),
 }
 
-impl Blender {
-    unsafe fn new(mgr: &IMFDXGIDeviceManager, (w, h): (u32, u32)) -> Result<Blender> {
+impl Vp {
+    unsafe fn new(mgr: &IMFDXGIDeviceManager, in_size: (u32, u32), out_size: (u32, u32), streams: u32) -> Result<Vp> {
         let hd = mgr.OpenDeviceHandle()?;
         let mut dev: Option<ID3D11Device> = None;
         let got = mgr.GetVideoService(hd, &ID3D11Device::IID, &mut dev as *mut _ as *mut *mut c_void);
@@ -861,17 +1037,17 @@ impl Blender {
         let cd = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
             InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
             InputFrameRate: rate,
-            InputWidth: w,
-            InputHeight: h,
+            InputWidth: in_size.0,
+            InputHeight: in_size.1,
             OutputFrameRate: rate,
-            OutputWidth: w,
-            OutputHeight: h,
+            OutputWidth: out_size.0,
+            OutputHeight: out_size.1,
             Usage: D3D11_VIDEO_USAGE_OPTIMAL_SPEED,
         };
         let en = vdev.CreateVideoProcessorEnumerator(&cd)?;
         let mut caps = D3D11_VIDEO_PROCESSOR_CAPS::default();
         en.GetVideoProcessorCaps(&mut caps)?;
-        if caps.MaxInputStreams < 2 || caps.FeatureCaps & D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_ALPHA_STREAM.0 as u32 == 0 {
+        if streams > 1 && (caps.MaxInputStreams < streams || caps.FeatureCaps & D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_ALPHA_STREAM.0 as u32 == 0) {
             bail!("el procesador de video de esta GPU no funde dos imágenes");
         }
         let vp = vdev.CreateVideoProcessor(&en, 0)?;
@@ -881,43 +1057,43 @@ impl Blender {
             Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 { Texture2D: D3D11_TEX2D_VPIV { MipSlice: 0, ArraySlice: 0 } },
         };
         let mut inputs = Vec::new();
-        for i in 0..2 {
-            let t = nv12_texture(&dev, w, h, None)?;
+        for i in 0..streams {
+            let t = nv12_texture(&dev, in_size.0, in_size.1, None)?;
             let mut v = None;
             vdev.CreateVideoProcessorInputView(&t, &en, &ivd, Some(&mut v))?;
             inputs.push((t, v.ok_or_else(|| anyhow!("sin vista de entrada"))?));
             vctx.VideoProcessorSetStreamFrameFormat(&vp, i, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
             vctx.VideoProcessorSetStreamAutoProcessingMode(&vp, i, false);
         }
-        // Los dos cuadros y la salida en el mismo espacio de color: el procesador solo los mezcla.
+        // Entradas y salida en el mismo espacio de color: el procesador no convierte nada.
         if let Ok(v1) = vctx.cast::<ID3D11VideoContext1>() {
-            for i in 0..2 {
+            for i in 0..streams {
                 v1.VideoProcessorSetStreamColorSpace1(&vp, i, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709);
             }
             v1.VideoProcessorSetOutputColorSpace1(&vp, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709);
         }
-        let black = nv12_texture(&dev, w, h, Some(&black_nv12(w, h)))?;
-        Ok(Blender { dev, ctx, vdev, vctx, en, vp, inputs, black, size: (w, h) })
+        // Lo que no tapa ninguna imagen queda negro.
+        vctx.VideoProcessorSetOutputBackgroundColor(&vp, true, &VP_BLACK);
+        let black = nv12_texture(&dev, out_size.0, out_size.1, Some(&black_nv12(out_size.0, out_size.1)))?;
+        Ok(Vp { dev, ctx, vdev, vctx, en, vp, inputs, black, caps: caps.FeatureCaps, in_size, out_size })
     }
 
-    /// Copia el cuadro de `s` (una textura del decodificador) a la entrada `i`.
+    /// Copia el cuadro de `s` (una textura del decodificador o de otro procesador) a la entrada `i`.
     unsafe fn load(&self, i: usize, s: &IMFSample) -> Result<()> {
         let b: IMFDXGIBuffer = s.GetBufferByIndex(0)?.cast()?;
         let mut tex: Option<ID3D11Texture2D> = None;
         b.GetResource(&ID3D11Texture2D::IID, &mut tex as *mut _ as *mut *mut c_void)?;
         let tex = tex.ok_or_else(|| anyhow!("cuadro sin textura"))?;
-        // Solo el área de la salida: el decodificador puede entregar cuadros más altos (1088).
-        let (w, h) = self.size;
+        // Solo el área de la imagen: el decodificador puede entregar cuadros más altos (1088).
+        let (w, h) = self.in_size;
         let area = D3D11_BOX { left: 0, top: 0, front: 0, right: w, bottom: h, back: 1 };
         self.ctx.CopySubresourceRegion(&self.inputs[i].0, 0, 0, 0, 0, &tex, b.GetSubresourceIndex()?, Some(&area));
         Ok(())
     }
 
-    /// `b` encima de `a` con opacidad `alpha`, en un cuadro nuevo.
-    unsafe fn blend(&self, a: &IMFSample, b: &IMFSample, alpha: f32) -> Result<IMFSample> {
-        self.load(0, a)?;
-        self.load(1, b)?;
-        let out = nv12_texture(&self.dev, self.size.0, self.size.1, None)?;
+    /// Pasa las entradas por el procesador a un cuadro nuevo de la salida.
+    unsafe fn run(&self) -> Result<IMFSample> {
+        let out = nv12_texture(&self.dev, self.out_size.0, self.out_size.1, None)?;
         let ovd = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
             ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
             Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 { Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 } },
@@ -925,7 +1101,6 @@ impl Blender {
         let mut view = None;
         self.vdev.CreateVideoProcessorOutputView(&out, &self.en, &ovd, Some(&mut view))?;
         let view = view.ok_or_else(|| anyhow!("sin vista de salida"))?;
-        self.vctx.VideoProcessorSetStreamAlpha(&self.vp, 1, true, alpha);
         let mut streams: Vec<D3D11_VIDEO_PROCESSOR_STREAM> = self
             .inputs
             .iter()
@@ -939,17 +1114,57 @@ impl Blender {
         surface_sample(&out)
     }
 
+    /// `b` encima de `a` con opacidad `alpha`, en un cuadro nuevo.
+    unsafe fn blend(&self, a: &IMFSample, b: &IMFSample, alpha: f32) -> Result<IMFSample> {
+        self.load(0, a)?;
+        self.load(1, b)?;
+        self.vctx.VideoProcessorSetStreamAlpha(&self.vp, 1, true, alpha);
+        self.run()
+    }
+
+    /// El cuadro `s` en el lienzo como dice `p`, girado `turns` cuartos de vuelta y espejado si `flip`; negro
+    /// alrededor.
+    unsafe fn place(&self, s: &IMFSample, p: &Placed, f: &Frame) -> Result<IMFSample> {
+        let turns = f.turns % 4;
+        if turns != 0 && self.caps & D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_ROTATION.0 as u32 == 0 {
+            bail!("la GPU no puede girar la imagen");
+        }
+        self.load(0, s)?;
+        let (w, h) = (self.in_size.0 as f32, self.in_size.1 as f32);
+        let px = |r: [f32; 4], (w, h): (f32, f32)| windows::Win32::Foundation::RECT {
+            left: (r[0] * w).round() as i32,
+            top: (r[1] * h).round() as i32,
+            right: (r[2] * w).round() as i32,
+            bottom: (r[3] * h).round() as i32,
+        };
+        let src = px(p.src_rect(), (w, h));
+        let dst = px(p.dst, (1.0, 1.0));
+        self.vctx.VideoProcessorSetStreamSourceRect(&self.vp, 0, true, Some(&src));
+        self.vctx.VideoProcessorSetStreamDestRect(&self.vp, 0, true, Some(&dst));
+        // El procesador espeja antes de girar: girar y después espejar es lo mismo que espejar y girar al revés.
+        let turns = if f.flip { (4 - turns) % 4 } else { turns };
+        let rot = [D3D11_VIDEO_PROCESSOR_ROTATION_IDENTITY, D3D11_VIDEO_PROCESSOR_ROTATION_90, D3D11_VIDEO_PROCESSOR_ROTATION_180, D3D11_VIDEO_PROCESSOR_ROTATION_270];
+        self.vctx.VideoProcessorSetStreamRotation(&self.vp, 0, turns != 0, rot[turns as usize]);
+        if let Ok(v1) = self.vctx.cast::<ID3D11VideoContext1>() {
+            v1.VideoProcessorSetStreamMirror(&self.vp, 0, f.flip, f.flip, false);
+        } else if f.flip {
+            bail!("la GPU no puede espejar la imagen");
+        }
+        self.run()
+    }
+
     unsafe fn black(&self) -> Result<IMFSample> {
         surface_sample(&self.black)
     }
 }
 
-/// El procesador de video para fundir y para el negro, creado la primera vez que hace falta.
-unsafe fn blender<'a>(b: &'a mut Option<Blender>, mgr: &IMFDXGIDeviceManager, size: (u32, u32)) -> Result<&'a Blender> {
-    if b.is_none() {
-        *b = Some(Blender::new(mgr, size)?);
-    }
-    Ok(b.as_ref().unwrap())
+/// El procesador de video que recibe cuadros de `in_size` y entrega del tamaño de la salida, creado la primera vez
+/// que hace falta.
+unsafe fn vp<'a>(all: &'a mut HashMap<(u32, u32), Vp>, mgr: &IMFDXGIDeviceManager, in_size: (u32, u32), out_size: (u32, u32), streams: u32) -> Result<&'a Vp> {
+    Ok(match all.entry(in_size) {
+        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+        std::collections::hash_map::Entry::Vacant(e) => e.insert(Vp::new(mgr, in_size, out_size, streams)?),
+    })
 }
 
 /// Textura NV12 que el procesador de video puede escribir y el encoder leer.
@@ -986,6 +1201,13 @@ unsafe fn surface_sample(t: &ID3D11Texture2D) -> Result<IMFSample> {
     Ok(s)
 }
 
+/// Otra muestra con la misma imagen que `s`, para escribirla con otro tiempo.
+unsafe fn same_image(s: &IMFSample) -> Result<IMFSample> {
+    let o = MFCreateSample()?;
+    o.AddBuffer(&s.GetBufferByIndex(0)?)?;
+    Ok(o)
+}
+
 /// Cuadro NV12 negro (Y = 16, UV = 128).
 fn black_nv12(w: u32, h: u32) -> Vec<u8> {
     let n = (w * h) as usize;
@@ -1000,18 +1222,81 @@ fn mix_nv12(a: &[u8], b: &[u8], alpha: f32) -> Vec<u8> {
     a.iter().zip(b).map(|(&x, &y)| ((x as u32 * (256 - k) + y as u32 * k) >> 8) as u8).collect()
 }
 
+/// La imagen NV12 compacta `src` (`sw`×`sh`) en un lienzo negro de `tw`×`th` como dice `p` (lo mismo que hace
+/// `Vp::place` por GPU, con el píxel más cercano).
+fn place_nv12(src: &[u8], (sw, sh): (u32, u32), p: &Placed, (tw, th): (u32, u32)) -> Vec<u8> {
+    let (sw, sh, tw, th) = (sw as usize, sh as usize, tw as usize, th as usize);
+    let mut out = black_nv12(tw as u32, th as u32);
+    let [l, t, r, b] = p.dst;
+    let (x0, y0, x1, y1) = (l.round() as usize, t.round() as usize, (r.round() as usize).min(tw), (b.round() as usize).min(th));
+    // El píxel del archivo que cae en el punto (x, y) del lienzo.
+    let at = |x: f32, y: f32| {
+        let [u, v] = p.uv_at((x - l) / (r - l), (y - t) / (b - t));
+        (((u * sw as f32) as usize).min(sw - 1), ((v * sh as f32) as usize).min(sh - 1))
+    };
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let (sx, sy) = at(x as f32 + 0.5, y as f32 + 0.5);
+            out[y * tw + x] = src[sy * sw + sx];
+        }
+    }
+    // Color: U y V juntos, uno cada 2×2 píxeles.
+    for y in y0 / 2..y1.div_ceil(2).min(th / 2) {
+        for x in x0 / 2..x1.div_ceil(2).min(tw / 2) {
+            let (sx, sy) = at(x as f32 * 2.0 + 1.0, y as f32 * 2.0 + 1.0);
+            let (si, di) = (sw * sh + sy / 2 * sw + sx / 2 * 2, tw * th + y * tw + x * 2);
+            out[di] = src[si];
+            out[di + 1] = src[si + 1];
+        }
+    }
+    out
+}
+
+/// Un cuadro que no cambió no se vuelve a escribir (un clip de 30 fps sale a 60 sin cuadros de más), salvo cada
+/// tanto: una imagen congelada también tiene que seguir teniendo cuadros.
+const REPEAT_EVERY: i64 = 5_000_000;
+
+/// Cómo entra cada pieza de video en el lienzo: tal cual (del tamaño de la salida) o ubicada (`Placed`).
+struct Fit {
+    direct: bool,
+    placed: Option<Placed>,
+    /// Tamaño al que se decodifica.
+    size: (u32, u32),
+}
+
+impl Fit {
+    fn shows(&self) -> bool {
+        self.direct || self.placed.is_some()
+    }
+}
+
+/// El cuadro actual de `f` ya en el lienzo (por GPU).
+unsafe fn canvas_sample(f: &Frames, fit: &Fit, frame: &Frame, mgr: &IMFDXGIDeviceManager, placers: &mut HashMap<(u32, u32), Vp>, size: (u32, u32)) -> Result<IMFSample> {
+    let s = f.sample().ok_or_else(|| anyhow!("sin cuadro"))?;
+    match &fit.placed {
+        Some(p) if !fit.direct => vp(placers, mgr, f.size, size, 1)?.place(s, p, frame),
+        _ => same_image(s),
+    }
+}
+
+/// El cuadro actual de `f` ya en el lienzo (por CPU).
+unsafe fn canvas_bytes(f: &Frames, fit: &Fit, size: (u32, u32)) -> Result<Vec<u8>> {
+    match &fit.placed {
+        Some(p) if !fit.direct => Ok(place_nv12(&f.bytes()?, f.size, p, size)),
+        _ => f.bytes(),
+    }
+}
+
 /// Arma el video cuadro a cuadro y lo vuelve a codificar: en cada cuadro se ve la pista visible más alta
-/// que tenga algo (donde dos piezas se superponen, fundidas; donde no hay nada, negro) y suena la mezcla
-/// de todo. Con `gpu` los cuadros no salen de la placa de video (la GPU decodifica, escala, funde y
-/// codifica); sin ella se decodifica y se funde por CPU y se codifica por GPU.
+/// que tenga algo (donde dos piezas se superponen, fundidas; donde no hay nada, negro), cada pieza recortada,
+/// girada y ubicada en el lienzo, y suena la mezcla de todo. Con `gpu` los cuadros no salen de la placa de
+/// video (la GPU decodifica, escala, ubica, funde y codifica); sin ella se decodifica y se arma por CPU y se
+/// codifica por GPU.
 unsafe fn export_reencode(edit: &Edit, probes: &HashMap<PathBuf, Probe>, out: &Path, opts: &ExportOpts, prog: &Progress, gpu: Option<&IMFDXGIDeviceManager>) -> Result<()> {
     let info = edit.first_video().map(|c| &probes[&c.path]).ok_or_else(|| anyhow!("no hay video para exportar"))?;
-    let (sw, sh) = (info.width.max(2), info.height.max(2));
     let src_rate = if info.fps() > 0.0 { info.frame_rate } else { (60, 1) };
     let target = opts.target.unwrap_or(Target { height: 0, fps: 0, bitrate: opts.bitrate, constant: false });
-    // Tamaño de salida: el alto elegido (nunca más grande que el original) y el ancho proporcional.
-    let th = (if target.height == 0 || target.height >= sh { sh } else { target.height }) & !1;
-    let tw = ((sw as u64 * th as u64 / sh as u64) as u32).max(2) & !1;
+    let (tw, th) = canvas_size((info.width, info.height), edit.ratio, target.height);
     let fps = if target.fps == 0 || (target.fps as f64) >= src_rate.0 as f64 / src_rate.1 as f64 - 0.5 {
         src_rate
     } else {
@@ -1055,7 +1340,24 @@ unsafe fn export_reencode(edit: &Edit, probes: &HashMap<PathBuf, Probe>, out: &P
     let fdur = 10_000_000 * fps.1.max(1) as i64 / fps.0.max(1) as i64;
     let size = (tw, th);
     let len = edit.len();
-    let mut blend_gpu: Option<Blender> = None;
+    // Cómo entra cada pieza en el lienzo: tal cual si tiene su forma y no se tocó su imagen.
+    let fits: Vec<Vec<Fit>> = edit
+        .video
+        .iter()
+        .map(|t| {
+            t.iter()
+                .map(|c| {
+                    let p = &probes[&c.path];
+                    let src = (p.width.max(2) & !1, p.height.max(2) & !1);
+                    let direct = c.frame.is_plain() && same_shape(src, size);
+                    let placed = c.frame.place((src.0 as f32, src.1 as f32), (tw as f32, th as f32));
+                    Fit { direct, placed, size: if direct { size } else { src } }
+                })
+                .collect()
+        })
+        .collect();
+    let mut blend_gpu: HashMap<(u32, u32), Vp> = HashMap::new();
+    let mut placers: HashMap<(u32, u32), Vp> = HashMap::new();
     // Lo que se está leyendo de cada pieza de video (se abre al llegar a ella y se cierra al pasarla).
     let mut open: Vec<Vec<Option<Frames>>> = edit.video.iter().map(|t| t.iter().map(|_| None).collect()).collect();
     let mut t = 0i64;
@@ -1069,12 +1371,12 @@ unsafe fn export_reencode(edit: &Edit, probes: &HashMap<PathBuf, Probe>, out: &P
             }
         }
         // Lo que se ve en `t`, de abajo hacia arriba (con lo que todavía no tiene cuadro, afuera).
-        let shown = layers(&edit.video, t);
+        let shown: Vec<(usize, usize, f32)> = layers(&edit.video, t).into_iter().filter(|&(ti, i, _)| fits[ti][i].shows()).collect();
         for &(ti, i, _) in &shown {
             let c = &edit.video[ti][i];
-            let src = c.src_in + t - c.start;
+            let src = c.src_at(t);
             if open[ti][i].is_none() {
-                open[ti][i] = Some(Frames::open(c, src, size, gpu)?);
+                open[ti][i] = Some(Frames::open(c, src, fits[ti][i].size, gpu)?);
             }
             if let Some(f) = &mut open[ti][i] {
                 f.seek_to(src, fdur / 2)?;
@@ -1083,49 +1385,49 @@ unsafe fn export_reencode(edit: &Edit, probes: &HashMap<PathBuf, Probe>, out: &P
         let ready: Vec<(usize, usize, f32)> = shown.iter().copied().filter(|&(ti, i, _)| open[ti][i].as_ref().is_some_and(|f| f.cur.is_some())).collect();
         let sample = match ready[..] {
             [] if !shown.is_empty() => None,
-            // Un cuadro tal cual, si es nuevo (no se repite el mismo).
+            // Una sola imagen que tapa todo: su cuadro, si es nuevo.
             [(ti, i, a)] if a >= 1.0 => {
                 let f = open[ti][i].as_mut().unwrap();
-                let ts = f.cur.as_ref().map(|c| c.0);
-                if f.written == ts {
+                let ts = f.cur.as_ref().map_or(0, |c| c.0);
+                // El último cuadro siempre va: si no, el video terminaría donde se escribió el anterior.
+                if f.written.is_some_and(|(w, at)| w == ts && t - at < REPEAT_EVERY) && t + fdur < len {
                     None
                 } else {
-                    f.written = ts;
+                    f.written = Some((ts, t));
+                    let (fit, frame) = (&fits[ti][i], &edit.video[ti][i].frame);
                     Some(match gpu {
-                        Some(_) => f.sample().unwrap().clone(),
-                        None => mem_sample(&f.bytes(size)?)?,
+                        Some(m) => canvas_sample(f, fit, frame, m, &mut placers, size)?,
+                        None => mem_sample(&canvas_bytes(f, fit, size)?)?,
                     })
                 }
             }
             // Cada capa encima de lo de abajo con su opacidad, empezando por negro si lo de abajo no tapa todo.
-            _ => {
-                let frames = |ti: usize, i: usize| open[ti][i].as_ref().unwrap();
-                Some(match gpu {
-                    Some(m) => {
-                        let b = blender(&mut blend_gpu, m, size)?;
-                        let mut acc: Option<IMFSample> = None;
-                        for &(ti, i, a) in &ready {
-                            let s = frames(ti, i).sample().unwrap();
-                            acc = Some(match acc {
-                                None if a >= 1.0 => s.clone(),
-                                None => b.blend(&b.black()?, s, a)?,
-                                Some(under) => b.blend(&under, s, a)?,
-                            });
-                        }
-                        match acc {
-                            Some(s) => s,
-                            None => b.black()?,
-                        }
+            _ => Some(match gpu {
+                Some(m) => {
+                    let mut acc: Option<IMFSample> = None;
+                    for &(ti, i, a) in &ready {
+                        let f = open[ti][i].as_ref().unwrap();
+                        let s = canvas_sample(f, &fits[ti][i], &edit.video[ti][i].frame, m, &mut placers, size)?;
+                        let b = vp(&mut blend_gpu, m, size, size, 2)?;
+                        acc = Some(match acc {
+                            None if a >= 1.0 => s,
+                            None => b.blend(&b.black()?, &s, a)?,
+                            Some(under) => b.blend(&under, &s, a)?,
+                        });
                     }
-                    None => {
-                        let mut acc = black_nv12(tw, th);
-                        for &(ti, i, a) in &ready {
-                            acc = mix_nv12(&acc, &frames(ti, i).bytes(size)?, a);
-                        }
-                        mem_sample(&acc)?
+                    match acc {
+                        Some(s) => s,
+                        None => vp(&mut blend_gpu, m, size, size, 2)?.black()?,
                     }
-                })
-            }
+                }
+                None => {
+                    let mut acc = black_nv12(tw, th);
+                    for &(ti, i, a) in &ready {
+                        acc = mix_nv12(&acc, &canvas_bytes(open[ti][i].as_ref().unwrap(), &fits[ti][i], size)?, a);
+                    }
+                    mem_sample(&acc)?
+                }
+            }),
         };
         if let Some(s) = sample {
             s.SetSampleTime(t)?;
@@ -1141,7 +1443,6 @@ unsafe fn export_reencode(edit: &Edit, probes: &HashMap<PathBuf, Probe>, out: &P
     w.Finalize()?;
     Ok(())
 }
-
 
 // --- Índice MP4 (moov/trak/.../stss + stts) -------------------------------------------
 

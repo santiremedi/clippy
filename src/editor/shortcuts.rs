@@ -34,6 +34,8 @@ pub enum Act {
     Split,
     Duplicate,
     Delete,
+    Freeze,
+    Marker,
     MuteClip,
     Link,
     Magnet,
@@ -47,7 +49,7 @@ pub enum Act {
     Shortcuts,
 }
 
-pub const ALL: [Act; 21] = [
+pub const ALL: [Act; 23] = [
     Act::PlayPause,
     Act::PrevFrame,
     Act::NextFrame,
@@ -58,6 +60,8 @@ pub const ALL: [Act; 21] = [
     Act::Split,
     Act::Duplicate,
     Act::Delete,
+    Act::Freeze,
+    Act::Marker,
     Act::MuteClip,
     Act::Link,
     Act::Magnet,
@@ -80,7 +84,7 @@ fn k(key: &str, ctrl: bool, shift: bool) -> Combo {
 impl Act {
     /// Cambia las piezas de la línea de tiempo (sus posiciones o su cantidad).
     pub fn edits_timeline(self) -> bool {
-        matches!(self, Act::Split | Act::Duplicate | Act::Delete | Act::MuteClip | Act::Link | Act::Undo | Act::Redo)
+        matches!(self, Act::Split | Act::Duplicate | Act::Delete | Act::Freeze | Act::MuteClip | Act::Link | Act::Undo | Act::Redo)
     }
 
     pub fn id(self) -> &'static str {
@@ -95,6 +99,8 @@ impl Act {
             Act::Split => "split",
             Act::Duplicate => "duplicate",
             Act::Delete => "delete",
+            Act::Freeze => "freeze",
+            Act::Marker => "marker",
             Act::MuteClip => "mute_clip",
             Act::Link => "link_audio",
             Act::Magnet => "magnet",
@@ -121,7 +127,9 @@ impl Act {
             Act::Split => "Dividir en el cursor",
             Act::Duplicate => "Duplicar clip",
             Act::Delete => "Eliminar clip",
-            Act::MuteClip => "Silenciar / activar sonido del clip",
+            Act::Freeze => "Congelar el cuadro del cursor",
+            Act::Marker => "Poner o sacar un marcador",
+            Act::MuteClip => "Silenciar o activar el sonido del clip",
             Act::Link => "Separar o unir el audio y el video",
             Act::Magnet => "Imán: pegar los clips solos",
             Act::Undo => "Deshacer",
@@ -131,14 +139,14 @@ impl Act {
             Act::ZoomFit => "Ver toda la línea de tiempo",
             Act::Import => "Importar videos",
             Act::Export => "Exportar video",
-            Act::Shortcuts => "Ver atajos de teclado",
+            Act::Shortcuts => "Ayuda y atajos",
         }
     }
 
     pub fn group(self) -> &'static str {
         GROUPS[match self {
             Act::PlayPause | Act::PrevFrame | Act::NextFrame | Act::Back | Act::Forward | Act::ToStart | Act::ToEnd => 0,
-            Act::Split | Act::Duplicate | Act::Delete | Act::MuteClip | Act::Link | Act::Magnet | Act::Undo | Act::Redo => 1,
+            Act::Split | Act::Duplicate | Act::Delete | Act::Freeze | Act::Marker | Act::MuteClip | Act::Link | Act::Magnet | Act::Undo | Act::Redo => 1,
             Act::ZoomIn | Act::ZoomOut | Act::ZoomFit => 2,
             Act::Import | Act::Export | Act::Shortcuts => 3,
         }]
@@ -156,7 +164,9 @@ impl Act {
             Act::Split => k("S", false, false),
             Act::Duplicate => k("D", true, false),
             Act::Delete => k("Delete", false, false),
-            Act::MuteClip => k("M", false, false),
+            Act::Freeze => k("F", false, false),
+            Act::Marker => k("M", false, false),
+            Act::MuteClip => k("M", false, true),
             Act::Link => k("L", true, false),
             Act::Magnet => k("N", false, false),
             Act::Undo => k("Z", true, false),
