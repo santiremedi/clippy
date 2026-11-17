@@ -192,7 +192,7 @@ impl App {
         let mut failed = Vec::new();
         for a in GlobalAction::ALL {
             let (vk, mods) = self.cfg.hotkey(a);
-            // Guardar clip solo mientras graba; pausar y abrir editor, siempre.
+            // Guardar clip solo mientras graba; los demás, siempre.
             if vk == 0 || (a == GlobalAction::SaveClip && !self.cfg.enabled) {
                 continue;
             }
@@ -368,15 +368,17 @@ fn run_command(id: usize) {
                 a.apply(c, false);
             });
         }
-        ID_FOLDER => {
-            if let Some(d) = with_app(|a| a.cfg.output_dir.clone()) {
-                open_folder(&d);
-            }
-        }
+        ID_FOLDER => open_clips_folder(),
         ID_EXIT => {
             with_app(|a| a.quit());
         }
         _ => {}
+    }
+}
+
+fn open_clips_folder() {
+    if let Some(d) = with_app(|a| a.cfg.output_dir.clone()) {
+        open_folder(&d);
     }
 }
 
@@ -407,6 +409,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     });
                 }
                 Some(GlobalAction::OpenEditor) => open_editor(),
+                Some(GlobalAction::OpenFolder) => open_clips_folder(),
                 None => {}
             }
             LRESULT(0)

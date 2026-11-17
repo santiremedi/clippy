@@ -73,6 +73,9 @@ pub struct Config {
     /// Atajo global para abrir el editor (vk 0 = sin asignar).
     pub editor_vk: u32,
     pub editor_mods: u32,
+    /// Atajo global para abrir la carpeta de clips (vk 0 = sin asignar).
+    pub folder_vk: u32,
+    pub folder_mods: u32,
 }
 
 /// Atajos globales: funcionan en cualquier momento, incluso dentro del juego.
@@ -81,10 +84,12 @@ pub enum GlobalAction {
     SaveClip,
     ToggleRecording,
     OpenEditor,
+    OpenFolder,
 }
 
 impl GlobalAction {
-    pub const ALL: [GlobalAction; 3] = [GlobalAction::SaveClip, GlobalAction::ToggleRecording, GlobalAction::OpenEditor];
+    pub const ALL: [GlobalAction; 4] =
+        [GlobalAction::SaveClip, GlobalAction::ToggleRecording, GlobalAction::OpenEditor, GlobalAction::OpenFolder];
 
     /// Id para RegisterHotKey / WM_HOTKEY.
     pub fn id(self) -> i32 {
@@ -100,6 +105,7 @@ impl GlobalAction {
             GlobalAction::SaveClip => "Guardar clip",
             GlobalAction::ToggleRecording => "Pausar / reanudar grabación",
             GlobalAction::OpenEditor => "Abrir el editor",
+            GlobalAction::OpenFolder => "Abrir la carpeta de clips",
         }
     }
 }
@@ -127,6 +133,8 @@ impl Default for Config {
             toggle_mods: 0,
             editor_vk: 0,
             editor_mods: 0,
+            folder_vk: 0,
+            folder_mods: 0,
         }
     }
 }
@@ -158,12 +166,15 @@ impl Config {
         }
         self.hotkey_mods &= 0x7;
         self.toggle_mods &= 0x7;
-        self.editor_mods &= 0x7;
-        if self.toggle_vk > 0xFE {
-            self.toggle_vk = 0;
-        }
-        if self.editor_vk > 0xFE {
-            self.editor_vk = 0;
+        for a in GlobalAction::ALL {
+            if a == GlobalAction::SaveClip {
+                continue;
+            }
+            let (vk, mods) = self.hotkey_mut(a);
+            *mods &= 0x7;
+            if *vk > 0xFE {
+                *vk = 0;
+            }
         }
     }
 
@@ -173,6 +184,7 @@ impl Config {
             GlobalAction::SaveClip => (self.hotkey_vk, self.hotkey_mods),
             GlobalAction::ToggleRecording => (self.toggle_vk, self.toggle_mods),
             GlobalAction::OpenEditor => (self.editor_vk, self.editor_mods),
+            GlobalAction::OpenFolder => (self.folder_vk, self.folder_mods),
         }
     }
 
@@ -191,6 +203,7 @@ impl Config {
             GlobalAction::SaveClip => (&mut self.hotkey_vk, &mut self.hotkey_mods),
             GlobalAction::ToggleRecording => (&mut self.toggle_vk, &mut self.toggle_mods),
             GlobalAction::OpenEditor => (&mut self.editor_vk, &mut self.editor_mods),
+            GlobalAction::OpenFolder => (&mut self.folder_vk, &mut self.folder_mods),
         }
     }
 }
