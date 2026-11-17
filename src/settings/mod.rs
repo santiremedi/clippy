@@ -37,6 +37,9 @@ pub fn run() {
     );
 }
 
+/// Resultado de un trabajo en segundo plano (None = todavía no terminó).
+type Shared<T> = std::sync::Arc<std::sync::Mutex<Option<T>>>;
+
 struct SettingsApp {
     cfg: Config,
     saved: Config,
@@ -57,8 +60,11 @@ struct SettingsApp {
     mics: Vec<(String, String)>,
     /// Versión nueva disponible y estado de la descarga.
     update: Option<(String, String)>,
-    update_status: std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>>,
+    update_status: Shared<Result<(), String>>,
     updating: bool,
+    /// "Buscar actualizaciones": la consulta en curso y su resultado (versión nueva, si hay).
+    check: Shared<Result<Option<String>, String>>,
+    checking: bool,
     maximized: bool,
     page: Page,
     confirm_quit: bool,
@@ -95,6 +101,8 @@ impl SettingsApp {
             update: None,
             update_status: Default::default(),
             updating: false,
+            check: Default::default(),
+            checking: false,
             maximized: false,
             page: Page::Home,
             confirm_quit: false,
@@ -127,6 +135,31 @@ impl SettingsApp {
             let r = update::download(&url).and_then(|p| update::start_install(&p)).map_err(|e| e.to_string());
             *st.lock().unwrap() = Some(r);
         });
+    }
+
+    /// "Buscar actualizaciones": una consulta en segundo plano.
+    fn start_check(&mut self) {
+        self.checking = true;
+        let st = self.check.clone();
+        *st.lock().unwrap() = None;
+        std::thread::spawn(move || {
+            let r = update::check_now().map_err(|e| e.to_string());
+            *st.lock().unwrap() = Some(r);
+        });
+    }
+
+    /// Mientras se busca, mirar si terminó; si hay versión nueva aparece el botón para actualizar.
+    fn finish_check(&mut self, ctx: &egui::Context) {
+        if !self.checking {
+            return;
+        }
+        match &*self.check.lock().unwrap() {
+            Some(_) => self.checking = false,
+            None => ctx.request_repaint_after(Duration::from_millis(200)),
+        }
+        if !self.checking {
+            self.update = update::available();
+        }
     }
 
     /// Hay una descarga en curso (todavía sin resultado).

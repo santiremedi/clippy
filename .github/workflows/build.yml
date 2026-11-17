@@ -18,9 +18,32 @@ permissions:
   contents: read
 
 jobs:
+  # PRs y main: verificar que compila (con y sin las pruebas) y los avisos de clippy.
+  # En debug y sin LTO: varias veces más rápido que compilar el exe final.
+  # Se llama "build" porque la protección de main pide ese check.
   build:
+    if: github.event_name != 'workflow_dispatch'
     runs-on: windows-latest
-    # Escribir solo para crear el release (en PRs de forks GitHub igual da solo lectura).
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --locked
+
+      - name: Clippy con devtools
+        run: cargo clippy --locked --features devtools
+
+  # Publicar a mano (Actions → Build → Run workflow): el exe final, una sola vez.
+  release:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    # Escribir solo para crear el release.
     permissions:
       contents: write
     steps:
@@ -32,9 +55,6 @@ jobs:
 
       - name: Compilar
         run: cargo build --release --locked
-
-      - name: Compilar con devtools (solo para verificar)
-        run: cargo build --release --locked --features devtools --target-dir target/dev
 
       - name: Preparar Clippy.exe
         shell: bash
@@ -48,7 +68,7 @@ jobs:
           path: Clippy.exe
 
       - name: Publicar el release
-        if: github.event_name == 'workflow_dispatch' && inputs.publish && inputs.tag != ''
+        if: inputs.publish && inputs.tag != ''
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}

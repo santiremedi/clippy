@@ -98,6 +98,11 @@ impl Window {
         }
     }
 
+    /// ¿Está abierta (o terminando de cerrarse)?
+    pub fn running(self) -> bool {
+        mutex_exists(self.mutex())
+    }
+
     /// Pide cerrarla (como si el usuario tocara la X).
     pub fn close(self) {
         if let Some(h) = find_own_window(self.title()) {
@@ -128,8 +133,13 @@ pub const WM_UPDATE: u32 = WM_APP + 6;
 
 /// ¿Está abierta la grabadora? (aunque su ventana todavía no exista).
 pub fn tray_running() -> bool {
+    mutex_exists(TRAY_MUTEX)
+}
+
+/// ¿Algún proceso tiene tomado ese candado de instancia única?
+fn mutex_exists(name: PCWSTR) -> bool {
     unsafe {
-        match OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, TRAY_MUTEX) {
+        match OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, name) {
             Ok(h) => {
                 let _ = CloseHandle(h);
                 true
