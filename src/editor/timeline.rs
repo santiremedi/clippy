@@ -1,7 +1,7 @@
-//! Línea de tiempo: pistas de video y de audio con sus piezas, las ediciones y deshacer.
+//! Línea de tiempo: pistas de video y de audio con sus piezas, marcadores, las ediciones y deshacer.
 //!
 //! Un clip entra como dos piezas unidas, la imagen en una pista de video y el sonido en una de audio:
-//! se eligen, mueven, recortan, dividen y borran juntas hasta que se las separa.
+//! se eligen, mueven, recortan, dividen, aceleran y borran juntas hasta que se las separa.
 //!
 //! Con el imán prendido, las piezas de cada pista quedan una detrás de la otra desde el inicio
 //! (si dos ya se fundían, siguen igual). Apagado, cada pieza queda donde se la suelta; si se
@@ -9,17 +9,19 @@
 
 use std::path::{Path, PathBuf};
 
-use super::media::{self, Clip, Curve, Edit};
+use super::media::{self, Clip, Curve, Edit, Frame, Ratio};
 use super::playback::UNKNOWN_FRAME;
 use super::EditorApp;
 
 pub(super) const MIN_LEN: i64 = 2_000_000; // 0,2 s
+/// Cuánto dura un cuadro congelado recién creado.
+const FREEZE_LEN: i64 = 30_000_000;
 /// Pasos de deshacer que se guardan.
 const UNDO_MAX: usize = 100;
 /// Pistas de cada tipo como máximo: más no entran en la línea de tiempo.
 pub(super) const MAX_TRACKS: usize = 4;
 
-fn push_capped(stack: &mut Vec<Vec<Track>>, v: Vec<Track>) {
+fn push_capped(stack: &mut Vec<Snapshot>, v: Snapshot) {
     stack.push(v);
     if stack.len() > UNDO_MAX {
         stack.remove(0);
@@ -36,10 +38,13 @@ pub(super) enum TrackKind {
 pub(super) struct Piece {
     pub(super) id: u64,
     pub(super) path: PathBuf,
-    /// Dónde empieza en la línea.
+    /// Dónde empieza en la línea y cuánto dura ahí.
     pub(super) start: i64,
+    pub(super) len: i64,
+    /// Dónde empieza en el archivo.
     pub(super) src_in: i64,
-    pub(super) src_out: i64,
+    /// Cuánto del archivo pasa en cada instante de la línea (ver `media::src_at`); 0 = imagen congelada.
+    pub(super) speed: f64,
     pub(super) gain: f32,
     pub(super) muted: bool,
     /// Las piezas con el mismo número (distinto de 0) están unidas: la imagen y el sonido de un clip.
@@ -49,17 +54,35 @@ pub(super) struct Piece {
     pub(super) fade_out: i64,
     /// Forma del fundido de entrada y del de salida (cada uno se elige con clic derecho sobre él).
     pub(super) curves: (Curve, Curve),
+    /// Cómo se ve su imagen en el lienzo (solo cuenta en las pistas de video).
+    pub(super) frame: Frame,
 }
 
 impl Piece {
-    pub(super) fn len(&self) -> i64 {
-        self.src_out - self.src_in
-    }
     pub(super) fn end(&self) -> i64 {
-        self.start + self.len()
+        self.start + self.len
     }
     pub(super) fn covers(&self, t: i64) -> bool {
         self.start <= t && t < self.end()
+    }
+    /// El instante del archivo que se ve o se oye en `t` de la línea.
+    pub(super) fn src_at(&self, t: i64) -> i64 {
+        media::src_at(self.start, self.src_in, self.speed, t)
+    }
+    pub(super) fn src_out(&self) -> i64 {
+        self.src_at(self.end())
+    }
+    /// Una imagen quieta: el mismo cuadro todo el tiempo.
+    pub(super) fn still(&self) -> bool {
+        self.speed == 0.0
+    }
+    /// Cuánto dura en la línea un tramo `src` del archivo (en una imagen quieta, todo lo que se quiera).
+    fn line_len(&self, src: i64) -> i64 {
+        if self.still() {
+            i64::MAX / 4
+        } else {
+            (src as f64 / self.speed).floor() as i64
+        }
     }
     pub(super) fn eff_gain(&self) -> f32 {
         if self.muted {
@@ -70,8 +93,8 @@ impl Piece {
     }
     /// Que los fundidos a negro entren en la pieza (después de recortarla).
     fn fit_fades(&mut self) {
-        self.fade_in = self.fade_in.min(self.len());
-        self.fade_out = self.fade_out.min(self.len() - self.fade_in);
+        self.fade_in = self.fade_in.min(self.len);
+        self.fade_out = self.fade_out.min(self.len - self.fade_in);
     }
 }
 
@@ -101,6 +124,11 @@ impl Track {
         media::overlaps(&self.clips.iter().map(|p| (p.start, p.end())).collect::<Vec<_>>())
     }
 
+    /// Cuánto se superpone cada pieza con la anterior (con el imán, eso se mantiene al cambiar un largo).
+    fn joins(&self) -> Vec<i64> {
+        self.overlaps().iter().map(|f| f.0).collect()
+    }
+
     /// Lo que hay en esta pista se oye.
     pub(super) fn sounds(&self) -> bool {
         self.kind == TrackKind::Audio && !self.muted
@@ -113,7 +141,7 @@ impl Track {
     /// Con el imán: aplica `f` a las piezas y a cuánto se superpone cada una con la anterior
     /// (0 = pegadas) y las vuelve a poner una detrás de la otra desde el inicio.
     fn reflow(&mut self, f: impl FnOnce(&mut Vec<Piece>, &mut Vec<i64>)) {
-        let mut ov: Vec<i64> = self.overlaps().iter().map(|f| f.0).collect();
+        let mut ov = self.joins();
         f(&mut self.clips, &mut ov);
         self.relayout(&ov);
     }
@@ -124,10 +152,10 @@ impl Track {
         let mut end = 0;
         let mut prev = 0;
         for (i, p) in self.clips.iter_mut().enumerate() {
-            let o = if i == 0 { 0 } else { ov.get(i).copied().unwrap_or(0).clamp(0, prev.min(p.len()) / 2) };
+            let o = if i == 0 { 0 } else { ov.get(i).copied().unwrap_or(0).clamp(0, prev.min(p.len) / 2) };
             p.start = end - o;
             end = p.end();
-            prev = p.len();
+            prev = p.len;
         }
     }
 
@@ -147,6 +175,25 @@ impl Track {
         p.unwrap()
     }
 
+    /// Mete `p` donde empieza y corre lo que empieza ahí o después lo que dura `p` (con el imán, pegada a sus vecinas).
+    fn insert(&mut self, p: Piece, magnet: bool) {
+        let k = self.clips.iter().filter(|c| c.start < p.start).count();
+        if magnet {
+            self.reflow(|c, ov| {
+                c.insert(k, p);
+                ov.insert(k, 0);
+                if let Some(o) = ov.get_mut(k + 1) {
+                    *o = 0;
+                }
+            });
+        } else {
+            for c in self.clips.iter_mut().skip(k) {
+                c.start += p.len;
+            }
+            self.clips.insert(k, p);
+        }
+    }
+
     /// Pone `p`: con el imán, en el lugar que le toca a su centro y pegada a sus vecinas; sin él, donde dice su inicio.
     fn put(&mut self, p: Piece, magnet: bool) {
         if !magnet {
@@ -154,8 +201,8 @@ impl Track {
             self.sort();
             return;
         }
-        let center = p.start + p.len() / 2;
-        let k = self.clips.iter().filter(|c| c.start + c.len() / 2 < center).count();
+        let center = p.start + p.len / 2;
+        let k = self.clips.iter().filter(|c| c.start + c.len / 2 < center).count();
         self.reflow(|c, ov| {
             c.insert(k, p);
             ov.insert(k, 0);
@@ -164,6 +211,14 @@ impl Track {
             }
         });
     }
+}
+
+/// Cómo estaba la línea de tiempo (pistas, marcadores y proporción), para deshacer.
+#[derive(Clone)]
+pub(super) struct Snapshot {
+    tracks: Vec<Track>,
+    markers: Vec<i64>,
+    ratio: Option<Ratio>,
 }
 
 /// Una pieza a la que se le cambia un fundido arrastrando una esquina de arriba.
@@ -270,22 +325,50 @@ impl EditorApp {
         self.tracks.len() - 1
     }
 
+    /// Cómo está la línea ahora.
+    pub(super) fn snapshot(&self) -> Snapshot {
+        Snapshot { tracks: self.tracks.clone(), markers: self.markers.clone(), ratio: self.ratio }
+    }
+
     /// Guarda cómo estaba la línea (`before`) para poder deshacer el cambio que se hizo o se va a hacer.
-    pub(super) fn record_undo(&mut self, before: Vec<Track>) {
+    pub(super) fn record(&mut self, before: Snapshot) {
         self.dirty = true;
         push_capped(&mut self.undo, before);
         self.redo.clear();
     }
 
-    fn push_undo(&mut self) {
-        self.record_undo(self.tracks.clone());
+    /// Como `record`, para un cambio que solo tocó las pistas (`before`).
+    pub(super) fn record_undo(&mut self, before: Vec<Track>) {
+        let s = Snapshot { tracks: before, ..self.snapshot() };
+        self.record(s);
+    }
+
+    /// Como `record`, para un cambio que solo movió marcadores (`before`).
+    pub(super) fn record_markers(&mut self, before: Vec<i64>) {
+        if before != self.markers {
+            let s = Snapshot { markers: before, ..self.snapshot() };
+            self.record(s);
+        }
+    }
+
+    pub(super) fn push_undo(&mut self) {
+        self.record(self.snapshot());
+    }
+
+    fn restore(&mut self, s: Snapshot) -> Snapshot {
+        let now = self.snapshot();
+        self.tracks = s.tracks;
+        self.markers = s.markers;
+        self.ratio = s.ratio;
+        now
     }
 
     pub(super) fn undo(&mut self) {
         if let Some(prev) = self.undo.pop() {
             let pos = self.pos();
             self.dirty = true;
-            self.redo.push(std::mem::replace(&mut self.tracks, prev));
+            let now = self.restore(prev);
+            self.redo.push(now);
             self.after_edit(pos);
         }
     }
@@ -294,10 +377,44 @@ impl EditorApp {
         if let Some(next) = self.redo.pop() {
             let pos = self.pos();
             self.dirty = true;
-            let now = std::mem::replace(&mut self.tracks, next);
+            let now = self.restore(next);
             push_capped(&mut self.undo, now);
             self.after_edit(pos);
         }
+    }
+
+    /// Quita de la línea, y de lo que se puede deshacer, las piezas de archivos que ya no existen (`gone`).
+    pub(super) fn forget_files(&mut self, gone: &[PathBuf]) {
+        let magnet = self.prefs.magnet;
+        for t in &mut self.tracks {
+            for i in (0..t.clips.len()).rev() {
+                if gone.contains(&t.clips[i].path) {
+                    t.take(i, magnet);
+                }
+            }
+        }
+        for s in self.undo.iter_mut().chain(self.redo.iter_mut()) {
+            for t in &mut s.tracks {
+                t.clips.retain(|p| !gone.contains(&p.path));
+            }
+        }
+        let pos = self.pos();
+        self.after_edit(pos);
+    }
+
+    /// Un archivo cambió de lugar (`from` -> `to`): las piezas que lo usan lo siguen.
+    pub(super) fn moved_file(&mut self, from: &Path, to: &Path) {
+        let fix = |t: &mut Vec<Track>| {
+            for p in t.iter_mut().flat_map(|t| t.clips.iter_mut()).filter(|p| p.path == from) {
+                p.path = to.to_path_buf();
+            }
+        };
+        fix(&mut self.tracks);
+        for s in self.undo.iter_mut().chain(self.redo.iter_mut()) {
+            fix(&mut s.tracks);
+        }
+        let pos = self.pos();
+        self.after_edit(pos);
     }
 
     /// Agrega el clip al final de la primera pista de video, con su sonido unido en la primera de audio.
@@ -310,7 +427,21 @@ impl EditorApp {
         let vt = self.first_track(TrackKind::Video);
         let start = self.tracks[vt].end();
         let id = self.new_id();
-        let mut p = Piece { id, path: path.to_path_buf(), start, src_in: 0, src_out: pr.duration, gain: 1.0, muted: false, link: 0, fade_in: 0, fade_out: 0, curves: (Curve::Linear, Curve::Linear) };
+        let mut p = Piece {
+            id,
+            path: path.to_path_buf(),
+            start,
+            len: pr.duration,
+            src_in: 0,
+            speed: 1.0,
+            gain: 1.0,
+            muted: false,
+            link: 0,
+            fade_in: 0,
+            fade_out: 0,
+            curves: (Curve::Linear, Curve::Linear),
+            frame: Frame::default(),
+        };
         if pr.audio.is_some() {
             p.link = self.new_id();
             let mut a = p.clone();
@@ -326,39 +457,95 @@ impl EditorApp {
         self.message = None;
     }
 
-    /// Divide en el cursor la pieza elegida (con su pareja) si está ahí; si no, la de más arriba.
-    pub(super) fn split(&mut self) {
+    /// La pieza (con su pareja) que se edita con el cursor: la elegida si está en el cursor; si no, la de más
+    /// arriba ahí. Con `video`, solo una que tenga imagen.
+    fn at_cursor(&self, video: bool) -> Option<(usize, usize)> {
         let t = self.pos();
-        let chosen = self.selection().filter(|&(ti, i)| self.tracks[ti].clips[i].covers(t));
-        let Some((ti, i)) = chosen.or_else(|| self.piece_at(t)) else { return };
+        let ok = |&(ti, i): &(usize, usize)| self.tracks[ti].clips[i].covers(t) && (!video || self.tracks[ti].kind == TrackKind::Video);
+        let chosen = self.selected.map(|id| self.group(id)).unwrap_or_default().into_iter().find(ok);
+        chosen.or_else(|| self.display_order().into_iter().find_map(|ti| self.tracks[ti].clips.iter().rposition(|p| p.covers(t)).map(|i| (ti, i))).filter(ok))
+    }
+
+    /// Parte en `t` las piezas del grupo de `(ti, i)` que lo cruzan, si a todas les queda al menos MIN_LEN de
+    /// cada lado. Devuelve el id de la mitad de la derecha de `(ti, i)`.
+    fn split_at(&mut self, (ti, i): (usize, usize), t: i64) -> Option<u64> {
         let parts: Vec<(usize, usize)> = self.group(self.tracks[ti].clips[i].id).into_iter().filter(|&(tj, j)| self.tracks[tj].clips[j].covers(t)).collect();
         let fits = |p: &Piece| t - p.start >= MIN_LEN && p.end() - t >= MIN_LEN;
         if !parts.iter().all(|&(tj, j)| fits(&self.tracks[tj].clips[j])) {
-            return;
+            return None;
         }
-        self.push_undo();
         let link = if parts.len() > 1 { self.new_id() } else { 0 };
         let clicked = self.tracks[ti].clips[i].id;
+        let mut right = None;
         for (tj, j) in parts {
             let mut b = self.tracks[tj].clips[j].clone();
-            let st = b.src_in + t - b.start;
             b.id = self.new_id();
-            b.src_in = st;
+            b.src_in = b.src_at(t);
+            b.len = b.end() - t;
             b.start = t;
             b.link = link;
             b.fade_in = 0;
             if self.tracks[tj].clips[j].id == clicked {
-                self.selected = Some(b.id);
+                right = Some(b.id);
             }
             let track = &mut self.tracks[tj];
-            track.clips[j].src_out = st;
-            track.clips[j].fade_out = 0;
-            track.clips[j].fit_fades();
+            let a = &mut track.clips[j];
+            a.len = t - a.start;
+            a.fade_out = 0;
+            a.fit_fades();
             b.fit_fades();
             track.clips.insert(j + 1, b);
             track.sort();
         }
-        self.after_edit(t);
+        right
+    }
+
+    /// Divide en el cursor la pieza elegida (con su pareja) si está ahí; si no, la de más arriba.
+    pub(super) fn split(&mut self) {
+        let t = self.pos();
+        let Some(at) = self.at_cursor(false) else { return };
+        let before = self.snapshot();
+        if let Some(id) = self.split_at(at, t) {
+            self.selected = Some(id);
+            self.record(before);
+            self.after_edit(t);
+        }
+    }
+
+    /// Congela el cuadro que se ve en el cursor: parte ahí la pieza de video (la elegida o la de más arriba) y
+    /// mete entre las dos mitades esa imagen quieta por FREEZE_LEN, con su sonido en silencio; lo que sigue en
+    /// esas pistas se corre.
+    pub(super) fn freeze(&mut self) {
+        let t = self.pos();
+        let Some((ti, i)) = self.at_cursor(true) else { return };
+        let p = self.tracks[ti].clips[i].clone();
+        if p.still() {
+            return;
+        }
+        let before = self.snapshot();
+        let magnet = self.prefs.magnet;
+        // Cerca de un borde no se parte: la imagen va antes o después de la pieza.
+        let at = if self.split_at((ti, i), t).is_some() {
+            t
+        } else if t - p.start < p.end() - t {
+            p.start
+        } else {
+            p.end()
+        };
+        let audio = self.find(p.id).map(|(ti, i)| self.group(self.tracks[ti].clips[i].id)).unwrap_or_default().into_iter().find(|&(tj, _)| self.tracks[tj].kind == TrackKind::Audio).map(|(tj, _)| tj);
+        let link = if audio.is_some() { self.new_id() } else { 0 };
+        let still = Piece { id: self.new_id(), start: at, len: FREEZE_LEN, src_in: p.src_at(t.clamp(p.start, p.end() - 1)), speed: 0.0, link, fade_in: 0, fade_out: 0, ..p };
+        let mut tracks = vec![(ti, still.clone())];
+        if let Some(ta) = audio {
+            let silence = Piece { id: self.new_id(), muted: true, curves: (Curve::Even, Curve::Even), frame: Frame::default(), ..still.clone() };
+            tracks.push((ta, silence));
+        }
+        for (tj, piece) in tracks {
+            self.tracks[tj].insert(piece, magnet);
+        }
+        self.selected = Some(still.id);
+        self.record(before);
+        self.after_edit(at);
     }
 
     pub(super) fn delete_selected(&mut self) {
@@ -382,7 +569,7 @@ impl EditorApp {
         self.push_undo();
         let magnet = self.prefs.magnet;
         let group = self.group(self.tracks[ti].clips[i].id);
-        let len = self.tracks[ti].clips[i].len();
+        let len = self.tracks[ti].clips[i].len;
         let free = group.iter().all(|&(tj, j)| {
             let at = self.tracks[tj].clips[j].end();
             self.tracks[tj].clips.iter().all(|c| c.end() <= at || c.start >= at + len)
@@ -415,6 +602,12 @@ impl EditorApp {
         self.group(id).into_iter().find(|&(ti, _)| self.tracks[ti].kind == TrackKind::Audio)
     }
 
+    /// La pieza de video de lo elegido (ella misma o su pareja), si tiene.
+    pub(super) fn selected_video(&self) -> Option<(usize, usize)> {
+        let id = self.selected?;
+        self.group(id).into_iter().find(|&(ti, _)| self.tracks[ti].kind == TrackKind::Video)
+    }
+
     pub(super) fn toggle_mute_selected(&mut self) {
         let Some((ti, i)) = self.selected_audio() else { return };
         self.push_undo();
@@ -422,19 +615,85 @@ impl EditorApp {
         p.muted = !p.muted;
     }
 
+    /// Cambia la velocidad de lo elegido (con su pareja): el mismo tramo del archivo dura menos o más en la línea.
+    /// Con el imán, lo que sigue se corre. El que llama guarda cómo estaba para deshacer.
+    pub(super) fn set_speed(&mut self, speed: f64) {
+        let Some(id) = self.selected else { return };
+        let speed = speed.clamp(media::SPEED_MIN, media::SPEED_MAX);
+        let magnet = self.prefs.magnet;
+        for (ti, i) in self.group(id) {
+            let track = &mut self.tracks[ti];
+            let ov = track.joins();
+            let p = &mut track.clips[i];
+            if p.still() || p.speed == speed {
+                continue;
+            }
+            let span = p.len as f64 * p.speed;
+            p.speed = speed;
+            p.len = ((span / speed).round() as i64).max(MIN_LEN);
+            p.fit_fades();
+            if magnet {
+                track.relayout(&ov);
+            }
+        }
+        let pos = self.pos();
+        self.after_edit(pos);
+    }
+
+    /// Cambia cómo se ve la imagen de lo elegido (girarla, espejarla, recortarla o cómo entra en el lienzo).
+    pub(super) fn edit_frame(&mut self, f: impl FnOnce(&mut Frame)) {
+        let Some((ti, i)) = self.selected_video() else { return };
+        let mut frame = self.tracks[ti].clips[i].frame;
+        f(&mut frame);
+        if frame != self.tracks[ti].clips[i].frame {
+            self.push_undo();
+            self.tracks[ti].clips[i].frame = frame;
+        }
+    }
+
+    /// Cambia la proporción del lienzo (None = la del primer clip).
+    pub(super) fn set_ratio(&mut self, ratio: Option<Ratio>) {
+        if ratio != self.ratio {
+            self.push_undo();
+            self.ratio = ratio;
+        }
+    }
+
+    /// El marcador a menos de `tol` de `t`, si hay.
+    pub(super) fn marker_near(&self, t: i64, tol: i64) -> Option<usize> {
+        self.markers.iter().enumerate().filter(|(_, &m)| (m - t).abs() <= tol).min_by_key(|(_, &m)| (m - t).abs()).map(|(k, _)| k)
+    }
+
+    /// Pone un marcador en el cursor o, si ya hay uno ahí, lo saca.
+    pub(super) fn toggle_marker(&mut self) {
+        let t = self.pos();
+        self.push_undo();
+        match self.marker_near(t, self.frame_at_cursor() / 2) {
+            Some(k) => {
+                self.markers.remove(k);
+            }
+            None => {
+                self.markers.push(t);
+                self.markers.sort_unstable();
+            }
+        }
+    }
+
     /// Con qué se uniría la pieza elegida si no está unida: la pieza suelta de la otra clase de pista que
     /// salió del mismo archivo (sus tramos se tocan), la más cercana.
     fn link_partner(&self) -> Option<(usize, usize)> {
         let (ti, i) = self.selection()?;
         let p = &self.tracks[ti].clips[i];
-        if p.link != 0 {
+        if p.link != 0 || p.still() {
             return None;
         }
+        // Dónde caería en la línea el comienzo del archivo: dos piezas que van a la par lo tienen en el mismo lugar.
+        let origin = |c: &Piece| c.start - c.line_len(c.src_in);
         let mut best: Option<((usize, usize), i64)> = None;
         for (tj, t) in self.tracks.iter().enumerate().filter(|(_, t)| t.kind != self.tracks[ti].kind) {
             for (j, c) in t.clips.iter().enumerate() {
-                if c.link == 0 && c.path == p.path && c.src_in < p.src_out && p.src_in < c.src_out {
-                    let gap = ((c.start - c.src_in) - (p.start - p.src_in)).abs();
+                if c.link == 0 && !c.still() && c.path == p.path && c.src_in < p.src_out() && p.src_in < c.src_out() {
+                    let gap = (origin(c) - origin(p)).abs();
                     if best.is_none_or(|b| gap < b.1) {
                         best = Some(((tj, j), gap));
                     }
@@ -459,7 +718,7 @@ impl EditorApp {
     }
 
     /// Separa la imagen y el sonido de lo elegido o, si están separados, los vuelve a unir: el sonido
-    /// vuelve a quedar a la par de la imagen.
+    /// vuelve a quedar a la par de la imagen (y a su velocidad).
     pub(super) fn toggle_link(&mut self) {
         let Some((ti, i)) = self.selection() else { return };
         let group = self.group(self.tracks[ti].clips[i].id);
@@ -475,8 +734,12 @@ impl EditorApp {
         let link = self.new_id();
         let p = self.tracks[ti].clips[i].clone();
         let c = &mut self.tracks[tj].clips[j];
-        c.start = p.start + c.src_in - p.src_in;
+        let span = c.len as f64 * c.speed;
+        c.speed = p.speed;
+        c.len = (span / p.speed).round() as i64;
+        c.start = p.start + p.line_len(c.src_in - p.src_in);
         c.link = link;
+        c.fit_fades();
         self.tracks[ti].clips[i].link = link;
         self.tracks[tj].sort();
         let pos = self.pos();
@@ -572,9 +835,9 @@ impl EditorApp {
     }
 
     /// Puntos donde se engancha lo que se arrastra con el imán: los bordes y los fundidos de las piezas que no
-    /// se están arrastrando (`skip`).
+    /// se están arrastrando (`skip`) y los marcadores.
     pub(super) fn snap_points(&self, skip: &[(usize, usize)]) -> Vec<i64> {
-        let mut v = Vec::new();
+        let mut v = self.markers.clone();
         for (ti, t) in self.tracks.iter().enumerate() {
             for (i, p) in t.clips.iter().enumerate().filter(|&(i, _)| !skip.contains(&(ti, i))) {
                 let (a, b) = self.fade_handles(ti, i);
@@ -591,8 +854,8 @@ impl EditorApp {
             .copied()
             .map(|(tj, j)| {
                 let orig = self.tracks[tj].clips[j].clone();
-                let max = self.loader.probe(&orig.path).map(|p| p.duration).unwrap_or(orig.src_out);
-                Trimmed { at: (tj, j), ov: self.tracks[tj].overlaps().iter().map(|f| f.0).collect(), max, orig }
+                let max = self.loader.probe(&orig.path).map(|p| p.duration).unwrap_or(orig.src_out());
+                Trimmed { at: (tj, j), ov: self.tracks[tj].joins(), max, orig }
             })
             .collect()
     }
@@ -606,26 +869,28 @@ impl EditorApp {
         for t in parts {
             let o = &t.orig;
             if left {
-                // Sin el imán el borde no puede quedar antes del inicio de la línea.
-                let first = if magnet { 0 } else { (o.src_in - o.start).max(0) };
-                lo = lo.max(first - o.src_in);
-                hi = hi.min(o.src_out - MIN_LEN - o.src_in);
+                // Hasta el comienzo del archivo; sin el imán, tampoco antes del inicio de la línea.
+                let room = if magnet { o.line_len(o.src_in) } else { o.line_len(o.src_in).min(o.start) };
+                lo = lo.max(-room);
+                hi = hi.min(o.len - MIN_LEN);
             } else {
-                lo = lo.max(o.src_in + MIN_LEN - o.src_out);
-                hi = hi.min(t.max - o.src_out);
+                lo = lo.max(MIN_LEN - o.len);
+                hi = hi.min(o.line_len(t.max - o.src_out()));
             }
         }
         let dt = dt.clamp(lo, hi.max(lo));
         for t in parts {
             let track = &mut self.tracks[t.at.0];
             let p = &mut track.clips[t.at.1];
+            let o = &t.orig;
             if left {
-                p.src_in = t.orig.src_in + dt;
+                p.src_in = o.src_at(o.start + dt);
+                p.len = o.len - dt;
                 if !magnet {
-                    p.start = t.orig.start + dt;
+                    p.start = o.start + dt;
                 }
             } else {
-                p.src_out = t.orig.src_out + dt;
+                p.len = o.len + dt;
             }
             p.fit_fades();
             if magnet {
@@ -662,8 +927,8 @@ impl EditorApp {
         let p = &t.clips[i];
         // Toca a la vecina si la pisa o queda a menos de un cuadro.
         let near = if out { t.clips.get(i + 1).filter(|n| n.start <= p.end() + UNKNOWN_FRAME / 2) } else { i.checked_sub(1).map(|k| &t.clips[k]).filter(|n| n.end() >= p.start - UNKNOWN_FRAME / 2) };
-        let max = self.loader.probe(&p.path).map(|q| q.duration).unwrap_or(p.src_out);
-        Faded { at: (ti, i), orig: p.clone(), ov: t.overlaps().iter().map(|f| f.0).collect(), neighbor: near.map(Piece::len), max }
+        let max = self.loader.probe(&p.path).map(|q| q.duration).unwrap_or(p.src_out());
+        Faded { at: (ti, i), orig: p.clone(), ov: t.joins(), neighbor: near.map(|n| n.len), max }
     }
 
     /// Mueve la esquina de arriba (`out`: la derecha) de la pieza `dt` desde donde estaba.
@@ -673,7 +938,7 @@ impl EditorApp {
         // Hacia afuera de la pieza es positivo.
         let d = if out { dt } else { -dt };
         let (fade0, other) = if out { (o.fade_out, o.fade_in) } else { (o.fade_in, o.fade_out) };
-        let fade_max = (o.len() - other).max(0);
+        let fade_max = (o.len - other).max(0);
         let track = &mut self.tracks[f.at.0];
         let p = &mut track.clips[f.at.1];
         let Some(nb_len) = f.neighbor else {
@@ -688,15 +953,16 @@ impl EditorApp {
         // Índice de la unión con la vecina en `ov`.
         let k = if out { f.at.1 + 1 } else { f.at.1 };
         let ov0 = f.ov.get(k).copied().unwrap_or(0);
-        let room = if out { f.max - o.src_out } else { o.src_in };
+        // Cuánto puede crecer la pieza hacia ese lado con lo que sobra del archivo.
+        let room = o.line_len(if out { f.max - o.src_out() } else { o.src_in });
         // Positivo: cuánto se funde con la vecina; negativo: cuánto tarda en ir a negro.
-        let s = (ov0 - fade0 + d).clamp(-fade_max, (ov0 + room).min(nb_len / 2).max(ov0));
+        let s = (ov0 - fade0 + d).clamp(-fade_max, ov0.saturating_add(room).min(nb_len / 2).max(ov0));
         let grow = s.max(0) - ov0;
+        p.len = o.len + grow;
         if out {
-            p.src_out = o.src_out + grow;
             p.fade_out = (-s).max(0);
         } else {
-            p.src_in = o.src_in - grow;
+            p.src_in = o.src_at(o.start - grow);
             p.fade_in = (-s).max(0);
             if !magnet {
                 p.start = o.start - grow;
@@ -713,7 +979,7 @@ impl EditorApp {
 
     /// Tras cualquier cambio: pausar, soltar reproductores que ya no se usan y ubicar el cursor.
     /// Las piezas quedan en su lugar de una (deshacer y el teclado no se animan).
-    fn after_edit(&mut self, pos: i64) {
+    pub(super) fn after_edit(&mut self, pos: i64) {
         self.settle = None;
         self.pause();
         let used: Vec<PathBuf> = self.tracks.iter().flat_map(|t| t.clips.iter().map(|p| p.path.clone())).collect();
@@ -738,7 +1004,7 @@ impl EditorApp {
 
     /// Lo que hay que exportar: las pistas de video visibles y las de audio, con sus fundidos.
     pub(super) fn edit(&self) -> Edit {
-        let mut e = Edit::default();
+        let mut e = Edit { ratio: self.ratio, ..Edit::default() };
         for t in &self.tracks {
             let clips: Vec<Clip> = t
                 .clips
@@ -746,8 +1012,19 @@ impl EditorApp {
                 .zip(t.overlaps())
                 .map(|(p, xfade)| {
                     let gain = if t.sounds() { p.eff_gain() } else { 0.0 };
-                    let fade = (p.fade_in, p.fade_out);
-                    Clip { id: p.id, path: p.path.clone(), start: p.start, src_in: p.src_in, src_out: p.src_out, fade, xfade, gain, curves: p.curves }
+                    Clip {
+                        id: p.id,
+                        path: p.path.clone(),
+                        start: p.start,
+                        len: p.len,
+                        src_in: p.src_in,
+                        speed: p.speed,
+                        fade: (p.fade_in, p.fade_out),
+                        xfade,
+                        gain,
+                        curves: p.curves,
+                        frame: p.frame,
+                    }
                 })
                 .collect();
             match t.kind {

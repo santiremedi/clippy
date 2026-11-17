@@ -233,8 +233,6 @@ pub enum Glyph {
     Scissors,
     /// Tacho (eliminar el clip).
     Trash,
-    /// Dos hojas (duplicar el clip).
-    Duplicate,
     /// Parlante (sonido del clip).
     Speaker,
     /// Carpeta (abrir una carpeta en el Explorador).
@@ -250,6 +248,20 @@ pub enum Glyph {
     Magnet,
     /// Cuadro de video sobre una onda (separar o unir el audio y el video).
     Detach,
+    /// Flecha en círculo (girar la imagen).
+    Rotate,
+    /// Dos triángulos enfrentados (espejar la imagen).
+    Flip,
+    /// Dos escuadras cruzadas (recortar la imagen).
+    Crop,
+    /// Copo de nieve (congelar un cuadro).
+    Freeze,
+    /// Marcador (una cinta con punta).
+    Marker,
+    /// Carpeta con un más (carpeta nueva).
+    NewFolder,
+    /// Flecha hacia la izquierda (volver).
+    Back,
 }
 
 /// Ancho del ícono y espacio hasta el texto.
@@ -297,10 +309,6 @@ fn glyph_shapes(g: Glyph, c: Pos2, col: Color32) -> Vec<Shape> {
             Shape::line_segment([p(-0.2, -0.2), p(-0.2, 0.6)], st),
             Shape::line_segment([p(0.2, -0.2), p(0.2, 0.6)], st),
         ],
-        Glyph::Duplicate => vec![
-            Shape::closed_line(vec![p(-0.35, -0.35), p(1.0, -0.35), p(1.0, 1.0), p(-0.35, 1.0)], st),
-            Shape::line(vec![p(-0.35, 0.35), p(-1.0, 0.35), p(-1.0, -1.0), p(0.35, -1.0), p(0.35, -0.35)], st),
-        ],
         Glyph::Speaker => vec![
             Shape::closed_line(vec![p(-1.0, -0.32), p(-0.55, -0.32), p(0.0, -0.82), p(0.0, 0.82), p(-0.55, 0.32), p(-1.0, 0.32)], st),
             Shape::line(vec![p(0.42, -0.42), p(0.62, 0.0), p(0.42, 0.42)], st),
@@ -326,7 +334,52 @@ fn glyph_shapes(g: Glyph, c: Pos2, col: Color32) -> Vec<Shape> {
             Shape::rect_stroke(Rect::from_min_max(p(-1.0, -0.95), p(1.0, -0.15)), 1.5, st),
             Shape::line(vec![p(-1.0, 0.6), p(-0.6, 0.3), p(-0.2, 0.9), p(0.2, 0.3), p(0.6, 0.9), p(1.0, 0.6)], st),
         ],
+        Glyph::Rotate => {
+            // Arco en el sentido del reloj que termina en punta.
+            let at = |a: f32| p(0.85 * a.cos(), 0.85 * a.sin());
+            let (a0, a1) = (150f32.to_radians(), 400f32.to_radians());
+            let arc: Vec<Pos2> = (0..=12).map(|k| at(a0 + (a1 - a0) * k as f32 / 12.0)).collect();
+            let (end, dir, out) = (at(a1), egui::vec2(-a1.sin(), a1.cos()), egui::vec2(a1.cos(), a1.sin()));
+            vec![Shape::line(arc, st), Shape::line(vec![end - (dir * 0.5 - out * 0.35) * s, end, end - (dir * 0.5 + out * 0.35) * s], st)]
+        }
+        Glyph::Flip => vec![
+            Shape::closed_line(vec![p(-0.25, -0.7), p(-1.0, 0.7), p(-0.25, 0.7)], st),
+            Shape::closed_line(vec![p(0.25, -0.7), p(1.0, 0.7), p(0.25, 0.7)], st),
+            Shape::line_segment([p(0.0, -1.0), p(0.0, -0.6)], st),
+            Shape::line_segment([p(0.0, -0.2), p(0.0, 0.2)], st),
+            Shape::line_segment([p(0.0, 0.6), p(0.0, 1.0)], st),
+        ],
+        Glyph::Crop => vec![
+            Shape::line(vec![p(-0.55, -1.0), p(-0.55, 0.55), p(1.0, 0.55)], st),
+            Shape::line(vec![p(-1.0, -0.55), p(0.55, -0.55), p(0.55, 1.0)], st),
+        ],
+        Glyph::Freeze => (0..3)
+            .flat_map(|k| {
+                let a = k as f32 * std::f32::consts::PI / 3.0 + std::f32::consts::FRAC_PI_2;
+                let d = egui::vec2(a.cos(), a.sin());
+                let n = egui::vec2(-d.y, d.x);
+                let tip = |e: f32| [c + d * e * 0.6 * s - n * 0.25 * s, c + d * e * 0.85 * s, c + d * e * 0.6 * s + n * 0.25 * s];
+                [Shape::line_segment([c - d * s, c + d * s], st), Shape::line(tip(1.0).to_vec(), st), Shape::line(tip(-1.0).to_vec(), st)]
+            })
+            .collect(),
+        Glyph::Marker => vec![Shape::closed_line(vec![p(-0.65, -0.95), p(0.65, -0.95), p(0.65, 0.35), p(0.0, 0.95), p(-0.65, 0.35)], st)],
+        Glyph::NewFolder => vec![
+            Shape::closed_line(vec![p(-1.0, -0.75), p(-0.3, -0.75), p(-0.02, -0.42), p(1.0, -0.42), p(1.0, 0.8), p(-1.0, 0.8)], st),
+            Shape::line_segment([p(-0.35, 0.2), p(0.35, 0.2)], st),
+            Shape::line_segment([p(0.0, -0.15), p(0.0, 0.55)], st),
+        ],
+        Glyph::Back => vec![Shape::line_segment([p(0.85, 0.0), p(-0.85, 0.0)], st), Shape::line(vec![p(-0.2, -0.65), p(-0.85, 0.0), p(-0.2, 0.65)], st)],
     }
+}
+
+/// Un ícono suelto de `size` px centrado en `center` (por ejemplo, en una tarjeta).
+pub fn glyph(g: Glyph, center: Pos2, size: f32, col: Color32) -> Vec<Shape> {
+    let mut v = glyph_shapes(g, center, col);
+    let t = scale_about(center, size / GLYPH_W);
+    for s in &mut v {
+        s.transform(t);
+    }
+    v
 }
 
 /// Botón chico de solo ícono para algo que se prende y se apaga (ver una pista, su sonido).

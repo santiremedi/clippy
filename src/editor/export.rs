@@ -10,6 +10,7 @@ use crate::log::file_stamp;
 use crate::ui_kit::theme::*;
 use super::media::Progress;
 use crate::mf::Mf;
+use super::library;
 use super::media;
 use super::EditorApp;
 
@@ -105,16 +106,14 @@ impl EditorApp {
         let src = self.loader.probe(&edit.first_video()?.path)?;
         let total_s = (edit.len() as f64 / 1e7).max(0.1);
         let src_fps = src.fps().max(1.0);
-        let (sw, sh) = (src.width.max(2), src.height.max(2));
-        let oh = if d.height == 0 || d.height >= sh { sh } else { d.height } & !1;
-        let ow = ((sw as u64 * oh as u64 / sh as u64) as u32) & !1;
+        let (ow, oh) = media::canvas_size((src.width, src.height), edit.ratio, d.height);
         let ofps = if d.fps == 0 || d.fps as f64 >= src_fps - 0.5 { src_fps } else { d.fps as f64 };
         let original = d.height == 0 && d.fps == 0 && d.quality == Quality::Recommended;
 
         // ¿Se puede copiar sin recodificar? Una sola pista de piezas pegadas, del mismo formato y con
         // cortes en fotogramas clave.
         let info = self.loader.info.lock().unwrap();
-        let parts = edit.copy_parts();
+        let parts = edit.copy_parts((src.width, src.height));
         let mut copy = Some(original && parts.is_some());
         for p in parts.unwrap_or_default() {
             let i = info.get(&p.path);
@@ -139,9 +138,9 @@ impl EditorApp {
             .unwrap_or_default()
             .iter()
             .map(|p| {
-                let size = self.assets.iter().find(|a| a.path == p.path).map(|a| a.size).unwrap_or(0) as f64;
+                let size = std::fs::metadata(&p.path).map_or(0, |m| m.len()) as f64;
                 let dur = info.get(&p.path).and_then(|i| i.probe.as_ref()).map(|q| q.duration).unwrap_or(1).max(1) as f64;
-                size * (p.src_out - p.src_in) as f64 / dur
+                size * p.len as f64 / dur
             })
             .sum();
         drop(info);
@@ -174,8 +173,16 @@ impl EditorApp {
 
     pub(super) fn export_dialog(&mut self, ctx: &egui::Context) {
         let Some(mut d) = self.export_dlg.take() else { return };
-        let src = self.edit().first_video().and_then(|c| self.loader.probe(&c.path));
-        let (src_h, src_fps) = src.as_ref().map(|s| (s.height, s.fps().round() as u32)).unwrap_or((1080, 60));
+        let edit = self.edit();
+        let src = edit.first_video().and_then(|c| self.loader.probe(&c.path));
+        // Las resoluciones son del lado corto (1080p también en un video vertical).
+        let (src_h, src_fps) = src
+            .as_ref()
+            .map(|s| {
+                let (w, h) = media::canvas_size((s.width, s.height), edit.ratio, 0);
+                (w.min(h), s.fps().round() as u32)
+            })
+            .unwrap_or((1080, 60));
         let plan = self.export_plan(&d);
         let max_h = (ctx.screen_rect().height() - 240.0).max(200.0);
         let mut action = 0;
@@ -328,7 +335,7 @@ impl EditorApp {
     }
 
     fn start_export(&mut self, d: &ExportDialog, plan: &ExportPlan) {
-        let clean: String = d.name.trim().chars().map(|c| if "<>:\"/\\|?*".contains(c) { '_' } else { c }).collect();
+        let clean: String = d.name.trim().chars().map(|c| if library::BAD_NAME.contains(c) { '_' } else { c }).collect();
         let mut out = d.dir.join(format!("{clean}.mp4"));
         let mut n = 2;
         while out.exists() {

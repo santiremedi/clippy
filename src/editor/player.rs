@@ -18,26 +18,34 @@ use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 use super::media::{self, d3d_manager, pack, reader, seek, AUDIO, EOS, VIDEO};
 use crate::mf::{self, frames_at, Mf, FRAME_BYTES};
 
-/// Reloj de reproducción compartido (100 ns).
-pub struct Clock(Mutex<(bool, Instant, i64)>);
+/// Reloj de reproducción compartido (100 ns): si avanza, desde dónde y cuándo, y a qué velocidad (1 = normal).
+pub struct Clock(Mutex<(bool, Instant, i64, f64)>);
 
 impl Clock {
     pub fn new() -> Self {
-        Clock(Mutex::new((false, Instant::now(), 0)))
+        Clock(Mutex::new((false, Instant::now(), 0, 1.0)))
     }
-    pub fn pos(&self) -> i64 {
-        let g = self.0.lock().unwrap();
+    fn at(g: &(bool, Instant, i64, f64)) -> i64 {
         if g.0 {
-            g.2 + (g.1.elapsed().as_nanos() / 100) as i64
+            g.2 + (g.1.elapsed().as_nanos() as f64 / 100.0 * g.3) as i64
         } else {
             g.2
         }
+    }
+    pub fn pos(&self) -> i64 {
+        Self::at(&self.0.lock().unwrap())
     }
     pub fn playing(&self) -> bool {
         self.0.lock().unwrap().0
     }
     pub fn set(&self, pos: i64, playing: bool) {
-        *self.0.lock().unwrap() = (playing, Instant::now(), pos);
+        let mut g = self.0.lock().unwrap();
+        *g = (playing, Instant::now(), pos, g.3);
+    }
+    /// Cambia la velocidad sin saltar.
+    pub fn set_rate(&self, rate: f64) {
+        let mut g = self.0.lock().unwrap();
+        *g = (g.0, Instant::now(), Self::at(&g), rate);
     }
     fn stop_at(&self, pos: i64) {
         self.set(pos, false);
@@ -68,6 +76,8 @@ pub struct Player {
     pub shared: Arc<Shared>,
     pub duration: i64,
     gain: Arc<AtomicU32>,
+    /// Velocidad (bits de un f64): el sonido se estira o se comprime, como una cinta.
+    speed: Arc<AtomicU64>,
     vtx: Option<Sender<VCmd>>,
     atx: Option<Sender<ACmd>>,
 }
@@ -88,15 +98,16 @@ impl Player {
             vtx
         });
         let gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        let speed = Arc::new(AtomicU64::new(1.0f64.to_bits()));
         let atx = if !video && probe.audio.is_some() {
             let (atx, arx) = mpsc::channel();
-            let (path, gain) = (path.clone(), gain.clone());
-            std::thread::spawn(move || audio_thread(path, arx, gain));
+            let (path, gain, speed) = (path.clone(), gain.clone(), speed.clone());
+            std::thread::spawn(move || audio_thread(path, arx, gain, speed));
             Some(atx)
         } else {
             None
         };
-        Player { clock, shared, duration: probe.duration, gain, vtx, atx }
+        Player { clock, shared, duration: probe.duration, gain, speed, vtx, atx }
     }
 
     pub fn pos(&self) -> i64 {
@@ -134,6 +145,13 @@ impl Player {
     /// Volumen de la vista previa (0 = mudo, 1 = normal, 2 = doble).
     pub fn set_gain(&self, g: f32) {
         self.gain.store(g.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Velocidad de la vista previa (1 = normal, 0 = imagen quieta).
+    pub fn set_speed(&self, s: f64) {
+        if self.speed.swap(s.to_bits(), Ordering::Relaxed) != s.to_bits() {
+            self.clock.set_rate(s);
+        }
     }
 
     pub fn seek(&self, t: i64) {
@@ -370,7 +388,7 @@ fn video_thread(path: PathBuf, w: u32, h: u32, clock: Arc<Clock>, rx: Receiver<V
 
 // --- Audio ------------------------------------------------------------------------
 
-fn audio_thread(path: PathBuf, rx: Receiver<ACmd>, gain: Arc<AtomicU32>) {
+fn audio_thread(path: PathBuf, rx: Receiver<ACmd>, gain: Arc<AtomicU32>, speed: Arc<AtomicU64>) {
     let _mf = Mf::init();
     let r = unsafe { audio_setup(&path) };
     let Ok((r, client, render, bufsize)) = r else {
@@ -405,7 +423,7 @@ fn audio_thread(path: PathBuf, rx: Receiver<ACmd>, gain: Arc<AtomicU32>) {
                     feed = Feed { skip_until: pos, ..Feed::default() };
                     let _ = seek(&r, pos);
                     playing = true;
-                    fill(&r, &render, bufsize, &client, &mut feed, f32::from_bits(gain.load(Ordering::Relaxed)));
+                    fill(&r, &render, bufsize, &client, &mut feed, f32::from_bits(gain.load(Ordering::Relaxed)), f64::from_bits(speed.load(Ordering::Relaxed)));
                     let _ = client.Start();
                     continue;
                 }
@@ -417,7 +435,7 @@ fn audio_thread(path: PathBuf, rx: Receiver<ACmd>, gain: Arc<AtomicU32>) {
                 None => {}
             }
             if playing {
-                fill(&r, &render, bufsize, &client, &mut feed, f32::from_bits(gain.load(Ordering::Relaxed)));
+                fill(&r, &render, bufsize, &client, &mut feed, f32::from_bits(gain.load(Ordering::Relaxed)), f64::from_bits(speed.load(Ordering::Relaxed)));
             }
         }
     }
@@ -455,13 +473,18 @@ struct Feed {
     eos: bool,
     /// Recién buscado: lo que el archivo entrega antes de este punto se descarta.
     skip_until: i64,
+    /// A otra velocidad: dónde va la lectura entre el primer cuadro de `queue` y el siguiente (0 a 1).
+    frac: f64,
 }
 
-unsafe fn fill(r: &IMFSourceReader, render: &IAudioRenderClient, bufsize: u32, client: &IAudioClient, feed: &mut Feed, gain: f32) {
+/// Llena lo que haya libre en la placa de sonido. A otra velocidad (`speed`), cada cuadro que sale mezcla los dos
+/// cuadros del archivo entre los que cae.
+unsafe fn fill(r: &IMFSourceReader, render: &IAudioRenderClient, bufsize: u32, client: &IAudioClient, feed: &mut Feed, gain: f32, speed: f64) {
     let Ok(pad) = client.GetCurrentPadding() else { return };
     let free = (bufsize - pad) as usize;
-    let Feed { queue, eos, skip_until } = feed;
-    while queue.len() / FRAME_BYTES < free && !*eos {
+    let Feed { queue, eos, skip_until, frac } = feed;
+    let need = (*frac + free as f64 * speed).ceil() as usize + 2;
+    while queue.len() / FRAME_BYTES < need && !*eos {
         let (mut flags, mut ts, mut s) = (0u32, 0i64, None);
         if r.ReadSample(AUDIO, 0, None, Some(&mut flags), Some(&mut ts), Some(&mut s)).is_err() {
             *eos = true;
@@ -483,17 +506,34 @@ unsafe fn fill(r: &IMFSourceReader, render: &IAudioRenderClient, bufsize: u32, c
         }
     }
     *skip_until = 0;
-    let n = free.min(queue.len() / FRAME_BYTES);
+    // Cuadros que se pueden armar con lo que hay: cada uno necesita también el cuadro del archivo que sigue.
+    let room = (queue.len() / FRAME_BYTES) as f64 - 1.0 - *frac;
+    let n = if room <= 0.0 {
+        0
+    } else if speed <= 0.0 {
+        free
+    } else {
+        free.min((room / speed).ceil() as usize)
+    };
     if n == 0 {
         return;
     }
     if let Ok(p) = render.GetBuffer(n as u32) {
         let dst = std::slice::from_raw_parts_mut(p as *mut i16, n * 2);
-        let bytes: Vec<u8> = queue.drain(..n * FRAME_BYTES).collect();
-        for (d, s) in dst.iter_mut().zip(bytes.as_chunks::<2>().0) {
-            let v = i16::from_le_bytes(*s) as f32 * gain;
-            *d = v.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        let data = queue.make_contiguous();
+        let at = |i: usize, ch: usize| i16::from_le_bytes([data[i * FRAME_BYTES + ch * 2], data[i * FRAME_BYTES + ch * 2 + 1]]) as f32;
+        for j in 0..n {
+            let pos = *frac + j as f64 * speed;
+            let (i, f) = (pos as usize, (pos - pos.floor()) as f32);
+            for ch in 0..2 {
+                let v = (at(i, ch) * (1.0 - f) + at(i + 1, ch) * f) * gain;
+                dst[j * 2 + ch] = v.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+            }
         }
         let _ = render.ReleaseBuffer(n as u32, 0);
+        let end = *frac + n as f64 * speed;
+        let used = end.floor() as usize;
+        queue.drain(..used * FRAME_BYTES);
+        *frac = end - used as f64;
     }
 }

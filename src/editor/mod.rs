@@ -1,12 +1,15 @@
 //! Editor de clips estilo CapCut (proceso aparte: `clippy.exe --editor`).
-//! Biblioteca a la izquierda, vista previa al centro, propiedades a la derecha y
+//! Biblioteca a la izquierda, vista previa al centro, ajustes del clip a la derecha y
 //! línea de tiempo abajo con pistas de video (miniaturas) y de audio (forma de onda).
 //! Al cerrar la ventana el proceso termina.
 
+mod browser;
 mod library;
+mod inspector;
 mod media;
 mod player;
 mod prefs;
+mod preview;
 mod shortcuts;
 mod export;
 mod panels;
@@ -24,7 +27,6 @@ use eframe::egui::{self, Align, Align2, FontId, Layout, Margin, RichText, Stroke
 use crate::app::mode::Window;
 use crate::config::{self, Config};
 use crate::mf::Mf;
-use crate::log::app_dir;
 use crate::ui_kit::theme::*;
 use crate::ui_kit::watch::Watcher;
 use crate::ui_kit::window::{maximize_once, single_instance, window_options};
@@ -33,9 +35,11 @@ use library::{Asset, Loader};
 use prefs::Prefs;
 use player::Clock;
 use playback::{Layer, Voice};
-use timeline::{Track, TrackKind};
+use timeline::{Snapshot, Track, TrackKind};
 use export::{ExportDialog, ExportJob};
-use panels::Drag;
+use panels::{Drag, Menu};
+use browser::Browser;
+use preview::CropEdit;
 
 /// Tamaño mínimo de la ventana: entran los paneles en su tamaño mínimo y la vista previa.
 const MIN_SIZE: [f32; 2] = [960.0, 600.0];
@@ -58,6 +62,13 @@ pub fn run(file: Option<PathBuf>) {
     );
 }
 
+/// Pestañas de la ventana de la tuerca.
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum HelpTab {
+    Keys,
+    Guide,
+}
+
 struct EditorApp {
     ctx: egui::Context,
     _mf: Mf,
@@ -65,16 +76,22 @@ struct EditorApp {
     cfg: Config,
     prefs: Prefs,
     loader: Loader,
+    /// Los videos de la carpeta que se ve en la biblioteca.
     assets: Vec<Asset>,
     imported: Vec<PathBuf>,
+    browser: Browser,
     /// Avisa cuando cambia la carpeta de clips o la config (por ejemplo, un clip recién guardado).
     watcher: Watcher,
 
     tracks: Vec<Track>,
+    /// Marcadores de la línea de tiempo, ordenados.
+    markers: Vec<i64>,
+    /// Proporción del lienzo (None = la del primer clip).
+    ratio: Option<media::Ratio>,
     next_id: u64,
     selected: Option<u64>,
-    undo: Vec<Vec<Track>>,
-    redo: Vec<Vec<Track>>,
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
 
     /// Dónde está el cursor de reproducción y si avanza.
     clock: Clock,
@@ -84,6 +101,8 @@ struct EditorApp {
     /// Piezas que muestra la vista previa (de abajo hacia arriba) y cuánto se ve cada una.
     shown: Vec<(u64, f32)>,
     layers: Vec<Layer>,
+    /// Recortando la imagen de una pieza en la vista previa.
+    crop: Option<CropEdit>,
 
     zoom: f32,
     /// Zoom pedido (botones, deslizador, teclado o Ctrl + rueda); se aplica al dibujar la línea de tiempo,
@@ -98,15 +117,16 @@ struct EditorApp {
     scrub_t: Option<i64>,
     /// Mientras se arrastra un borde o una esquina con el imán: el punto donde quedó enganchado.
     snap: Option<i64>,
-    /// Fundidos sobre los que se hizo clic derecho (pieza y si es el de salida): a qué se le cambia la curva.
-    curve_menu: Vec<(u64, bool)>,
+    /// Lo que se tocó con el clic derecho en la línea de tiempo.
+    menu: Menu,
     /// Recién soltado un clip en otro lugar: cuándo y cuántos px le faltan a cada pieza para llegar.
     settle: Option<(f64, Vec<(u64, f32)>)>,
 
     job: Option<ExportJob>,
     message: Option<(bool, String, Option<PathBuf>)>,
     maximized: bool,
-    show_keys: bool,
+    /// Ventana de la tuerca abierta, y en qué pestaña.
+    help: Option<HelpTab>,
     export_dlg: Option<ExportDialog>,
     /// Hay cambios sin exportar.
     dirty: bool,
@@ -178,8 +198,9 @@ impl eframe::App for EditorApp {
             .frame(egui::Frame::none().fill(BG).inner_margin(Margin::same(18.0)))
             .show(ctx, |ui| self.preview(ui));
 
-        self.keys_window(ctx);
+        self.help_window(ctx);
         self.export_dialog(ctx);
+        self.library_dialogs(ctx);
         self.close_guard(ctx);
         self.drop_files(ctx);
     }
@@ -189,7 +210,7 @@ impl EditorApp {
     fn new(ctx: egui::Context, file: Option<PathBuf>) -> Self {
         let cfg = config::load();
         let imported = library::load_imported();
-        let watcher = Watcher::new(ctx.clone(), vec![app_dir(), cfg.output_dir.clone()], false);
+        let watcher = Watcher::new(ctx.clone(), vec![crate::log::app_dir(), cfg.output_dir.clone()], false);
         let mut app = Self {
             loader: Loader::new(ctx.clone()),
             ctx,
@@ -198,8 +219,11 @@ impl EditorApp {
             prefs: Prefs::load(),
             assets: Vec::new(),
             imported,
+            browser: Browser::default(),
             watcher,
             tracks: vec![Track::new(1, TrackKind::Video), Track::new(2, TrackKind::Audio)],
+            markers: Vec::new(),
+            ratio: None,
             next_id: 2,
             selected: None,
             undo: Vec::new(),
@@ -210,6 +234,7 @@ impl EditorApp {
             idle: Vec::new(),
             shown: Vec::new(),
             layers: Vec::new(),
+            crop: None,
             zoom: 1.0,
             zoom_to: None,
             scroll_x: 0.0,
@@ -219,12 +244,12 @@ impl EditorApp {
             last_seek: Instant::now(),
             scrub_t: None,
             snap: None,
-            curve_menu: Vec::new(),
+            menu: Menu::None,
             settle: None,
             job: None,
             message: None,
             maximized: false,
-            show_keys: false,
+            help: None,
             export_dlg: None,
             dirty: false,
             confirm_close: false,
@@ -241,45 +266,52 @@ impl EditorApp {
         app
     }
 
-    fn scan(&mut self) {
-        self.imported.retain(|p| p.exists());
-        self.assets = library::scan(&self.cfg.output_dir, &self.imported);
-    }
-
     /// Agrega archivos a la biblioteca (y opcionalmente a la línea de tiempo).
     fn import(&mut self, files: Vec<PathBuf>, to_timeline: bool) {
         let mut bad = Vec::new();
+        let mut added = false;
         for f in files {
             if !library::is_video(&f) || self.loader.probe(&f).is_none() {
                 bad.push(f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
                 continue;
             }
-            let in_dir = f.parent().is_some_and(|d| d == self.cfg.output_dir);
-            if !in_dir && !self.imported.contains(&f) {
+            // Lo que ya está en la carpeta de clips (o en una de sus carpetas) no se importa: ya se ve.
+            if !f.starts_with(&self.cfg.output_dir) && !self.imported.contains(&f) {
                 self.imported.push(f.clone());
+                added = true;
             }
             if to_timeline {
                 self.add_to_timeline(&f);
             }
         }
         library::save_imported(&self.imported);
-        self.scan();
+        // Los importados se ven en la biblioteca, no dentro de una carpeta.
+        if added && self.browser.dir.is_some() {
+            self.open_dir(None);
+        } else {
+            self.scan();
+        }
         if !bad.is_empty() {
             self.message = Some((false, format!("No se pudo abrir: {}", bad.join(", ")), None));
         }
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        if ctx.wants_keyboard_input() || self.keys_editor.capturing.is_some() || self.export_dlg.is_some() {
+        let modal = self.export_dlg.is_some() || self.crop.is_some() || self.confirm_close || self.library_dialog_open();
+        if ctx.wants_keyboard_input() || self.keys_editor.capturing.is_some() || modal {
             return;
         }
         for act in shortcuts::pressed(ctx, &self.prefs.keys) {
-            if self.show_keys && act != Act::Shortcuts {
+            if self.help.is_some() && act != Act::Shortcuts {
                 continue;
             }
             // Mientras el mouse arrastra un clip o un borde, el arrastre apunta a una pieza:
             // editar con el teclado en ese momento la movería o borraría debajo del mouse.
             if act.edits_timeline() && !matches!(self.drag, Drag::None) {
+                continue;
+            }
+            // Supr con lo último tocado en la biblioteca borra lo elegido ahí (con confirmación).
+            if act == Act::Delete && self.delete_library_selection() {
                 continue;
             }
             self.run_action(act);
@@ -301,6 +333,8 @@ impl EditorApp {
             Act::Split => self.split(),
             Act::Duplicate => self.duplicate_selected(),
             Act::Delete => self.delete_selected(),
+            Act::Freeze => self.freeze(),
+            Act::Marker => self.toggle_marker(),
             Act::MuteClip => self.toggle_mute_selected(),
             Act::Link => self.toggle_link(),
             Act::Magnet => {
@@ -319,7 +353,11 @@ impl EditorApp {
             Act::Import => self.import_dialog(),
             Act::Export => self.export(),
             Act::Shortcuts => {
-                self.show_keys = !self.show_keys;
+                if self.help.is_some() {
+                    self.help = None;
+                } else {
+                    self.open_help(HelpTab::Keys);
+                }
                 self.keys_editor.capturing = None;
             }
         }
@@ -336,52 +374,111 @@ impl EditorApp {
         let m = config::config_mtime();
         if m != self.cfg_mtime {
             self.cfg_mtime = m;
+            let dir = self.cfg.output_dir.clone();
             self.cfg = config::load();
-            self.watcher.set_dirs(vec![app_dir(), self.cfg.output_dir.clone()]);
+            if self.cfg.output_dir != dir {
+                self.browser.dir = None;
+            }
+            self.watcher.set_dirs(self.watched_dirs());
         }
     }
 
-    /// Ventana de atajos (editable).
-    fn keys_window(&mut self, ctx: &egui::Context) {
-        if !self.show_keys {
-            return;
-        }
+    pub(super) fn open_help(&mut self, tab: HelpTab) {
+        self.help = Some(tab);
+        self.keys_editor.capturing = None;
+    }
+
+    /// La ventana de la tuerca: los atajos (se cambian tocándolos) y cómo se usa el editor.
+    fn help_window(&mut self, ctx: &egui::Context) {
+        let Some(mut tab) = self.help else { return };
         if self.keys_editor.poll(ctx, &mut self.prefs.keys) {
             self.prefs.save();
         }
         let capturing = self.keys_editor.capturing.is_some();
-        let max_h = (ctx.screen_rect().height() - 300.0).clamp(240.0, 560.0);
+        let max_h = (ctx.screen_rect().height() - 340.0).clamp(220.0, 560.0);
         let mut done = false;
-        let x = modal(
-            ctx,
-            "keys",
-            "Ajustes del editor",
-            "Atajos de teclado: tocá uno para cambiarlo. Los que funcionan mientras jugás están en la ventana de Clippy.",
-            820.0,
-            |ui| {
-                modal_body(ui, |ui| {
-                    egui::ScrollArea::vertical().max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
-                        self.keys_editor.ui(ui, &self.prefs.keys);
-                    });
-                });
-                modal_footer(ui, |ui| {
-                    if button_sized(ui, "Restablecer atajos", Kind::Secondary, egui::vec2(0.0, 38.0)).clicked() {
-                        self.keys_editor.reset(&mut self.prefs.keys);
-                        self.prefs.save();
+        let subtitle = match tab {
+            HelpTab::Keys => "Tocá un atajo para cambiarlo. Los que funcionan mientras jugás están en la ventana de Clippy.",
+            HelpTab::Guide => "Lo que conviene saber para editar rápido.",
+        };
+        let x = modal(ctx, "keys", "Ajustes del editor", subtitle, 820.0, |ui| {
+            modal_body(ui, |ui| {
+                ui.allocate_ui(egui::vec2(320.0, 32.0), |ui| {
+                    if seg(ui, &mut tab, &[(HelpTab::Keys, "Atajos"), (HelpTab::Guide, "Cómo se usa")]) {
+                        self.keys_editor.capturing = None;
                     }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if button_sized(ui, "Listo", Kind::Primary, egui::vec2(120.0, 38.0)).clicked() {
-                            done = true;
-                        }
-                    });
                 });
-            },
-        );
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical().max_height(max_h).auto_shrink([false, true]).show(ui, |ui| match tab {
+                    HelpTab::Keys => self.keys_editor.ui(ui, &self.prefs.keys),
+                    HelpTab::Guide => self.guide(ui),
+                });
+            });
+            modal_footer(ui, |ui| {
+                if tab == HelpTab::Keys && button_sized(ui, "Restablecer atajos", Kind::Secondary, egui::vec2(0.0, 38.0)).clicked() {
+                    self.keys_editor.reset(&mut self.prefs.keys);
+                    self.prefs.save();
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if button_sized(ui, "Listo", Kind::Primary, egui::vec2(120.0, 38.0)).clicked() {
+                        done = true;
+                    }
+                });
+            });
+        });
+        self.help = Some(tab);
         // Esc mientras se elige una tecla cancela esa elección, no cierra la ventana.
         if done || (x && !capturing) {
-            self.show_keys = false;
+            self.help = None;
             self.keys_editor.capturing = None;
         }
+    }
+
+    /// "Cómo se usa": lo que no se descubre solo (arrastres, Alt, clic derecho), con los atajos de ahora.
+    fn guide(&self, ui: &mut egui::Ui) {
+        let k = |a: Act| shortcuts::short(&self.prefs.keys, a);
+        let topics = [
+            (
+                "Biblioteca",
+                "Un clic elige un video (con Ctrl se suman, con Shift se elige un tramo) y arrastrando elegís varios con un recuadro. Doble clic o el + lo suma a la línea de tiempo; también podés arrastrar videos del Explorador a la ventana. Con el clic derecho los movés a una carpeta o los mandás a la Papelera de reciclaje.".to_string(),
+            ),
+            (
+                "Recortar y mover",
+                "Arrastrá los bordes de un clip para recortarlo y del medio para cambiarlo de lugar o de pista. Con Alt apretado, el borde o la esquina cambia solo la imagen o solo el sonido.".to_string(),
+            ),
+            (
+                "Fundidos",
+                "Arrastrá una esquina de arriba de un clip para que aparezca desde negro o se vaya a negro. Si toca a otro clip, se funden uno en el otro. Con el clic derecho sobre el fundido elegís su curva.".to_string(),
+            ),
+            (
+                "Imán",
+                format!("Prendido ({}), los clips de cada pista quedan pegados uno detrás del otro. Apagado, quedan donde los soltás y, si se superponen, se funden.", k(Act::Magnet)),
+            ),
+            (
+                "Clic derecho en un clip",
+                "Dividir, duplicar, congelar el cuadro, cambiar la velocidad, girar, espejar o recortar la imagen, silenciar, separar el audio y eliminar.".to_string(),
+            ),
+            (
+                "Velocidad, imagen y proporción",
+                "En el panel de la derecha cambiás la velocidad del clip y su imagen. Debajo de la vista previa elegís la proporción del video: horizontal, vertical para el celular o cuadrado. Si un clip no tiene esa forma, elegís si entra entero o llena el cuadro.".to_string(),
+            ),
+            (
+                "Congelar y marcadores",
+                format!(
+                    "{} deja quieto el cuadro del cursor 3 segundos (arrastrá su borde para que dure más o menos). {} pone un marcador: tocalo para ir ahí, arrastralo para moverlo o sacalo con el clic derecho. Con el imán, los bordes se enganchan en los marcadores.",
+                    k(Act::Freeze),
+                    k(Act::Marker)
+                ),
+            ),
+        ];
+        ui.columns(2, |cols| {
+            for (n, (title, text)) in topics.iter().enumerate() {
+                let ui = &mut cols[n % 2];
+                ui.label(RichText::new(*title).family(bold()).size(13.5).color(TEXT));
+                ui.add(egui::Label::new(RichText::new(text).size(13.0).color(MUTED)).wrap());
+                ui.add_space(12.0);
+            }
+        });
     }
 
     /// Si hay cambios sin exportar (o se está exportando), preguntar antes de cerrar.

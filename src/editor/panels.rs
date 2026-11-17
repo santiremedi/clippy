@@ -1,22 +1,21 @@
-//! Paneles de la ventana: barra superior, biblioteca, vista previa, propiedades y pistas.
+//! Barra de arriba y línea de tiempo: herramientas, pistas, marcadores y el clic derecho sobre un clip.
 
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use eframe::egui::text::LayoutJob;
 use eframe::egui::{self, Align, Align2, Color32, CursorIcon, FontId, Layout, Pos2, Rangef, Rect, RichText, Sense, Shape, Stroke, Vec2};
 
 use crate::ui_kit::theme::*;
 use crate::ui_kit::window::open_folder;
-use super::library::Asset;
 use super::shortcuts::Act;
 use super::shortcuts;
 use super::library;
+use super::inspector::{fmt_speed, SPEEDS};
 use super::media::Curve;
 use super::timeline::{Faded, Piece, TrackKind, Trimmed, MAX_TRACKS};
-use super::EditorApp;
+use super::{EditorApp, HelpTab};
 
 const PAD: f32 = 16.0;
 
@@ -47,8 +46,6 @@ const AUTO_SCROLL: f32 = 900.0;
 const ZOOM_MAX: f32 = 40.0;
 /// Mientras se arrastra, el video busca el cuadro como mucho cada tanto (buscar es caro).
 const SEEK_EVERY: Duration = Duration::from_millis(40);
-/// Alto del título y los datos debajo de la miniatura de una tarjeta de la biblioteca.
-const CARD_TEXT_H: f32 = 42.0;
 
 #[derive(Clone)]
 pub(super) enum Drag {
@@ -62,7 +59,25 @@ pub(super) enum Drag {
     /// Una esquina de arriba (`out`: la derecha) de una pieza y su pareja: el fundido de ese lado.
     Fade { parts: Vec<Faded>, out: bool, press_x: f32, pps: f32, from: i64, snaps: Vec<i64> },
     Move { id: u64, grab_dx: f32 },
+    /// Un marcador (lugar en la lista) y cómo estaban todos al empezar.
+    Marker { k: usize, before: Vec<i64> },
 }
+
+/// Lo que se tocó con el clic derecho en la línea de tiempo (queda mientras el menú está abierto).
+#[derive(Clone, Default)]
+pub(super) enum Menu {
+    #[default]
+    None,
+    /// Un clip y, si se tocó sobre un fundido, cuáles (pieza y si es el de salida).
+    Clip { fades: Vec<(u64, bool)> },
+    /// Un marcador.
+    Marker(usize),
+    /// La regla, en ese momento.
+    Ruler(i64),
+}
+
+/// Medio ancho de un marcador en la regla (también lo que se puede errar al tocarlo).
+const MARKER_W: f32 = 6.0;
 
 /// Una pieza en la línea de tiempo: de `a` a `b` en x, dentro de la franja `row` de su pista. En una pista de
 /// video se ven las miniaturas; en una de audio, la forma de onda. Devuelve las miniaturas de los cuadros
@@ -84,7 +99,7 @@ fn draw_piece(painter: &egui::Painter, p: &Piece, info: Option<&library::Info>, 
             if !tile.intersects(clip.clip_rect()) {
                 continue;
             }
-            let at = |x: f32| p.src_in + ((x - r.left()) / pps * 1e7) as i64;
+            let at = |x: f32| p.src_at(p.start + ((x - r.left()) / pps * 1e7) as i64);
             let Some(i) = library::thumb_for(thumbs, at(tile.left()), at(tile.right())) else { continue };
             match &thumbs[i].tex {
                 Some(tex) => {
@@ -124,7 +139,8 @@ fn draw_piece(painter: &egui::Painter, p: &Piece, info: Option<&library::Info>, 
     }
     // Etiqueta: en la imagen, y en el sonido solo si va suelto (si no, ya la tiene su pareja).
     if (video || p.link == 0) && r.width() > 70.0 && r.height() >= 22.0 {
-        let label = format!("{}  ·  {}", library::pretty_name(&p.path), fmt_len(p.len()));
+        let how = if p.still() { "  ·  congelado".to_string() } else if p.speed != 1.0 { format!("  ·  {}", fmt_speed(p.speed)) } else { String::new() };
+        let label = format!("{}  ·  {}{how}", library::pretty_name(&p.path), fmt_len(p.len));
         let g = one_line(painter, label, FontId::proportional(11.5), r.width() - 22.0);
         let badge = Rect::from_min_size(r.min + egui::vec2(6.0, 4.0), g.size() + egui::vec2(10.0, 4.0));
         painter.rect_filled(badge, 4.0, BADGE);
@@ -176,7 +192,7 @@ fn draw_wave(painter: &egui::Painter, p: &Piece, info: Option<&library::Info>, a
             let px = 1.0 / painter.ctx().pixels_per_point();
             let left = ar.left().max(clip.clip_rect().left());
             let right = ar.right().min(clip.clip_rect().right());
-            let t_at = |x: f32| p.src_in + ((x - ar.left()) / pps * 1e7) as i64;
+            let t_at = |x: f32| p.src_at(p.start + ((x - ar.left()) / pps * 1e7) as i64);
             let size = |v: f32| {
                 let v = v * gain;
                 let db = if v > 0.0 { 20.0 * v.log10() } else { -100.0 };
@@ -225,54 +241,12 @@ fn fmt_ruler(s: f32) -> String {
 }
 
 /// Largo de un clip: "12.5 s" hasta el minuto (al recortar importa la décima) y "1:05" desde ahí.
-fn fmt_len(t: i64) -> String {
+pub(super) fn fmt_len(t: i64) -> String {
     if t < 600_000_000 {
         format!("{:.1} s", t as f64 / 1e7)
     } else {
         fmt_clock(((t + 5_000_000) / 10_000_000) as u64)
     }
-}
-
-fn asset_card(ui: &mut egui::Ui, a: &Asset, info: Option<&library::Info>, size: Vec2, used: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    let thumb = Rect::from_min_size(rect.min, egui::vec2(size.x, size.y - CARD_TEXT_H));
-    let p = ui.painter();
-    let mut shapes = vec![Shape::rect_filled(thumb, 6.0, CONTROL)];
-    match info.and_then(|i| i.cover.as_ref()) {
-        Some(t) => {
-            shapes.push(Shape::image(t.id(), thumb, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE));
-        }
-        None => {
-            let msg = if info.and_then(|i| i.error.as_ref()).is_some() { "No se puede leer" } else { "Cargando…" };
-            shapes.push(ui.fonts(|f| Shape::text(f, thumb.center(), Align2::CENTER_CENTER, msg, FontId::proportional(12.0), MUTED)));
-        }
-    }
-    if let Some(pr) = info.and_then(|i| i.probe.as_ref()) {
-        let g = p.layout_no_wrap(fmt_len(pr.duration), FontId::proportional(11.5), WHITE);
-        let r = Rect::from_min_size(thumb.right_bottom() - g.size() - egui::vec2(14.0, 10.0), g.size() + egui::vec2(8.0, 4.0));
-        shapes.push(Shape::rect_filled(r, 4.0, BADGE));
-        shapes.push(Shape::galley(r.min + egui::vec2(4.0, 2.0), g, WHITE));
-    }
-    if used {
-        let r = Rect::from_min_size(thumb.min + egui::vec2(6.0, 6.0), egui::vec2(18.0, 18.0));
-        shapes.push(Shape::circle_filled(r.center(), 9.0, WHITE));
-        shapes.push(Shape::line_segment([r.center() + egui::vec2(-4.0, 0.0), r.center() + egui::vec2(-1.0, 3.5)], Stroke::new(2.0_f32, BLACK)));
-        shapes.push(Shape::line_segment([r.center() + egui::vec2(-1.0, 3.5), r.center() + egui::vec2(4.5, -3.5)], Stroke::new(2.0_f32, BLACK)));
-    }
-    if resp.hovered() {
-        shapes.push(Shape::rect_stroke(thumb, 6.0, Stroke::new(2.0_f32, WHITE)));
-        shapes.push(Shape::rect_filled(thumb, 6.0, HOVER_DIM));
-        shapes.push(Shape::circle_filled(thumb.center(), 18.0, WHITE));
-        shapes.push(Shape::line_segment([thumb.center() - egui::vec2(7.0, 0.0), thumb.center() + egui::vec2(7.0, 0.0)], Stroke::new(2.5_f32, BLACK)));
-        shapes.push(Shape::line_segment([thumb.center() - egui::vec2(0.0, 7.0), thumb.center() + egui::vec2(0.0, 7.0)], Stroke::new(2.5_f32, BLACK)));
-    }
-    let title = one_line(p, a.title.clone(), FontId::proportional(13.0), size.x - 4.0);
-    shapes.push(Shape::galley(Pos2::new(rect.left() + 2.0, thumb.bottom() + 6.0), title, TEXT));
-    let sub = format!("{}{}", fmt_bytes(a.size as f64), if a.imported { " · importado" } else { "" });
-    let sub = one_line(p, sub, FontId::proportional(11.5), size.x - 4.0);
-    shapes.push(Shape::galley(Pos2::new(rect.left() + 2.0, thumb.bottom() + 25.0), sub, MUTED));
-    paint_pressed(ui, rect.center(), press(ui, &resp), PRESS_DEPTH, shapes);
-    resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text(format!("{}\nAgregar a la línea de tiempo", a.title))
 }
 
 impl EditorApp {
@@ -298,9 +272,9 @@ impl EditorApp {
                 }
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let tip = format!("Ajustes del editor ({})", shortcuts::short(&self.prefs.keys, Act::Shortcuts));
+                let tip = format!("Atajos y ayuda ({})", shortcuts::short(&self.prefs.keys, Act::Shortcuts));
                 if gear_button(ui).on_hover_text(tip).clicked() {
-                    self.show_keys = true;
+                    self.open_help(HelpTab::Keys);
                 }
                 ui.add_space(6.0);
                 if let Some(job) = &self.job {
@@ -346,245 +320,6 @@ impl EditorApp {
         });
     }
 
-    pub(super) fn library_panel(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Biblioteca").family(bold()).size(17.0).color(TEXT));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let tip = format!("Agregar videos de cualquier carpeta ({})", shortcuts::short(&self.prefs.keys, Act::Import));
-                if icon_button(ui, Glyph::Plus, "Importar", Kind::Secondary, Vec2::ZERO).on_hover_text(tip).clicked() {
-                    self.import_dialog();
-                }
-            });
-        });
-        ui.add_space(6.0);
-        ui.label(RichText::new("Hacé clic en un video para sumarlo a la línea de tiempo.").size(12.5).color(MUTED));
-        ui.add_space(8.0);
-
-        // Abajo de todo; la lista usa lo que queda (en un panel angosto este texto ocupa dos líneas).
-        egui::TopBottomPanel::bottom("lib_hint")
-            .frame(egui::Frame::none().inner_margin(egui::Margin { top: 8.0, ..Default::default() }))
-            .show_separator_line(false)
-            .show_inside(ui, |ui| {
-                ui.label(RichText::new("También podés arrastrar videos a la ventana.").size(12.0).color(MUTED));
-            });
-
-        let mut add: Option<PathBuf> = None;
-        let mut remove: Option<PathBuf> = None;
-        let mut reveal: Option<PathBuf> = None;
-        if self.assets.is_empty() {
-            ui.add_space(24.0);
-            ui.label(RichText::new("No hay videos todavía.").color(TEXT));
-            ui.label(RichText::new("Guardá un clip mientras jugás o tocá Importar.").color(MUTED));
-        } else {
-            let gap = 10.0;
-            let w = ((ui.available_width() - gap) / 2.0).floor();
-            let card = egui::vec2(w, (w * 9.0 / 16.0).round() + CARD_TEXT_H);
-            let used: HashSet<&Path> = self.tracks.iter().flat_map(|t| t.clips.iter().map(|p| p.path.as_path())).collect();
-            // Solo se arman las filas que se ven: la carpeta puede tener cientos de clips.
-            egui::ScrollArea::vertical()
-                .id_salt("lib")
-                .auto_shrink([false, false])
-                .show_rows(ui, card.y + 6.0, self.assets.len().div_ceil(2), |ui, rows| {
-                    let shown = &self.assets[rows.start * 2..(rows.end * 2).min(self.assets.len())];
-                    // Portadas solo de lo que se ve. Antes de tomar `info`, que `want_cover` también bloquea.
-                    for a in shown {
-                        self.loader.want_cover(&a.path, (a.size, a.modified));
-                    }
-                    let info = self.loader.info.lock().unwrap();
-                    for pair in shown.chunks(2) {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = gap;
-                            for a in pair {
-                                let r = asset_card(ui, a, info.get(&a.path), card, used.contains(a.path.as_path()));
-                                if r.clicked() {
-                                    add = Some(a.path.clone());
-                                }
-                                r.context_menu(|ui| {
-                                    if ui.button("Agregar a la línea de tiempo").clicked() {
-                                        add = Some(a.path.clone());
-                                        ui.close_menu();
-                                    }
-                                    if ui.button("Mostrar en la carpeta").clicked() {
-                                        reveal = Some(a.path.clone());
-                                        ui.close_menu();
-                                    }
-                                    if a.imported && ui.button("Quitar de la biblioteca").clicked() {
-                                        remove = Some(a.path.clone());
-                                        ui.close_menu();
-                                    }
-                                });
-                            }
-                        });
-                        ui.add_space(6.0);
-                    }
-                });
-        }
-        if let Some(p) = add {
-            self.add_to_timeline(&p);
-        }
-        if let Some(p) = remove {
-            self.imported.retain(|x| *x != p);
-            library::save_imported(&self.imported);
-            self.scan();
-        }
-        if let Some(p) = reveal {
-            let _ = std::process::Command::new("explorer").arg(format!("/select,{}", p.display())).spawn();
-        }
-    }
-
-
-    pub(super) fn preview(&mut self, ui: &mut egui::Ui) {
-        let rect = ui.available_rect_before_wrap();
-        let resp = ui.allocate_rect(rect, Sense::click());
-        let p = ui.painter();
-        p.rect_filled(rect, 8.0, Color32::BLACK);
-        if self.is_empty() {
-            p.text(rect.center() - egui::vec2(0.0, 12.0), Align2::CENTER_CENTER, "Tu video aparece acá", FontId::proportional(20.0), TEXT);
-            p.text(
-                rect.center() + egui::vec2(0.0, 16.0),
-                Align2::CENTER_CENTER,
-                "Elegí un clip de la biblioteca para empezar",
-                FontId::proportional(14.0),
-                MUTED,
-            );
-            return;
-        }
-        if let Some(e) = self.preview_error() {
-            let mut job = LayoutJob::simple(e, FontId::proportional(14.0), MUTED, (rect.width() - 48.0).clamp(120.0, 480.0));
-            job.halign = Align::Center;
-            let g = p.layout_job(job);
-            p.galley(Pos2::new(rect.center().x, rect.center().y - g.size().y / 2.0), g, MUTED);
-        } else {
-            // Donde dos piezas se funden, la de arriba va encima con su transparencia.
-            for l in &self.layers {
-                let s = l.tex.size_vec2();
-                let scale = (rect.width() / s.x).min(rect.height() / s.y);
-                let img = Rect::from_center_size(rect.center(), s * scale);
-                p.image(l.tex.id(), img, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE.gamma_multiply(l.alpha));
-            }
-        }
-        if resp.clicked() {
-            self.toggle_play();
-        }
-    }
-
-    pub(super) fn props_panel(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Clip").family(bold()).size(17.0).color(TEXT));
-        ui.add_space(6.0);
-        let Some((ti, i)) = self.selection() else {
-            ui.label(RichText::new("Tocá un clip en la línea de tiempo para editarlo.").color(MUTED));
-            ui.add_space(18.0);
-            caption(ui, "Atajos");
-            for act in [Act::PlayPause, Act::Split, Act::Duplicate, Act::Delete, Act::Undo, Act::PrevFrame] {
-                ui.horizontal(|ui| {
-                    ui.allocate_ui_with_layout(egui::vec2(96.0, 20.0), Layout::left_to_right(Align::Center), |ui| {
-                        ui.label(RichText::new(shortcuts::short(&self.prefs.keys, act)).color(TEXT).family(bold()).size(13.0));
-                    });
-                    ui.add(egui::Label::new(RichText::new(act.label()).color(MUTED).size(13.0)).truncate());
-                });
-            }
-            ui.add_space(4.0);
-            if button(ui, "Ver y cambiar atajos", Kind::Ghost).clicked() {
-                self.show_keys = true;
-            }
-            ui.add_space(14.0);
-            caption(ui, "Recortar");
-            ui.label(
-                RichText::new("Arrastrá los bordes de un clip en la línea de tiempo. Arrastralo del medio para cambiarlo de lugar o de pista. Con Alt apretado, el borde o la esquina cambia solo la imagen o solo el sonido.")
-                    .size(13.0)
-                    .color(MUTED),
-            );
-            ui.add_space(14.0);
-            caption(ui, "Fundidos");
-            ui.label(
-                RichText::new("Arrastrá una esquina de arriba de un clip para que aparezca desde negro o se vaya a negro. Si toca a otro clip, esa esquina hace que se fundan uno en el otro. Con clic derecho sobre un fundido elegís su curva.")
-                    .size(13.0)
-                    .color(MUTED),
-            );
-            return;
-        };
-        let p = self.tracks[ti].clips[i].clone();
-        ui.add(egui::Label::new(RichText::new(library::pretty_name(&p.path)).color(TEXT)).truncate());
-        ui.label(
-            RichText::new(format!("{}  ·  dura {}  ·  empieza en {}", self.track_name(ti), fmt_time(p.len()), fmt_time(p.start)))
-                .size(12.5)
-                .color(MUTED),
-        );
-        if let Some(pr) = self.loader.probe(&p.path) {
-            ui.label(RichText::new(format!("{}×{} · {:.0} fps · {}", pr.width, pr.height, pr.fps(), pr.codec())).size(12.5).color(MUTED));
-        }
-        ui.add_space(14.0);
-
-        caption(ui, "Audio de este clip");
-        let audio = self.selected_audio();
-        if !self.has_audio(&p.path) {
-            ui.label(RichText::new("Este clip no tiene audio.").size(13.0).color(MUTED));
-        } else if audio.is_none() {
-            ui.label(RichText::new("Está separado: lo encontrás en una pista de audio.").size(13.0).color(MUTED));
-        } else if let Some((ta, ia)) = audio {
-            let p = self.tracks[ta].clips[ia].clone();
-            let before = self.tracks.clone();
-            let mut on = !p.muted;
-            let mut vol = (p.gain * 100.0).round() as u32;
-            let mut changed = false;
-            let mut start_edit = false;
-            ui.horizontal(|ui| {
-                let r = toggle(ui, &mut on).on_hover_text(if on { "Silenciar" } else { "Activar sonido" });
-                if r.changed() {
-                    changed = true;
-                    start_edit = true;
-                }
-                ui.label(RichText::new(if on { "Con sonido" } else { "Silenciado" }).color(if on { TEXT } else { MUTED }));
-            });
-            ui.add_enabled_ui(on, |ui| {
-                ui.spacing_mut().slider_width = ui.available_width() - 70.0;
-                let r = ui.add(egui::Slider::new(&mut vol, 0..=200).suffix(" %"));
-                if r.changed() {
-                    changed = true;
-                }
-                if r.drag_started() || (r.changed() && !r.dragged()) {
-                    start_edit = true;
-                }
-            });
-            if changed {
-                self.dirty = true;
-                if start_edit {
-                    self.record_undo(before.clone());
-                }
-                let c = &mut self.tracks[ta].clips[ia];
-                c.muted = !on;
-                c.gain = vol as f32 / 100.0;
-            }
-        }
-        ui.add_space(18.0);
-        caption(ui, "Acciones");
-        let mut acts = vec![Act::Split, Act::Duplicate];
-        if audio.is_some() {
-            acts.push(Act::MuteClip);
-        }
-        if self.can_link() {
-            acts.push(Act::Link);
-        }
-        acts.push(Act::Delete);
-        for act in acts {
-            let label = match act {
-                Act::Link => self.link_label(),
-                _ => act.label(),
-            };
-            let text = format!("{label}   ·   {}", shortcuts::short(&self.prefs.keys, act));
-            let glyph = match act {
-                Act::Split => Glyph::Scissors,
-                Act::Duplicate => Glyph::Duplicate,
-                Act::MuteClip => Glyph::Speaker,
-                Act::Link => Glyph::Detach,
-                _ => Glyph::Trash,
-            };
-            if button_fit(ui, Some(glyph), &text, Kind::Secondary, egui::vec2(ui.available_width(), 36.0)).clicked() {
-                self.run_action(act);
-            }
-        }
-    }
-
     pub(super) fn timeline_panel(&mut self, ui: &mut egui::Ui) {
         // Ocupar todo el panel: su fondo y su tamaño (el que se guarda al arrastrar el borde) son los de esto.
         ui.set_min_height(ui.available_height());
@@ -611,6 +346,16 @@ impl EditorApp {
                     let tip = format!("{} ({})", self.link_label(), shortcuts::short(&self.prefs.keys, Act::Link));
                     if icon_only_button(ui, Glyph::Detach, Kind::Secondary, &tip).clicked() {
                         self.toggle_link();
+                    }
+                });
+                ui.add_enabled_ui(!empty, |ui| {
+                    let tip = format!("Congelar el cuadro del cursor 3 segundos ({})", shortcuts::short(&self.prefs.keys, Act::Freeze));
+                    if icon_only_button(ui, Glyph::Freeze, Kind::Secondary, &tip).clicked() {
+                        self.freeze();
+                    }
+                    let tip = format!("Poner o sacar un marcador en el cursor ({})", shortcuts::short(&self.prefs.keys, Act::Marker));
+                    if icon_only_button(ui, Glyph::Marker, Kind::Secondary, &tip).clicked() {
+                        self.toggle_marker();
                     }
                 });
             });
@@ -682,6 +427,88 @@ impl EditorApp {
                 (ti, Rangef::new(y - rh, y))
             })
             .collect()
+    }
+
+    /// Clic derecho sobre un clip (ya elegido): lo que se le puede hacer, con sus atajos. `fades`: los fundidos
+    /// que había donde se tocó.
+    fn clip_menu(&mut self, ui: &mut egui::Ui, fades: &[(u64, bool)]) {
+        let Some((ti, i)) = self.selection() else { return };
+        let p = self.tracks[ti].clips[i].clone();
+        let at_cursor = self.group(p.id).iter().any(|&(tj, j)| self.tracks[tj].clips[j].covers(self.pos()));
+        let keys = self.prefs.keys.clone();
+        let mut run = None;
+        let mut item = |ui: &mut egui::Ui, act: Act, label: &str, enabled: bool, why: &str| {
+            let b = ui.add_enabled(enabled, egui::Button::new(label).shortcut_text(shortcuts::short(&keys, act))).on_disabled_hover_text(why);
+            if b.clicked() {
+                run = Some(act);
+                ui.close_menu();
+            }
+        };
+        if !fades.is_empty() {
+            let current = self.find(fades[0].0).map(|(ti, i)| {
+                let c = self.tracks[ti].clips[i].curves;
+                if fades[0].1 { c.1 } else { c.0 }
+            });
+            ui.menu_button("Curva del fundido", |ui| {
+                for (c, label, tip) in [
+                    (Curve::Even, "Pareja", "Al cruzarse dos sonidos el volumen no baja"),
+                    (Curve::Linear, "Lineal", "En línea recta"),
+                    (Curve::Smooth, "Suave", "Arranca y termina despacio"),
+                ] {
+                    if ui.add(egui::Button::new(label).selected(current == Some(c))).on_hover_text(tip).clicked() {
+                        self.set_curve(fades, c);
+                        ui.close_menu();
+                    }
+                }
+            });
+            ui.separator();
+        }
+        let away = "Llevá el cursor sobre el clip";
+        item(ui, Act::Split, "Dividir", at_cursor, away);
+        item(ui, Act::Duplicate, "Duplicar", true, "");
+        let video = self.selected_video().is_some();
+        if video && !p.still() {
+            item(ui, Act::Freeze, "Congelar cuadro", at_cursor, away);
+        }
+        if !p.still() {
+            ui.menu_button("Velocidad", |ui| {
+                for s in SPEEDS {
+                    if ui.add(egui::Button::new(fmt_speed(s)).selected(p.speed == s)).clicked() {
+                        self.push_undo();
+                        self.set_speed(s);
+                        ui.close_menu();
+                    }
+                }
+            });
+        }
+        if video {
+            ui.menu_button("Imagen", |ui| {
+                if ui.button("Girar a la derecha").clicked() {
+                    self.edit_frame(|f| f.turns = (f.turns + 1) % 4);
+                    ui.close_menu();
+                }
+                if ui.button("Espejo").clicked() {
+                    self.edit_frame(|f| f.flip = !f.flip);
+                    ui.close_menu();
+                }
+                if ui.button("Recortar…").clicked() {
+                    self.start_crop();
+                    ui.close_menu();
+                }
+            });
+        }
+        if let Some((ta, ia)) = self.selected_audio().filter(|_| !p.still()) {
+            let muted = self.tracks[ta].clips[ia].muted;
+            item(ui, Act::MuteClip, if muted { "Activar el sonido" } else { "Silenciar" }, true, "");
+        }
+        if self.can_link() {
+            item(ui, Act::Link, self.link_label(), true, "");
+        }
+        ui.separator();
+        item(ui, Act::Delete, "Eliminar", true, "");
+        if let Some(act) = run {
+            self.run_action(act);
+        }
     }
 
     /// Columna de la izquierda: el botón para agregar pistas y, en cada una, su nombre y los botones para verla
@@ -956,9 +783,14 @@ impl EditorApp {
                 Some((ti, i, if x <= a + g { -1 } else if x >= b - g { 1 } else { 0 }))
             })
         };
+        // El marcador que hay en (x, y) de la regla.
+        let markers = self.markers.clone();
+        let marker_at = |h: Pos2| -> Option<usize> {
+            ruler.contains(h).then(|| markers.iter().enumerate().filter(|(_, &m)| (tx(m) - h.x).abs() <= MARKER_W).min_by_key(|(_, &m)| (tx(m) - h.x).abs() as i64).map(|(k, _)| k)).flatten()
+        };
         // Apretar en la regla o fuera de los clips lleva el cursor ahí en el acto, y desde ahí se arrastra.
         let pressed = resp.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_pressed());
-        if pressed && pointer.is_some_and(|h| hit(h.x, h.y).is_none()) {
+        if pressed && pointer.is_some_and(|h| hit(h.x, h.y).is_none() && marker_at(h).is_none()) {
             self.drag = Drag::Scrub;
         }
         // Un clic lleva el cursor y sigue reproduciendo; recién al arrastrar se pausa (como antes).
@@ -971,6 +803,7 @@ impl EditorApp {
             self.drag_before = Some(self.tracks.clone());
             self.pause();
             self.drag = match hit(press.x, press.y) {
+                _ if marker_at(press).is_some() => Drag::Marker { k: marker_at(press).unwrap_or(0), before: self.markers.clone() },
                 Some((ti, i, kind)) if kind != 0 => {
                     let at = self.dragged(ti, i, ui.input(|i| i.modifiers.alt));
                     let snaps = if self.prefs.magnet { self.snap_points(&at) } else { Vec::new() };
@@ -1036,6 +869,22 @@ impl EditorApp {
                             self.last_seek = Instant::now();
                         }
                     }
+                    Drag::Marker { k, .. } => {
+                        // Con el imán se engancha a los bordes de los clips y a los otros marcadores.
+                        let mut snaps = if self.prefs.magnet { self.snap_points(&[]) } else { Vec::new() };
+                        if let Some(m) = self.markers.get(k) {
+                            snaps.retain(|s| s != m);
+                        }
+                        let t = xt(h.x).clamp(0, self.total());
+                        let t = t + self.snapped(t, 0, &snaps, pps);
+                        if let Some(m) = self.markers.get_mut(k) {
+                            *m = t;
+                        }
+                        if throttle {
+                            self.seek(t);
+                            self.last_seek = Instant::now();
+                        }
+                    }
                     Drag::Move { .. } | Drag::None => {}
                 }
             }
@@ -1080,6 +929,10 @@ impl EditorApp {
                         }
                     }
                 }
+                Drag::Marker { before, .. } => {
+                    self.markers.sort_unstable();
+                    self.record_markers(before);
+                }
                 Drag::Scrub | Drag::None => {
                     let t = pointer.map_or(self.pos(), |h| xt(h.x)).clamp(0, self.total());
                     self.scrub_t = None;
@@ -1091,9 +944,10 @@ impl EditorApp {
         }
         let cursor = match &self.drag {
             _ if on_split => Some(CursorIcon::ResizeVertical),
-            Drag::Move { .. } => Some(CursorIcon::Grabbing),
+            Drag::Move { .. } | Drag::Marker { .. } => Some(CursorIcon::Grabbing),
             Drag::Trim { .. } | Drag::Fade { .. } => Some(CursorIcon::ResizeHorizontal),
             Drag::Scrub | Drag::None => resp.hover_pos().and_then(|h| match hit(h.x, h.y) {
+                _ if marker_at(h).is_some() => Some(CursorIcon::Grab),
                 Some((_, _, 0)) => Some(CursorIcon::Grab),
                 Some(_) => Some(CursorIcon::ResizeHorizontal),
                 None => ruler.contains(h).then_some(CursorIcon::PointingHand),
@@ -1102,28 +956,48 @@ impl EditorApp {
         if let Some(c) = cursor {
             ui.ctx().set_cursor_icon(c);
         }
-        // Clic derecho sobre un fundido: elegir su curva.
+        // Clic derecho: qué se tocó queda guardado mientras el menú está abierto.
         if resp.secondary_clicked() {
-            self.curve_menu = pointer.map_or(Vec::new(), |h| self.fade_at(&rows, &xs, h.x, h.y, xt(h.x)));
+            self.menu = match pointer {
+                Some(h) if marker_at(h).is_some() => Menu::Marker(marker_at(h).unwrap_or(0)),
+                Some(h) if ruler.contains(h) => Menu::Ruler(xt(h.x).clamp(0, self.total())),
+                Some(h) => match hit(h.x, h.y) {
+                    Some((ti, i, _)) => {
+                        self.selected = Some(self.tracks[ti].clips[i].id);
+                        Menu::Clip { fades: self.fade_at(&rows, &xs, h.x, h.y, xt(h.x)) }
+                    }
+                    None => Menu::None,
+                },
+                None => Menu::None,
+            };
         }
-        if !self.curve_menu.is_empty() {
-            resp.context_menu(|ui| {
-                let current = self.find(self.curve_menu[0].0).map(|(ti, i)| {
-                    let c = self.tracks[ti].clips[i].curves;
-                    if self.curve_menu[0].1 { c.1 } else { c.0 }
-                });
-                ui.label(RichText::new("Curva del fundido").size(12.5).color(MUTED));
-                for (c, label, tip) in [
-                    (Curve::Even, "Pareja", "Al cruzarse dos sonidos el volumen no baja"),
-                    (Curve::Linear, "Lineal", "En línea recta"),
-                    (Curve::Smooth, "Suave", "Arranca y termina despacio"),
-                ] {
-                    if ui.add(egui::Button::new(label).selected(current == Some(c))).on_hover_text(tip).clicked() {
-                        let targets = self.curve_menu.clone();
-                        self.set_curve(&targets, c);
+        if !matches!(self.menu, Menu::None) {
+            resp.context_menu(|ui| match self.menu.clone() {
+                Menu::Clip { fades } => self.clip_menu(ui, &fades),
+                Menu::Marker(k) => {
+                    if ui.button("Ir al marcador").clicked() {
+                        if let Some(&m) = self.markers.get(k) {
+                            self.seek(m);
+                        }
+                        ui.close_menu();
+                    }
+                    if ui.button("Quitar marcador").clicked() {
+                        if k < self.markers.len() {
+                            self.push_undo();
+                            self.markers.remove(k);
+                        }
                         ui.close_menu();
                     }
                 }
+                Menu::Ruler(t) => {
+                    if ui.button("Poner un marcador acá").clicked() {
+                        self.push_undo();
+                        self.markers.push(t);
+                        self.markers.sort_unstable();
+                        ui.close_menu();
+                    }
+                }
+                Menu::None => {}
             });
         }
         if resp.clicked() {
@@ -1133,7 +1007,8 @@ impl EditorApp {
                     None if !ruler.contains(h) => self.selected = None,
                     None => {}
                 }
-                let t = xt(h.x).clamp(0, self.total());
+                // Tocar un marcador lleva el cursor justo ahí.
+                let t = marker_at(h).and_then(|k| self.markers.get(k).copied()).unwrap_or(xt(h.x)).clamp(0, self.total());
                 if t != self.clock.pos() {
                     self.seek(t);
                 }
@@ -1235,7 +1110,7 @@ impl EditorApp {
                 if self.prefs.magnet {
                     let center = xt((a + b) / 2.0);
                     let others: Vec<usize> = (0..self.tracks[dest].clips.len()).filter(|&k| !moving.contains(&(dest, k))).collect();
-                    let k = others.iter().filter(|&&k| self.tracks[dest].clips[k].start + self.tracks[dest].clips[k].len() / 2 < center).count();
+                    let k = others.iter().filter(|&&k| self.tracks[dest].clips[k].start + self.tracks[dest].clips[k].len / 2 < center).count();
                     let bar_x = match others.get(k) {
                         Some(&k) => xs[dest][k].0,
                         None => others.last().map_or(x0, |&k| xs[dest][k].1),
@@ -1272,6 +1147,15 @@ impl EditorApp {
         if let Some(r) = split.filter(|_| on_split) {
             let y = rows[nv - 1].1.max + LANE_GAP / 2.0;
             painter.hline(rect.x_range(), y, Stroke::new(2.0_f32, if r.dragged() { TEXT } else { BORDER }));
+        }
+
+        // Marcadores: una cinta en la regla y una línea tenue por las pistas.
+        for &m in &self.markers {
+            let x = tx(m);
+            painter.vline(x, Rangef::new(ruler.bottom(), lanes_bottom), Stroke::new(1.0_f32, WHITE.gamma_multiply(0.18)));
+            let (top, w) = (ruler.bottom() - 15.0, MARKER_W);
+            let pts = vec![Pos2::new(x - w, top), Pos2::new(x + w, top), Pos2::new(x + w, top + 9.0), Pos2::new(x, top + 14.0), Pos2::new(x - w, top + 9.0)];
+            painter.add(Shape::convex_polygon(pts, ICON, Stroke::new(1.0_f32, BLACK)));
         }
 
         // Cursor de reproducción
