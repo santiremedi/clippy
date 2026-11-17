@@ -71,8 +71,8 @@ struct SettingsApp {
     check_note: Option<String>,
     /// Novedades de la versión recién instalada (versión, texto), hasta que se cierran.
     news: Option<(String, String)>,
-    /// "Ver qué trae": el texto de la versión nueva antes de instalarla.
-    preview: Option<(String, String)>,
+    /// Confirmación de "Actualizar": la versión nueva y lo que trae, si el release tiene texto.
+    confirm_update: Option<(String, Option<String>)>,
     maximized: bool,
     page: Page,
     confirm_quit: bool,
@@ -113,7 +113,7 @@ impl SettingsApp {
             checking: false,
             check_note: None,
             news: None,
-            preview: None,
+            confirm_update: None,
             maximized: false,
             page: Page::Home,
             confirm_quit: false,

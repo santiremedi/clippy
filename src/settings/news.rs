@@ -1,5 +1,5 @@
 //! Novedades: el texto del release de GitHub, en un modal. Aparece una vez después de actualizar
-//! ("Novedades de la …") y cuando se quiere ver qué trae la versión nueva antes de instalarla.
+//! ("Novedades de la …") y al tocar "Actualizar", como confirmación de lo que se va a instalar.
 
 use eframe::egui::{self, Align, Layout, RichText};
 
@@ -16,16 +16,17 @@ impl SettingsApp {
     pub(super) fn news_modals(&mut self, ctx: &egui::Context) {
         if let Some((v, text)) = self.news.clone() {
             let mut done = false;
-            let x = notes_modal(ctx, "news", &format!("Novedades de la {v}"), "Clippy se actualizó. Esto es lo que cambió.", &text, |ui| {
+            let x = notes_modal(ctx, "news", &format!("Novedades de la {v}"), "Clippy se actualizó. Esto es lo que cambió.", Some(&text), |ui| {
                 done = button_sized(ui, "Listo", Kind::Primary, BUTTON).clicked();
             });
             if x || done {
                 self.news = None;
                 update::news_seen();
             }
-        } else if let Some((v, text)) = self.preview.clone() {
+        } else if let Some((v, text)) = self.confirm_update.clone() {
             let (mut install, mut later) = (false, false);
-            let x = notes_modal(ctx, "preview", &format!("Qué trae la {v}"), &format!("Tenés la {}.", update::current()), &text, |ui| {
+            let sub = format!("Tenés la {}. Clippy se cierra y vuelve a abrir solo.", update::current());
+            let x = notes_modal(ctx, "confirm_update", &format!("Actualizar a la {v}"), &sub, text.as_deref(), |ui| {
                 install = button_sized(ui, "Actualizar", Kind::Primary, BUTTON).clicked();
                 later = button_sized(ui, "Ahora no", Kind::Secondary, BUTTON).clicked();
             });
@@ -33,19 +34,21 @@ impl SettingsApp {
                 self.start_update();
             }
             if x || install || later {
-                self.preview = None;
+                self.confirm_update = None;
             }
         }
     }
 }
 
-/// Modal con el texto de un release. `buttons` se agregan de derecha a izquierda. Devuelve true si se
-/// tocó la X o Esc.
-fn notes_modal(ctx: &egui::Context, id: &str, title: &str, subtitle: &str, text: &str, buttons: impl FnOnce(&mut egui::Ui)) -> bool {
+/// Modal con el texto de un release (sin texto, solo el encabezado y los botones). `buttons` se agregan
+/// de derecha a izquierda. Devuelve true si se tocó la X o Esc.
+fn notes_modal(ctx: &egui::Context, id: &str, title: &str, subtitle: &str, text: Option<&str>, buttons: impl FnOnce(&mut egui::Ui)) -> bool {
     modal(ctx, id, title, subtitle, WIDTH, |ui| {
-        modal_body(ui, |ui| {
-            egui::ScrollArea::vertical().max_height(MAX_TEXT_H).auto_shrink([false, true]).show(ui, |ui| release_notes(ui, text));
-        });
+        if let Some(text) = text {
+            modal_body(ui, |ui| {
+                egui::ScrollArea::vertical().max_height(MAX_TEXT_H).auto_shrink([false, true]).show(ui, |ui| release_notes(ui, text));
+            });
+        }
         modal_footer(ui, |ui| {
             ui.with_layout(Layout::right_to_left(Align::Center), buttons);
         });
