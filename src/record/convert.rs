@@ -1,5 +1,5 @@
 //! Conversión BGRA -> NV12 con el procesador de video de la GPU (sin shaders ni CPU).
-//! También endereza monitores verticales y encaja un monitor de otra resolución sin deformarlo.
+//! También endereza monitores verticales, estira la resolución estirada y encaja un monitor de otra forma sin deformarlo.
 
 use std::mem::ManuallyDrop;
 
@@ -108,8 +108,9 @@ impl Converter {
             if quarter > 0 {
                 vctx.VideoProcessorSetStreamRotation(&vp, 0, true, D3D11_VIDEO_PROCESSOR_ROTATION(quarter));
             }
-            // Encajar sin deformar: un monitor con otra forma queda con bandas negras.
-            let (sw, sh) = if quarter % 2 == 1 { (sd.Height, sd.Width) } else { (sd.Width, sd.Height) };
+            // Encajar con la forma con la que se ve en el monitor: estirada si Windows la estira (resolución
+            // estirada); un monitor con otra forma queda con bandas negras.
+            let (sw, sh) = frame.shape;
             let scale = (w as f64 / sw as f64).min(h as f64 / sh as f64);
             let dw = (sw as f64 * scale).round() as i32 & !1;
             let dh = (sh as f64 * scale).round() as i32 & !1;

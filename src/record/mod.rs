@@ -7,4 +7,5 @@ mod convert;
 mod encoder;
 mod game;
 mod mux;
+mod screen;
 pub mod recorder;

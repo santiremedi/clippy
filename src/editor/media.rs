@@ -248,7 +248,19 @@ pub fn same_shape((aw, ah): (u32, u32), (bw, bh): (u32, u32)) -> bool {
     (aw as f64 * bh as f64 / ah.max(1) as f64 - bw as f64).abs() < 1.0
 }
 
-/// Cómo se ve la imagen de una pieza: girada, espejada, recortada y si llena el lienzo o entra entera.
+/// Cómo ocupa el lienzo una imagen que no tiene su forma.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Sizing {
+    /// Entra entera, con bordes negros.
+    #[default]
+    Whole,
+    /// Llena el lienzo; lo que sobra queda afuera.
+    Fill,
+    /// Se deforma hasta tener la forma del lienzo (clips grabados con resolución estirada).
+    Stretch,
+}
+
+/// Cómo se ve la imagen de una pieza: girada, espejada, recortada y cómo ocupa el lienzo.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Frame {
     /// Cuartos de vuelta en el sentido del reloj (0 a 3).
@@ -257,13 +269,12 @@ pub struct Frame {
     pub flip: bool,
     /// Lo que se ve del cuadro del archivo, de 0 a 1: izquierda, arriba, derecha, abajo.
     pub crop: [f32; 4],
-    /// Llena el lienzo (lo que sobra queda afuera) en vez de entrar entera con bordes negros.
-    pub fill: bool,
+    pub sizing: Sizing,
 }
 
 impl Default for Frame {
     fn default() -> Self {
-        Frame { turns: 0, flip: false, crop: [0.0, 0.0, 1.0, 1.0], fill: false }
+        Frame { turns: 0, flip: false, crop: [0.0, 0.0, 1.0, 1.0], sizing: Sizing::Whole }
     }
 }
 
@@ -296,7 +307,7 @@ impl Placed {
 impl Frame {
     /// Sin girar, espejar ni recortar: si el archivo tiene la forma del lienzo, se ve tal cual.
     pub fn is_plain(&self) -> bool {
-        Frame { fill: false, ..*self } == Frame::default()
+        Frame { sizing: Sizing::Whole, ..*self } == Frame::default()
     }
 
     /// El punto del cuadro del archivo (0 a 1) que se ve en (u, v) de la imagen ya recortada, girada y espejada.
@@ -335,15 +346,19 @@ impl Frame {
         }
     }
 
-    /// Dónde va, en un lienzo de `canvas` px, la imagen de un archivo de `src` px: centrada, entera o llenándolo.
+    /// Dónde va, en un lienzo de `canvas` px, la imagen de un archivo de `src` px: centrada, entera, llenándolo o estirada.
     /// Solo la parte que queda adentro del lienzo; None si no se ve nada.
     pub fn place(&self, src: (f32, f32), canvas: (f32, f32)) -> Option<Placed> {
         let (vw, vh) = self.view_size(src);
         if vw < 1.0 || vh < 1.0 {
             return None;
         }
-        let s = if self.fill { (canvas.0 / vw).max(canvas.1 / vh) } else { (canvas.0 / vw).min(canvas.1 / vh) };
-        let (dw, dh) = (vw * s, vh * s);
+        let (sx, sy) = (canvas.0 / vw, canvas.1 / vh);
+        let (dw, dh) = match self.sizing {
+            Sizing::Whole => (vw * sx.min(sy), vh * sx.min(sy)),
+            Sizing::Fill => (vw * sx.max(sy), vh * sx.max(sy)),
+            Sizing::Stretch => canvas,
+        };
         let (x0, y0) = ((canvas.0 - dw) / 2.0, (canvas.1 - dh) / 2.0);
         let (l, t, r, b) = (x0.max(0.0), y0.max(0.0), (x0 + dw).min(canvas.0), (y0 + dh).min(canvas.1));
         if r - l < 0.5 || b - t < 0.5 {

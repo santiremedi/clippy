@@ -37,7 +37,7 @@ Solo con `--features devtools`:
 
 | Argumentos | Qué hace |
 | --- | --- |
-| `--test <seg> <carpeta> [game\|desktop\|mic\|juegos]` | Graba, guarda un clip y sale (imprime el encoder y el juego detectado). |
+| `--test <seg> <carpeta> [game\|desktop\|mic\|juegos\|720\|1080\|1440]` | Graba, guarda un clip y sale (imprime el encoder y el juego detectado; un número elige la resolución del clip). |
 | `--test-mic` | Cuánto audio entrega cada micrófono en 3 s. |
 | `--test-download` | Descarga la versión publicada como el botón "Actualizar". |
 | `--test-export`, `--test-frame`, `--test-strip` | Pruebas del editor (ver `src/editor/devtools.rs`). |

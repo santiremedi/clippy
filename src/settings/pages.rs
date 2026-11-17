@@ -8,7 +8,7 @@ use crate::app::autostart;
 use crate::app::keys::hotkey_name;
 use crate::app::mode::Mode;
 use crate::app::update;
-use crate::config::{CaptureMode, GlobalAction, MAX_MBPS, MAX_SECONDS, MIN_MBPS};
+use crate::config::{CaptureMode, GlobalAction, MAX_MBPS, MAX_SECONDS, MIN_MBPS, RESOLUTIONS};
 
 /// Calidades de video de un toque (Mbps): baja, media y alta.
 const QUALITY: [u32; 3] = [15, 30, 60];
@@ -255,6 +255,12 @@ impl SettingsApp {
                 });
                 hint(ui, LABEL_W + 8.0, "Más Mbps, mejor imagen y clips más pesados. A 1080p y 60 fps, 40 a 60 ya se ve muy bien; a 1440p o 4K, conviene 80 o más.");
             }
+            row(ui, "Resolución", LABEL_W, |ui| {
+                let labels = RESOLUTIONS.map(|r| if r == 0 { "Como el monitor".to_string() } else { format!("{r}p") });
+                let opts: Vec<(u32, &str)> = RESOLUTIONS.iter().zip(&labels).map(|(&r, l)| (r, l.as_str())).collect();
+                seg(ui, &mut self.cfg.resolution, &opts);
+            });
+            hint(ui, LABEL_W + 8.0, "Con la forma de tu monitor: si jugás con resolución estirada, el clip sale estirado como lo ves. Menos resolución, clips más livianos.");
             row(ui, "Cuadros por segundo", LABEL_W, |ui| {
                 seg(ui, &mut self.cfg.fps, &[(30, "30"), (60, "60"), (120, "120")]);
             });

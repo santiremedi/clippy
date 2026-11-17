@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 
 use super::library;
-use super::media::{self, Clip, Edit, Frame, Progress};
+use super::media::{self, Clip, Edit, Frame, Progress, Sizing};
 use crate::mf::Mf;
 use super::player::Player;
 use super::timeline::{Piece, Track, TrackKind};
@@ -20,13 +20,13 @@ fn secs(s: &str) -> i64 {
     (s.parse::<f64>().unwrap_or(0.0) * 1e7) as i64
 }
 
-/// Con CLIPPY_FRAME="cuartos,espejo,izq,arriba,der,abajo,llenar" (ej. "1,1,0,0,0.5,1,0"), la imagen de todas las
-/// piezas girada, espejada y recortada así.
+/// Con CLIPPY_FRAME="cuartos,espejo,izq,arriba,der,abajo,encaje" (ej. "1,1,0,0,0.5,1,0"; encaje 0 entera,
+/// 1 llenar, 2 estirar), la imagen de todas las piezas girada, espejada, recortada y encajada así.
 fn test_frame() -> Frame {
     let Ok(v) = std::env::var("CLIPPY_FRAME") else { return Frame::default() };
     let n: Vec<f32> = v.split(',').map(|x| x.trim().parse().unwrap_or(0.0)).collect();
     let at = |i: usize, d: f32| n.get(i).copied().unwrap_or(d);
-    Frame { turns: at(0, 0.0) as u8, flip: at(1, 0.0) != 0.0, crop: [at(2, 0.0), at(3, 0.0), at(4, 1.0), at(5, 1.0)], fill: at(6, 0.0) != 0.0 }
+    Frame { turns: at(0, 0.0) as u8, flip: at(1, 0.0) != 0.0, crop: [at(2, 0.0), at(3, 0.0), at(4, 1.0), at(5, 1.0)], sizing: [Sizing::Whole, Sizing::Fill, Sizing::Stretch][(at(6, 0.0) as usize).min(2)] }
 }
 
 /// Con CLIPPY_RATIO="9:16", el lienzo con esa proporción.

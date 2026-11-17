@@ -8,7 +8,7 @@ use eframe::egui::text::LayoutJob;
 use eframe::egui::{self, Align, Align2, Color32, CursorIcon, FontId, Layout, Pos2, Rect, RichText, Sense, Shape, Stroke, Vec2};
 
 use crate::ui_kit::theme::*;
-use super::media::{Frame, Ratio};
+use super::media::{Frame, Ratio, Sizing};
 use super::panels::SEEK_EVERY;
 use super::shortcuts::{self, Act};
 use super::EditorApp;
@@ -349,7 +349,7 @@ impl EditorApp {
         let Some((ti, i)) = self.find(c.id) else { return };
         let frame = self.tracks[ti].clips[i].frame;
         // La imagen entera (sin recortar), girada y espejada como se va a ver.
-        let whole = Frame { crop: [0.0, 0.0, 1.0, 1.0], fill: false, ..frame };
+        let whole = Frame { crop: [0.0, 0.0, 1.0, 1.0], sizing: Sizing::Whole, ..frame };
         let p = ui.painter_at(area);
         let layer = self.layers.iter().find(|l| l.piece() == c.id);
         let Some(l) = layer else {

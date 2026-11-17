@@ -8,13 +8,17 @@ use windows::core::Interface;
 use windows::Win32::Foundation::{HMODULE, LUID, POINT};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1};
 use windows::Win32::Graphics::Direct3D11::*;
-use windows::Win32::Graphics::Dxgi::Common::DXGI_MODE_ROTATION;
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_MODE_ROTATION, DXGI_MODE_ROTATION_ROTATE270, DXGI_MODE_ROTATION_ROTATE90};
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Gdi::{MonitorFromPoint, HMONITOR, MONITOR_DEFAULTTOPRIMARY};
 
+use super::screen::{self, wide};
 use crate::log::log;
 
-/// Una duplicación que no se pudo abrir se reintenta cada 5 s (100 ns).
+/// Una duplicación que no se pudo abrir se reintenta enseguida durante `QUICK_FOR` (un juego que cambia el modo
+/// de video al entrar en pantalla completa la corta un segundo) y después cada 5 s (100 ns).
+const QUICK_RETRY: i64 = 2_500_000;
+const QUICK_FOR: i64 = 30_000_000;
 const RETRY: i64 = 50_000_000;
 
 /// Qué hizo `Capture::aim`.
@@ -30,6 +34,9 @@ pub enum Aim {
 pub struct Frame {
     pub tex: ID3D11Texture2D,
     pub rotation: DXGI_MODE_ROTATION,
+    /// La forma con la que se ve en el monitor (ya girada): la del panel si Windows la estira
+    /// (resolución estirada), si no la de la imagen.
+    pub shape: (u32, u32),
 }
 
 /// Un monitor visto desde una GPU.
@@ -37,7 +44,7 @@ struct Output {
     monitor: HMONITOR,
     output: IDXGIOutput1,
     name: String,
-    /// Tamaño en el escritorio (ya rotado), redondeado a par como lo pide H.264.
+    /// Tamaño del video para este monitor (ver `video_size`).
     width: u32,
     height: u32,
 }
@@ -46,7 +53,8 @@ pub struct Capture {
     pub device: ID3D11Device,
     pub context: ID3D11DeviceContext,
     pub luid: LUID,
-    /// Tamaño del video, fijo durante la sesión: otro monitor se escala adentro sin deformarse.
+    /// Tamaño del video, fijo durante la sesión (antes de achicarlo según los ajustes): otro monitor
+    /// se escala adentro sin deformarse.
     pub width: u32,
     pub height: u32,
     /// Es una textura nueva cuando cambia el tamaño o la rotación de la imagen.
@@ -56,8 +64,12 @@ pub struct Capture {
     out: Output,
     dup: Option<IDXGIOutputDuplication>,
     rotation: DXGI_MODE_ROTATION,
+    /// La forma del panel si Windows estira la imagen hasta llenarlo (None si la encaja con bandas o no se sabe).
+    stretch: Option<(u32, u32)>,
     retry_at: i64,
-    /// Ya se avisó en el log que la duplicación no abre (para no repetirlo cada 5 s).
+    /// Desde cuándo no abre la duplicación.
+    failing_since: Option<i64>,
+    /// Ya se avisó en el log que no abre (para no repetirlo cada 5 s).
     failing: bool,
     /// Último monitor que no se pudo seguir sin reiniciar (para avisarlo una sola vez).
     skipped: Option<HMONITOR>,
@@ -124,7 +136,9 @@ impl Capture {
                 out,
                 dup: None,
                 rotation: DXGI_MODE_ROTATION::default(),
+                stretch: None,
                 retry_at: 0,
+                failing_since: None,
                 failing: false,
                 skipped: None,
             };
@@ -143,6 +157,8 @@ impl Capture {
         let dup = unsafe { self.out.output.DuplicateOutput(&self.device)? };
         self.rotation = unsafe { dup.GetDesc() }.Rotation;
         self.dup = Some(dup);
+        // Se vuelve a abrir cada vez que un juego cambia el modo de video: ahí se ve si se estira.
+        self.stretch = screen::all().into_iter().find(|s| s.name == self.out.name && !s.keeps_shape).map(|s| s.panel);
         Ok(())
     }
 
@@ -165,7 +181,7 @@ impl Capture {
         match self.open() {
             Ok(()) => {
                 log(&format!("grabando {}", self.describe()));
-                self.failing = false;
+                (self.failing, self.failing_since) = (false, None);
                 self.skipped = None;
                 Aim::Switched
             }
@@ -199,13 +215,16 @@ impl Capture {
             }
             // Escritorio seguro (UAC, bloqueo), cambio de modo u otra app que ocupa la duplicación.
             if let Err(e) = self.open() {
-                self.retry_at = now + RETRY;
-                if !self.failing {
+                let since = *self.failing_since.get_or_insert(now);
+                let quick = now - since < QUICK_FOR;
+                self.retry_at = now + if quick { QUICK_RETRY } else { RETRY };
+                if !quick && !self.failing {
                     self.failing = true;
                     log(&format!("no se puede capturar {} ({e}): el video queda congelado, reintento cada 5 s", self.out.name));
                 }
                 return Ok(());
             }
+            self.failing_since = None;
             if std::mem::take(&mut self.failing) {
                 log(&format!("captura de {} recuperada", self.out.name));
             }
@@ -244,10 +263,13 @@ impl Capture {
         unsafe {
             let mut d = D3D11_TEXTURE2D_DESC::default();
             frame.GetDesc(&mut d);
+            let turned = matches!(self.rotation, DXGI_MODE_ROTATION_ROTATE90 | DXGI_MODE_ROTATION_ROTATE270);
+            let image = if turned { (d.Height, d.Width) } else { (d.Width, d.Height) };
+            let shape = self.stretch.unwrap_or(image);
             let fits = self.latest.as_ref().is_some_and(|f| {
                 let mut l = D3D11_TEXTURE2D_DESC::default();
                 f.tex.GetDesc(&mut l);
-                f.rotation == self.rotation && (l.Width, l.Height, l.Format) == (d.Width, d.Height, d.Format)
+                (f.rotation, f.shape) == (self.rotation, shape) && (l.Width, l.Height, l.Format) == (d.Width, d.Height, d.Format)
             });
             if !fits {
                 d.MipLevels = 1;
@@ -259,7 +281,10 @@ impl Capture {
                 let mut t = None;
                 self.device.CreateTexture2D(&d, None, Some(&mut t))?;
                 let tex = t.ok_or_else(|| anyhow!("sin textura de captura"))?;
-                self.latest = Some(Frame { tex, rotation: self.rotation });
+                if shape.0 as u64 * image.1 as u64 != shape.1 as u64 * image.0 as u64 {
+                    log(&format!("{} a {}x{}: estirado a la forma del monitor ({}x{})", self.out.name, image.0, image.1, shape.0, shape.1));
+                }
+                self.latest = Some(Frame { tex, rotation: self.rotation, shape });
             }
             if let Some(f) = &self.latest {
                 self.context.CopyResource(&f.tex, frame);
@@ -271,6 +296,7 @@ impl Capture {
 
 /// Monitores conectados al escritorio que ve esta GPU.
 fn outputs(adapter: &IDXGIAdapter1) -> Vec<Output> {
+    let screens = screen::all();
     let mut v = Vec::new();
     let mut j = 0;
     while let Ok(output) = unsafe { adapter.EnumOutputs(j) } {
@@ -279,19 +305,27 @@ fn outputs(adapter: &IDXGIAdapter1) -> Vec<Output> {
         if !d.AttachedToDesktop.as_bool() {
             continue;
         }
+        let name = wide(&d.DeviceName);
         let r = d.DesktopCoordinates;
-        v.push(Output {
-            monitor: d.Monitor,
-            output,
-            name: wide(&d.DeviceName),
-            width: (r.right - r.left) as u32 & !1,
-            height: (r.bottom - r.top) as u32 & !1,
-        });
+        let desktop = screen::desktop(&name).unwrap_or(((r.right - r.left) as u32, (r.bottom - r.top) as u32));
+        let panel = screens.iter().find(|s| s.name == name).map(|s| s.panel);
+        let (width, height) = video_size(desktop, panel);
+        v.push(Output { monitor: d.Monitor, output, name, width, height });
     }
     v
 }
 
-fn wide(s: &[u16]) -> String {
-    let n = s.iter().position(|&c| c == 0).unwrap_or(s.len());
-    String::from_utf16_lossy(&s[..n])
+/// Tamaño del video para un monitor (pares, como lo pide H.264): la forma del panel, así una resolución
+/// estirada sale estirada como la ve el jugador, a la resolución del escritorio de Windows (la que eligió el
+/// usuario, no la que pone un juego): no se agranda la imagen, un panel 4K con el escritorio a 1080p graba 1080p.
+fn video_size(desktop: (u32, u32), panel: Option<(u32, u32)>) -> (u32, u32) {
+    let (w, h) = match panel {
+        Some((pw, ph)) => {
+            let short = desktop.0.min(desktop.1).min(pw.min(ph)) as u64;
+            let (pw, ph) = (pw as u64, ph as u64);
+            if pw >= ph { (short * pw / ph, short) } else { (short, short * ph / pw) }
+        }
+        None => (desktop.0 as u64, desktop.1 as u64),
+    };
+    ((w as u32).max(2) & !1, (h as u32).max(2) & !1)
 }

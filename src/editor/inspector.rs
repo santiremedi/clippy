@@ -5,7 +5,7 @@ use eframe::egui::{self, RichText};
 
 use crate::ui_kit::theme::*;
 use super::library;
-use super::media::{self, Frame, SPEED_MAX, SPEED_MIN};
+use super::media::{self, Frame, Sizing, SPEED_MAX, SPEED_MIN};
 use super::shortcuts::{self, Act};
 use super::{EditorApp, HelpTab};
 
@@ -79,14 +79,14 @@ impl EditorApp {
                 self.start_crop();
             }
         });
-        // Entera o llenando solo cambia algo si la imagen no tiene la forma del lienzo.
+        // Entera, llenando o estirada solo cambia algo si la imagen no tiene la forma del lienzo.
         let canvas = self.canvas_shape();
         let shape = self.loader.probe(path).map(|p| frame.view_size((p.width as f32, p.height as f32)));
         if shape.is_some_and(|(w, h)| (w / h - canvas.0 / canvas.1).abs() > 0.01) {
             ui.add_space(8.0);
-            let mut fill = frame.fill;
-            if seg(ui, &mut fill, &[(false, "Entera"), (true, "Llenar")]) {
-                self.edit_frame(|f| f.fill = fill);
+            let mut sizing = frame.sizing;
+            if seg(ui, &mut sizing, &[(Sizing::Whole, "Entera"), (Sizing::Fill, "Llenar"), (Sizing::Stretch, "Estirar")]) {
+                self.edit_frame(|f| f.sizing = sizing);
             }
         }
         if frame != Frame::default() {

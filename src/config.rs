@@ -43,6 +43,8 @@ pub const MAX_SECONDS: u32 = 300;
 /// Calidad de video (Mbps) que se puede elegir a mano en "Personalizada".
 pub const MIN_MBPS: u32 = 5;
 pub const MAX_MBPS: u32 = 150;
+/// Resoluciones del clip que se pueden elegir (lado corto en px; 0 = como el monitor).
+pub const RESOLUTIONS: [u32; 4] = [0, 1440, 1080, 720];
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 #[serde(default)]
@@ -55,6 +57,8 @@ pub struct Config {
     pub hotkey_mods: u32,
     pub fps: u32,
     pub bitrate_mbps: u32,
+    /// Lado corto del video en px (720, 1080, 1440); 0 = como el monitor. Nunca agranda la imagen.
+    pub resolution: u32,
     /// Audio del juego (el proceso en pantalla completa que se detecta solo, ver `game`).
     pub game_audio: bool,
     pub game_volume: u32,
@@ -120,6 +124,7 @@ impl Default for Config {
             hotkey_mods: 0,
             fps: 60,
             bitrate_mbps: 30, // "Media"
+            resolution: 0,
             game_audio: true,
             game_volume: 100,
             desktop_audio: true,
@@ -141,8 +146,18 @@ impl Default for Config {
 
 impl Config {
     /// Valores que obligan a reiniciar la captura de video si cambian (se pierde el buffer).
-    pub fn video_params(&self) -> (bool, u32, u32) {
-        (self.enabled, self.fps, self.bitrate_mbps)
+    pub fn video_params(&self) -> (bool, u32, u32, u32) {
+        (self.enabled, self.fps, self.bitrate_mbps, self.resolution)
+    }
+
+    /// Tamaño del video (pares) para un monitor que se grabaría a `full`, con la resolución elegida.
+    pub fn video_size(&self, full: (u32, u32)) -> (u32, u32) {
+        let short = full.0.min(full.1);
+        if self.resolution == 0 || self.resolution >= short {
+            return full;
+        }
+        let k = |x: u32| ((x as u64 * self.resolution as u64 / short as u64) as u32).max(2) & !1;
+        (k(full.0), k(full.1))
     }
 
     pub fn audio_on(&self) -> bool {
@@ -155,6 +170,9 @@ impl Config {
             self.fps = 60;
         }
         self.bitrate_mbps = self.bitrate_mbps.clamp(MIN_MBPS, MAX_MBPS);
+        if !RESOLUTIONS.contains(&self.resolution) {
+            self.resolution = 0;
+        }
         self.game_volume = self.game_volume.min(100);
         self.desktop_volume = self.desktop_volume.min(100);
         self.mic_volume = self.mic_volume.min(200);
