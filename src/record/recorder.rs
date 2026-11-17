@@ -208,6 +208,9 @@ impl AudioState {
 /// Cada cuánto se revisa qué monitor grabar (100 ns).
 const AIM_EVERY: i64 = 2_500_000;
 
+/// Cuánto después de empezar a convertir un monitor se controla la imagen para el log (100 ns).
+const PROBE_AFTER: i64 = 20_000_000;
+
 /// `restarted`: el monitor del juego que pidió reiniciar (ya se grabó a su resolución; no se vuelve a pedir).
 fn session(cfg: &mut Config, rx: &Receiver<Cmd>, notify: &Notify, restarted: Option<HMONITOR>) -> Result<End> {
     let fps = cfg.fps.max(1);
@@ -242,6 +245,8 @@ fn session(cfg: &mut Config, rx: &Receiver<Cmd>, notify: &Notify, restarted: Opt
     notify(Event::Game(au.game.name()));
     let mut game_monitor = restarted;
     let mut next_aim = 0i64;
+    // Cuándo controlar la imagen del monitor actual (una vez por cada `Converter`).
+    let mut probe_at: Option<i64> = None;
     au.sync(cfg, 0);
     let mut next_frame = 0i64;
     let mut packets: VecDeque<Packet> = VecDeque::new();
@@ -289,6 +294,7 @@ fn session(cfg: &mut Config, rx: &Receiver<Cmd>, notify: &Notify, restarted: Opt
         if let Some(f) = &cap.latest {
             if !conv.as_ref().is_some_and(|c| c.is_for(f)) {
                 conv = Some(Converter::new(&cap.device, &cap.context, f, w, h, fps, 8)?);
+                probe_at = Some(now + PROBE_AFTER);
             }
         }
         au.sync(cfg, now);
@@ -306,6 +312,10 @@ fn session(cfg: &mut Config, rx: &Receiver<Cmd>, notify: &Notify, restarted: Opt
                 // Solo convertir si el encoder pidió otra imagen; si está ocupado se salta un cuadro.
                 if enc.pending_input > 0 {
                     let tex = if visible { c.convert()? } else { c.black() };
+                    if visible && probe_at.is_some_and(|t| now >= t) {
+                        probe_at = None;
+                        log(&c.probe(&tex));
+                    }
                     enc.feed(&tex, pts, frame_dur)?;
                 }
             }
@@ -394,6 +404,7 @@ fn save_clip(cfg: &Config, packets: &VecDeque<Packet>, enc: &Encoder, au: &Audio
         .or_else(|| packets.iter().position(|p| p.key));
     let Some(start) = start else { return fail("todavía no hay video en el buffer") };
     let pk: Vec<Packet> = packets.iter().skip(start).cloned().collect();
+    log(&format!("clip: {} cuadros, {} fotogramas clave", pk.len(), pk.iter().filter(|p| p.key).count()));
     let base = pk[0].pts;
     let end = pk.last().map_or(base, |p| p.pts) + frame_dur;
     let audio = cfg.audio_on().then(|| mixed_audio(cfg, au, frames_at(base), frames_at(end)));

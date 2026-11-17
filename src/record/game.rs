@@ -13,8 +13,7 @@ use windows::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClassNameW, GetForegroundWindow, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindow, IsZoomed, GWL_STYLE,
-    WS_CAPTION,
+    GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindow, IsZoomed,
 };
 
 /// Programas que pueden estar en pantalla completa sin ser juegos (en minúsculas, sin ".exe").
@@ -204,13 +203,13 @@ fn snapshot() -> Vec<(u32, String)> {
 }
 
 /// (PID, ventana) de la ventana activa si ocupa todo su monitor. El escritorio, las ventanas normales y las
-/// maximizadas con barra de título no cuentan (con la barra de tareas oculta, una ventana maximizada
-/// también tapa todo el monitor; un juego sin bordes no tiene barra de título).
+/// maximizadas no cuentan: en un monitor sin barra de tareas una ventana maximizada también lo tapa entero,
+/// y apps sin barra de título estándar (Discord, Spotify) parecerían juegos. Un juego sin bordes no se
+/// maximiza: se agranda al tamaño del monitor.
 fn fullscreen_window() -> Option<(u32, HWND)> {
     unsafe {
         let h = foreground()?;
-        let style = GetWindowLongW(h, GWL_STYLE) as u32;
-        if IsZoomed(h).as_bool() && style & WS_CAPTION.0 == WS_CAPTION.0 {
+        if IsZoomed(h).as_bool() {
             return None;
         }
         let mut r = RECT::default();
