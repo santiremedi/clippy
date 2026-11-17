@@ -113,7 +113,7 @@ impl Default for Config {
             hotkey_vk: 0x78, // F9
             hotkey_mods: 0,
             fps: 60,
-            bitrate_mbps: 20,
+            bitrate_mbps: 30, // "Media"
             game_audio: true,
             game_volume: 100,
             desktop_audio: true,
