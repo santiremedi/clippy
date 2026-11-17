@@ -1,11 +1,16 @@
 //! Vista previa: el lienzo con la proporción elegida y cada imagen recortada, girada y ubicada como se va a
-//! exportar; abajo, la proporción. Desde el panel del clip se entra a recortar su imagen acá mismo.
+//! exportar; abajo, la proporción y la pantalla completa. Desde el panel del clip se entra a recortar su imagen
+//! acá mismo.
+
+use std::time::{Duration, Instant};
 
 use eframe::egui::text::LayoutJob;
-use eframe::egui::{self, Align, Align2, Color32, CursorIcon, FontId, Layout, Pos2, Rect, Sense, Shape, Stroke, Vec2};
+use eframe::egui::{self, Align, Align2, Color32, CursorIcon, FontId, Layout, Pos2, Rect, RichText, Sense, Shape, Stroke, Vec2};
 
 use crate::ui_kit::theme::*;
 use super::media::{Frame, Ratio};
+use super::panels::SEEK_EVERY;
+use super::shortcuts::{self, Act};
 use super::EditorApp;
 
 /// Proporciones del lienzo que se pueden elegir (None = la del primer clip).
@@ -25,6 +30,22 @@ const BAR_H: f32 = 34.0;
 const CROP_GRIP: f32 = 14.0;
 /// Lo mínimo que puede quedar del recorte (px de pantalla).
 const CROP_MIN: f32 = 32.0;
+/// En pantalla completa, segundos con el mouse quieto hasta que se esconden la barra y el cursor.
+const IDLE_HIDE: f64 = 2.5;
+/// Alto de la barra de pantalla completa (con la sombra que la separa del video) y margen de sus controles.
+const FS_BAR_H: f32 = 96.0;
+const FS_PAD: f32 = 24.0;
+
+/// La vista previa en pantalla completa: solo el video y, abajo, una barra que se esconde con el mouse quieto.
+pub(super) struct Fullscreen {
+    /// La ventana estaba maximizada: al salir vuelve a estarlo.
+    was_maximized: bool,
+    /// Cuándo se entró (cada vez la barra arranca visible, sin fundido) y cuándo se movió el mouse.
+    since: f64,
+    moved: f64,
+    /// Arrastrando por la barra de tiempo.
+    scrubbing: bool,
+}
 
 /// Recortando la imagen de una pieza.
 pub(super) struct CropEdit {
@@ -115,9 +136,15 @@ impl EditorApp {
         }
     }
 
-    /// Barra de abajo: la proporción del lienzo.
+    /// Barra de abajo: la proporción del lienzo y la pantalla completa.
     fn ratio_bar(&mut self, ui: &mut egui::Ui, bar: Rect) {
         let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(bar).layout(Layout::right_to_left(Align::Center)));
+        let tip = format!("Pantalla completa ({})", shortcuts::short(&self.prefs.keys, Act::Fullscreen));
+        ui.add_enabled_ui(!self.is_empty(), |ui| {
+            if icon_only_button(ui, Glyph::Fullscreen, Kind::Secondary, &tip).clicked() {
+                self.toggle_fullscreen();
+            }
+        });
         let current = RATIOS.iter().find(|r| r.0 == self.ratio).map_or("Original", |r| r.1);
         let r = button(&mut ui, current, Kind::Secondary).on_hover_text("Forma del video: horizontal, vertical, cuadrado…");
         let menu = ui.id().with("ratio_menu");
@@ -142,7 +169,164 @@ impl EditorApp {
         if let Some(r) = pick {
             self.set_ratio(r);
         }
-        ui.label(egui::RichText::new("Proporción").size(13.0).color(MUTED));
+        ui.label(RichText::new("Proporción").size(13.0).color(MUTED));
+    }
+
+    /// Entra o sale de la pantalla completa (sin clips no hay nada que ver).
+    pub(super) fn toggle_fullscreen(&mut self) {
+        if self.fullscreen.is_some() {
+            self.exit_fullscreen();
+        } else if !self.is_empty() {
+            let (now, max) = self.ctx.input(|i| (i.time, i.viewport().maximized.unwrap_or(false)));
+            self.ctx.memory_mut(|m| m.close_popup());
+            self.ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+            self.fullscreen = Some(Fullscreen { was_maximized: max, since: now, moved: now, scrubbing: false });
+        }
+    }
+
+    /// Vuelve a la ventana como estaba.
+    pub(super) fn exit_fullscreen(&mut self) {
+        let Some(fs) = self.fullscreen.take() else { return };
+        self.ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        if fs.was_maximized {
+            self.ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+        }
+        if fs.scrubbing {
+            if let Some(t) = self.scrub_t.take() {
+                self.seek(t);
+            }
+        }
+    }
+
+    /// Pantalla completa: el lienzo con negro alrededor y la barra de abajo mientras se mueve el mouse.
+    pub(super) fn fullscreen_view(&mut self, ui: &mut egui::Ui) {
+        let full = ui.max_rect();
+        ui.painter().rect_filled(full, 0.0, Color32::BLACK);
+        self.canvas_view(ui, full);
+        let bar = Rect::from_min_max(Pos2::new(full.left(), full.bottom() - FS_BAR_H), full.max);
+        let (now, moved, hover) = ui.input(|i| (i.time, i.pointer.delta() != Vec2::ZERO || i.pointer.any_pressed(), i.pointer.hover_pos()));
+        let Some(fs) = self.fullscreen.as_mut() else { return };
+        if moved {
+            fs.moved = now;
+        }
+        // Con el mouse encima de la barra (o arrastrando la de tiempo) no se esconde.
+        let held = fs.scrubbing || hover.is_some_and(|h| bar.contains(h));
+        let idle = now - fs.moved;
+        let show = held || idle < IDLE_HIDE;
+        if show && !held {
+            // Un solo cuadro más, cuando toca esconderla.
+            ui.ctx().request_repaint_after(Duration::from_secs_f64(IDLE_HIDE - idle));
+        }
+        let a = if reduced_motion() {
+            f32::from(u8::from(show))
+        } else {
+            ui.ctx().animate_bool_with_time_and_easing(egui::Id::new("fs_bar").with(fs.since.to_bits()), show, T_FADE, ease_out)
+        };
+        if !show {
+            ui.ctx().set_cursor_icon(CursorIcon::None);
+        }
+        if a > 0.0 {
+            self.fullscreen_bar(ui, bar, a);
+        }
+    }
+
+    /// Barra de pantalla completa (con opacidad `a`): reproducir, el tiempo, la barra para moverse y salir.
+    fn fullscreen_bar(&mut self, ui: &mut egui::Ui, bar: Rect, a: f32) {
+        // Una sombra de abajo hacia arriba para que se lea sobre cualquier imagen.
+        let mut m = egui::Mesh::default();
+        let (top, bottom) = (Color32::TRANSPARENT, BADGE.gamma_multiply(a));
+        for (pos, col) in [(bar.left_top(), top), (bar.right_top(), top), (bar.right_bottom(), bottom), (bar.left_bottom(), bottom)] {
+            m.colored_vertex(pos, col);
+        }
+        m.add_triangle(0, 1, 2);
+        m.add_triangle(0, 2, 3);
+        ui.painter().add(Shape::mesh(m));
+        // Un clic en la barra (fuera de los controles) no pausa el video.
+        ui.interact(bar, ui.id().with("fs_bar"), Sense::click());
+
+        let row = Rect::from_min_max(Pos2::new(bar.left() + FS_PAD, bar.bottom() - FS_PAD - 40.0), Pos2::new(bar.right() - FS_PAD, bar.bottom() - FS_PAD));
+        let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(row).layout(Layout::left_to_right(Align::Center)));
+        ui.multiply_opacity(a);
+        ui.spacing_mut().item_spacing.x = 16.0;
+        let tip = format!("Reproducir / pausar ({})", shortcuts::short(&self.prefs.keys, Act::PlayPause));
+        if play_button(&mut ui, self.playing, 40.0).on_hover_text(tip).clicked() {
+            self.toggle_play();
+        }
+        // El ancho del tiempo más largo, así la barra no se mueve mientras cambian los números.
+        let total = self.total();
+        let font = FontId::proportional(15.0);
+        let widest = ui.painter().layout_no_wrap(format!("{0}  /  {0}", fmt_time(total)), font, TEXT).size().x;
+        let time = format!("{}  /  {}", fmt_time(self.pos()), fmt_time(total));
+        ui.allocate_ui_with_layout(egui::vec2(widest, 40.0), Layout::left_to_right(Align::Center), |ui| {
+            ui.label(RichText::new(time).size(15.0).color(TEXT));
+        });
+        let mut exit = false;
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            exit = icon_only_button(ui, Glyph::ExitFullscreen, Kind::Ghost, "Salir de pantalla completa (Esc)").clicked();
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 40.0), Sense::click_and_drag());
+            self.seek_bar(ui, rect, &resp);
+        });
+        if exit {
+            self.exit_fullscreen();
+        }
+    }
+
+    /// Barra para moverse por el video: el cursor sigue al mouse en cada cuadro y el video, como mucho cada
+    /// `SEEK_EVERY` (como al arrastrar el cursor en la línea de tiempo).
+    fn seek_bar(&mut self, ui: &egui::Ui, rect: Rect, resp: &egui::Response) {
+        let total = self.total().max(1);
+        let t_at = |x: f32| (((x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64 * total as f64) as i64;
+        let x_at = |t: i64| rect.left() + rect.width() * (t as f32 / total as f32).clamp(0.0, 1.0);
+        let down = resp.is_pointer_button_down_on();
+        if let (true, Some(h)) = (down, resp.interact_pointer_pos()) {
+            let t = t_at(h.x);
+            if self.scrub_t != Some(t) {
+                self.scrub_t = Some(t);
+                ui.ctx().request_repaint(); // el tiempo de la barra se dibujó antes que esto
+            }
+            if t != self.clock.pos() {
+                if ui.input(|i| i.pointer.any_pressed()) || self.last_seek.elapsed() > SEEK_EVERY {
+                    self.seek(t);
+                    self.last_seek = Instant::now();
+                } else {
+                    ui.ctx().request_repaint_after(SEEK_EVERY);
+                }
+            }
+        } else if self.fullscreen.as_ref().is_some_and(|f| f.scrubbing) {
+            if let Some(t) = self.scrub_t.take() {
+                if t != self.clock.pos() {
+                    self.seek(t);
+                }
+            }
+        }
+        if let Some(fs) = self.fullscreen.as_mut() {
+            fs.scrubbing = down;
+        }
+
+        let hot = down || resp.hovered();
+        let h = if hot { 6.0 } else { 4.0 };
+        let track = Rect::from_center_size(rect.center(), egui::vec2(rect.width(), h));
+        let x = x_at(self.pos());
+        let p = ui.painter();
+        p.rect_filled(track, h / 2.0, WHITE.gamma_multiply(0.3));
+        p.rect_filled(Rect::from_min_max(track.min, Pos2::new(x, track.bottom())), h / 2.0, WHITE);
+        for &m in &self.markers {
+            p.rect_filled(Rect::from_center_size(Pos2::new(x_at(m), track.center().y), egui::vec2(2.0, h + 6.0)), 1.0, MUTED);
+        }
+        if hot {
+            p.circle_filled(Pos2::new(x, track.center().y), 7.0, WHITE);
+        }
+        // El tiempo bajo el mouse, arriba de la barra.
+        if let Some(hp) = resp.hover_pos().filter(|_| !down) {
+            let g = p.layout_no_wrap(fmt_time(t_at(hp.x)), FontId::proportional(13.0), TEXT);
+            let r = Rect::from_center_size(Pos2::new(hp.x, rect.top() - 6.0 - g.size().y / 2.0), g.size() + egui::vec2(12.0, 6.0));
+            let r = r.translate(egui::vec2((rect.left() - r.left()).max(0.0) + (rect.right() - r.right()).min(0.0), 0.0));
+            p.rect_filled(r, 4.0, BADGE);
+            p.galley(r.center() - g.size() / 2.0, g, TEXT);
+        }
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        }
     }
 
     /// Empieza a recortar la imagen de lo elegido, con el cursor sobre esa pieza.

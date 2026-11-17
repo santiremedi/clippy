@@ -44,12 +44,13 @@ pub enum Act {
     ZoomIn,
     ZoomOut,
     ZoomFit,
+    Fullscreen,
     Import,
     Export,
     Shortcuts,
 }
 
-pub const ALL: [Act; 23] = [
+pub const ALL: [Act; 24] = [
     Act::PlayPause,
     Act::PrevFrame,
     Act::NextFrame,
@@ -70,6 +71,7 @@ pub const ALL: [Act; 23] = [
     Act::ZoomIn,
     Act::ZoomOut,
     Act::ZoomFit,
+    Act::Fullscreen,
     Act::Import,
     Act::Export,
     Act::Shortcuts,
@@ -85,6 +87,11 @@ impl Act {
     /// Cambia las piezas de la línea de tiempo (sus posiciones o su cantidad).
     pub fn edits_timeline(self) -> bool {
         matches!(self, Act::Split | Act::Duplicate | Act::Delete | Act::Freeze | Act::MuteClip | Act::Link | Act::Undo | Act::Redo)
+    }
+
+    /// Lo que se puede hacer en pantalla completa: moverse por el video (y salir).
+    pub fn in_fullscreen(self) -> bool {
+        self.group() == GROUPS[0] || self == Act::Fullscreen
     }
 
     pub fn id(self) -> &'static str {
@@ -109,6 +116,7 @@ impl Act {
             Act::ZoomIn => "zoom_in",
             Act::ZoomOut => "zoom_out",
             Act::ZoomFit => "zoom_fit",
+            Act::Fullscreen => "fullscreen",
             Act::Import => "import",
             Act::Export => "export",
             Act::Shortcuts => "shortcuts",
@@ -137,6 +145,7 @@ impl Act {
             Act::ZoomIn => "Acercar línea de tiempo",
             Act::ZoomOut => "Alejar línea de tiempo",
             Act::ZoomFit => "Ver toda la línea de tiempo",
+            Act::Fullscreen => "Pantalla completa",
             Act::Import => "Importar videos",
             Act::Export => "Exportar video",
             Act::Shortcuts => "Ayuda y atajos",
@@ -147,7 +156,7 @@ impl Act {
         GROUPS[match self {
             Act::PlayPause | Act::PrevFrame | Act::NextFrame | Act::Back | Act::Forward | Act::ToStart | Act::ToEnd => 0,
             Act::Split | Act::Duplicate | Act::Delete | Act::Freeze | Act::Marker | Act::MuteClip | Act::Link | Act::Magnet | Act::Undo | Act::Redo => 1,
-            Act::ZoomIn | Act::ZoomOut | Act::ZoomFit => 2,
+            Act::ZoomIn | Act::ZoomOut | Act::ZoomFit | Act::Fullscreen => 2,
             Act::Import | Act::Export | Act::Shortcuts => 3,
         }]
     }
@@ -174,6 +183,7 @@ impl Act {
             Act::ZoomIn => k("Plus", true, false),
             Act::ZoomOut => k("Minus", true, false),
             Act::ZoomFit => k("0", true, false),
+            Act::Fullscreen => k("F11", false, false),
             Act::Import => k("I", true, false),
             Act::Export => k("E", true, false),
             Act::Shortcuts => k("F1", false, false),

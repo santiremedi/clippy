@@ -262,6 +262,9 @@ pub enum Glyph {
     NewFolder,
     /// Flecha hacia la izquierda (volver).
     Back,
+    /// Cuatro esquinas hacia afuera (pantalla completa) y hacia adentro (salir de pantalla completa).
+    Fullscreen,
+    ExitFullscreen,
 }
 
 /// Ancho del ícono y espacio hasta el texto.
@@ -369,6 +372,14 @@ fn glyph_shapes(g: Glyph, c: Pos2, col: Color32) -> Vec<Shape> {
             Shape::line_segment([p(0.0, -0.15), p(0.0, 0.55)], st),
         ],
         Glyph::Back => vec![Shape::line_segment([p(0.85, 0.0), p(-0.85, 0.0)], st), Shape::line(vec![p(-0.2, -0.65), p(-0.85, 0.0), p(-0.2, 0.65)], st)],
+        Glyph::Fullscreen | Glyph::ExitFullscreen => {
+            // La punta de cada esquina: en el borde (afuera) o cerca del centro (adentro).
+            let k = if matches!(g, Glyph::Fullscreen) { 1.0 } else { 0.35 };
+            [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+                .into_iter()
+                .map(|(x, y)| Shape::line(vec![p(x, y * 0.35), p(x * k, y * k), p(x * 0.35, y)], st))
+                .collect()
+        }
     }
 }
 

@@ -45,7 +45,7 @@ const AUTO_SCROLL: f32 = 900.0;
 /// Zoom de la línea de tiempo: 1 = entra entera.
 const ZOOM_MAX: f32 = 40.0;
 /// Mientras se arrastra, el video busca el cuadro como mucho cada tanto (buscar es caro).
-const SEEK_EVERY: Duration = Duration::from_millis(40);
+pub(super) const SEEK_EVERY: Duration = Duration::from_millis(40);
 
 #[derive(Clone)]
 pub(super) enum Drag {

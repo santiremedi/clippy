@@ -39,7 +39,7 @@ use timeline::{Snapshot, Track, TrackKind};
 use export::{ExportDialog, ExportJob};
 use panels::{Drag, Menu};
 use browser::Browser;
-use preview::CropEdit;
+use preview::{CropEdit, Fullscreen};
 
 /// Tamaño mínimo de la ventana: entran los paneles en su tamaño mínimo y la vista previa.
 const MIN_SIZE: [f32; 2] = [960.0, 600.0];
@@ -103,6 +103,8 @@ struct EditorApp {
     layers: Vec<Layer>,
     /// Recortando la imagen de una pieza en la vista previa.
     crop: Option<CropEdit>,
+    /// La vista previa en pantalla completa.
+    fullscreen: Option<Fullscreen>,
 
     zoom: f32,
     /// Zoom pedido (botones, deslizador, teclado o Ctrl + rueda); se aplica al dibujar la línea de tiempo,
@@ -150,6 +152,12 @@ impl eframe::App for EditorApp {
         if self.playing {
             // El hilo de video ya pide cuadro con cada imagen nueva; esto mueve el cursor entre una y otra.
             ctx.request_repaint_after(Duration::from_millis(16));
+        }
+        if self.fullscreen.is_some() {
+            egui::CentralPanel::default().frame(egui::Frame::none()).show(ctx, |ui| self.fullscreen_view(ui));
+            self.close_guard(ctx);
+            self.drop_files(ctx);
+            return;
         }
         let screen = ctx.screen_rect();
         let mut resized = false;
@@ -235,6 +243,7 @@ impl EditorApp {
             shown: Vec::new(),
             layers: Vec::new(),
             crop: None,
+            fullscreen: None,
             zoom: 1.0,
             zoom_to: None,
             scroll_x: 0.0,
@@ -301,7 +310,14 @@ impl EditorApp {
         if ctx.wants_keyboard_input() || self.keys_editor.capturing.is_some() || modal {
             return;
         }
+        if self.fullscreen.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.exit_fullscreen();
+        }
         for act in shortcuts::pressed(ctx, &self.prefs.keys) {
+            // En pantalla completa no se ve la línea de tiempo: solo se mueve por el video.
+            if self.fullscreen.is_some() && !act.in_fullscreen() {
+                continue;
+            }
             if self.help.is_some() && act != Act::Shortcuts {
                 continue;
             }
@@ -350,6 +366,7 @@ impl EditorApp {
                 self.zoom_to = None;
                 self.set_scroll = Some(0.0);
             }
+            Act::Fullscreen => self.toggle_fullscreen(),
             Act::Import => self.import_dialog(),
             Act::Export => self.export(),
             Act::Shortcuts => {
