@@ -16,6 +16,7 @@ use super::EditorApp;
 /// Pruebas sin ventana:
 /// `--test-export <salida.mp4> <pista> <archivo> <ini_s> <fin_s> [<pista> <archivo> <ini_s> <fin_s> ...]` (ver `parts`)
 /// `--test-frame <archivo> <t_s> <salida.ppm>`
+/// `--test-play <archivo> <t_s> <dur_s>`: reproduce y cuenta los cuadros que muestra (con CLIPPY_BLUR, desenfocados)
 fn secs(s: &str) -> i64 {
     (s.parse::<f64>().unwrap_or(0.0) * 1e7) as i64
 }
@@ -110,6 +111,13 @@ impl EditorApp {
         self.selected = self.tracks.iter().flat_map(|t| t.clips.first()).next().map(|p| p.id);
         self.ratio = test_ratio();
         self.next_id += 1000;
+        // Con CLIPPY_AT="3.2" el cursor arranca ahí, y con CLIPPY_PLAY=1 se reproduce solo.
+        if let Ok(t) = std::env::var("CLIPPY_AT") {
+            self.seek(secs(&t));
+        }
+        if std::env::var_os("CLIPPY_PLAY").is_some() {
+            self.toggle_play();
+        }
     }
 }
 
@@ -194,10 +202,29 @@ pub fn test_cli(args: &[String]) -> i32 {
             }
             0
         }
+        Some("--test-play") => {
+            let path = PathBuf::from(&args[1]);
+            let probe = media::probe(&path).unwrap();
+            let p = Player::open(path, &probe, egui::Context::default(), true);
+            let fdur = (1e7 / probe.fps().max(1.0)) as i64;
+            p.set_blur(media::blur_frames(test_blur(), 1.0, fdur, fdur));
+            p.seek(secs(&args[2]));
+            std::thread::sleep(Duration::from_millis(800));
+            let (dur, gen) = (secs(&args[3]), p.shared.gen.load(std::sync::atomic::Ordering::Relaxed));
+            let t = Instant::now();
+            p.play();
+            std::thread::sleep(Duration::from_nanos(dur as u64 * 100));
+            let shown = p.shared.gen.load(std::sync::atomic::Ordering::Relaxed) - gen;
+            println!("{shown} cuadros en {:?} ({:.1} por segundo; el archivo tiene {:.0})", t.elapsed(), shown as f64 / t.elapsed().as_secs_f64(), probe.fps());
+            0
+        }
         Some("--test-frame") => {
             let path = PathBuf::from(&args[1]);
             let probe = media::probe(&path).unwrap();
             let p = Player::open(path, &probe, egui::Context::default(), true);
+            // Con CLIPPY_BLUR, como la vista previa de una pieza con ese desenfoque.
+            let fdur = (1e7 / probe.fps().max(1.0)) as i64;
+            p.set_blur(media::blur_frames(test_blur(), 1.0, fdur, fdur));
             std::thread::sleep(Duration::from_millis(800));
             p.seek(secs(&args[2]));
             std::thread::sleep(Duration::from_millis(800));

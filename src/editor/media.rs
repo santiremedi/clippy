@@ -221,6 +221,15 @@ pub struct Clip {
     pub blur: f32,
 }
 
+/// Ver `Clip::blur_frames`: para un desenfoque `blur` (0 a 1) a velocidad `speed`.
+pub fn blur_frames(blur: f32, speed: f64, fdur: i64, src_fdur: i64) -> f32 {
+    if blur <= 0.0 {
+        return 0.0;
+    }
+    let step = (fdur as f64 * speed / src_fdur.max(1) as f64).max(1.0) as f32;
+    (1.0 + blur.clamp(0.0, 1.0) * 2.0 * step).min(MAX_BLUR as f32)
+}
+
 /// Velocidades que se pueden elegir. 0 no está: es la de una imagen congelada.
 pub const SPEED_MIN: f64 = 0.1;
 pub const SPEED_MAX: f64 = 10.0;
@@ -417,11 +426,7 @@ impl Clip {
     /// cuadros por segundo, más si el clip va acelerado o sale con menos) por la intensidad. El último cuenta en
     /// parte, así la intensidad cambia de a poco. 0 = sin desenfoque.
     pub fn blur_frames(&self, fdur: i64, src_fdur: i64) -> f32 {
-        if self.blur <= 0.0 {
-            return 0.0;
-        }
-        let step = (fdur as f64 * self.speed / src_fdur.max(1) as f64).max(1.0) as f32;
-        (1.0 + self.blur.clamp(0.0, 1.0) * 2.0 * step).min(MAX_BLUR as f32)
+        blur_frames(self.blur, self.speed, fdur, src_fdur)
     }
     fn name(&self) -> String {
         self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()

@@ -155,7 +155,7 @@ impl EditorApp {
         if r.changed() {
             self.set_blur(pct as f32 / 100.0);
         }
-        ui.label(RichText::new("Se ve en el video exportado, no en la vista previa. Se nota más con el clip acelerado.").size(12.5).color(MUTED));
+        ui.label(RichText::new("Se nota más con el clip acelerado o exportando a menos cuadros por segundo.").size(12.5).color(MUTED));
     }
 
     fn sound_section(&mut self, ui: &mut egui::Ui, path: &std::path::Path) {

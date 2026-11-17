@@ -54,6 +54,8 @@ struct Want {
     src: i64,
     gain: f32,
     speed: f64,
+    /// Cuadros que se mezclan en cada uno por el desenfoque (`Clip::blur_frames`).
+    blur: f32,
 }
 
 impl EditorApp {
@@ -147,7 +149,10 @@ impl EditorApp {
                 }
                 let gain = if !video && active { c.gain_at(t) } else { 0.0 };
                 let src = if active { c.src_at(t) } else { c.src_in };
-                want.push(Want { id: c.id, path: c.path.clone(), video, active, src, gain, speed: c.speed });
+                // Como al exportar con los cuadros por segundo del archivo.
+                let fdur = self.frame_len(&c.path);
+                let blur = if video { c.blur_frames(fdur, fdur) } else { 0.0 };
+                want.push(Want { id: c.id, path: c.path.clone(), video, active, src, gain, speed: c.speed, blur });
             }
         }
 
@@ -186,6 +191,7 @@ impl EditorApp {
             };
             let v = &mut self.voices[vi];
             v.player.set_speed(w.speed);
+            v.player.set_blur(w.blur);
             if fresh || reseek || (v.live && !w.active) {
                 v.player.seek(w.src);
                 if w.active && playing {

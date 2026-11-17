@@ -78,6 +78,8 @@ pub struct Player {
     gain: Arc<AtomicU32>,
     /// Velocidad (bits de un f64): el sonido se estira o se comprime, como una cinta.
     speed: Arc<AtomicU64>,
+    /// Desenfoque de movimiento (bits de un f32): cuántos cuadros se mezclan en cada uno (`Clip::blur_frames`).
+    blur: Arc<AtomicU32>,
     vtx: Option<Sender<VCmd>>,
     atx: Option<Sender<ACmd>>,
 }
@@ -91,10 +93,11 @@ impl Player {
         let pw = probe.width.clamp(2, 960) & !1;
         let ph = ((pw as u64 * probe.height as u64 / probe.width.max(1) as u64) as u32).max(2) & !1;
 
+        let blur = Arc::new(AtomicU32::new(0.0f32.to_bits()));
         let vtx = video.then(|| {
             let (vtx, vrx) = mpsc::channel();
-            let (path, clock, shared, ctx) = (path.clone(), clock.clone(), shared.clone(), ctx.clone());
-            std::thread::spawn(move || video_thread(path, pw, ph, clock, vrx, shared, ctx));
+            let (path, clock, shared, blur, ctx) = (path.clone(), clock.clone(), shared.clone(), blur.clone(), ctx.clone());
+            std::thread::spawn(move || video_thread(path, pw, ph, clock, vrx, shared, blur, ctx));
             vtx
         });
         let gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
@@ -107,7 +110,7 @@ impl Player {
         } else {
             None
         };
-        Player { clock, shared, duration: probe.duration, gain, speed, vtx, atx }
+        Player { clock, shared, duration: probe.duration, gain, speed, blur, vtx, atx }
     }
 
     pub fn pos(&self) -> i64 {
@@ -151,6 +154,14 @@ impl Player {
     pub fn set_speed(&self, s: f64) {
         if self.speed.swap(s.to_bits(), Ordering::Relaxed) != s.to_bits() {
             self.clock.set_rate(s);
+        }
+    }
+
+    /// Desenfoque de movimiento de la vista previa: cuántos cuadros se mezclan en cada uno (0 = nada). Quieto, la
+    /// imagen se vuelve a armar con el nuevo.
+    pub fn set_blur(&self, n: f32) {
+        if self.blur.swap(n.to_bits(), Ordering::Relaxed) != n.to_bits() && !self.playing() {
+            self.send(VCmd::Seek(self.pos()));
         }
     }
 
@@ -269,6 +280,11 @@ impl Video {
 
     /// Busca y devuelve el cuadro visible en `t`.
     pub(super) fn frame_at(&mut self, t: i64) -> Result<Option<egui::ColorImage>> {
+        Ok(self.timed_frame_at(t)?.map(|(_, img)| img))
+    }
+
+    /// Como `frame_at`, con el tiempo del cuadro.
+    fn timed_frame_at(&mut self, t: i64) -> Result<Option<(i64, egui::ColorImage)>> {
         unsafe { seek(&self.r, t)? };
         self.read = None;
         self.decode_to(t)
@@ -278,7 +294,7 @@ impl Video {
     /// sigue desde ahí sin buscar: recorrer el clip hacia adelante decodifica cada cuadro una sola vez.
     pub(super) fn frame_ahead(&mut self, t: i64, key: i64) -> Result<Option<egui::ColorImage>> {
         if self.read.is_some_and(|r| r >= key && r <= t) {
-            self.decode_to(t)
+            Ok(self.decode_to(t)?.map(|(_, img)| img))
         } else {
             self.frame_at(t)
         }
@@ -291,16 +307,16 @@ impl Video {
         self.next()?.map(|(_, _, s)| self.to_image(&s)).transpose()
     }
 
-    fn decode_to(&mut self, t: i64) -> Result<Option<egui::ColorImage>> {
+    fn decode_to(&mut self, t: i64) -> Result<Option<(i64, egui::ColorImage)>> {
         let mut last = None;
         while let Some((ts, d, s)) = self.next()? {
             let hit = ts + d > t;
-            last = Some(s);
+            last = Some((ts, s));
             if hit {
                 break;
             }
         }
-        last.map(|s| self.to_image(&s)).transpose()
+        last.map(|(ts, s)| Ok((ts, self.to_image(&s)?))).transpose()
     }
 }
 
@@ -310,7 +326,59 @@ fn publish(shared: &Shared, ctx: &egui::Context, img: egui::ColorImage) {
     ctx.request_repaint();
 }
 
-fn video_thread(path: PathBuf, w: u32, h: u32, clock: Arc<Clock>, rx: Receiver<VCmd>, shared: Arc<Shared>, ctx: egui::Context) {
+/// Un cuadro decodificado que espera su momento: tal cual (se convierte recién al mostrarlo, y si va atrasado ni
+/// eso) o ya convertido, cuando se mezcla con otros por el desenfoque.
+enum Pic {
+    Raw(IMFSample),
+    Image(egui::ColorImage),
+}
+
+/// Completa `ahead` hasta tener `m` cuadros (menos al final del archivo); con `convert`, ya convertidos.
+fn fill_ahead(v: &mut Video, ahead: &mut VecDeque<(i64, Pic)>, m: usize, convert: bool) -> Result<()> {
+    while ahead.len() < m {
+        let Some((ts, _, s)) = v.next()? else { break };
+        ahead.push_back((ts, if convert { Pic::Image(v.to_image(&s)?) } else { Pic::Raw(s) }));
+    }
+    Ok(())
+}
+
+/// Lo que se ve en el primer cuadro de `ahead`: ese cuadro mezclado con los que le siguen, `n` en total (el último
+/// en parte), como al exportar (`Clip::blur_frames`).
+fn blurred(v: &Video, ahead: &VecDeque<(i64, Pic)>, n: f32) -> Result<egui::ColorImage> {
+    let n = n.max(1.0);
+    let mut parts: Vec<(std::borrow::Cow<egui::ColorImage>, u32)> = Vec::new();
+    for (k, (_, p)) in ahead.iter().enumerate() {
+        let w = ((n - k as f32).clamp(0.0, 1.0) * 256.0).round() as u32;
+        if w == 0 {
+            break;
+        }
+        let img = match p {
+            Pic::Raw(s) => std::borrow::Cow::Owned(v.to_image(s)?),
+            Pic::Image(img) => std::borrow::Cow::Borrowed(img),
+        };
+        parts.push((img, w));
+    }
+    if parts.len() == 1 {
+        // Sin nada que mezclar: el cuadro tal cual (sin copiarlo si se acaba de convertir).
+        return Ok(parts.remove(0).0.into_owned());
+    }
+    let Some((first, _)) = parts.first() else { return Err(anyhow!("sin cuadro")) };
+    let size = first.size;
+    let mut sum = vec![[0u32; 3]; first.pixels.len()];
+    let total: u32 = parts.iter().map(|(_, w)| w).sum();
+    for (img, w) in &parts {
+        for (s, p) in sum.iter_mut().zip(&img.pixels) {
+            s[0] += p.r() as u32 * w;
+            s[1] += p.g() as u32 * w;
+            s[2] += p.b() as u32 * w;
+        }
+    }
+    let px = |x: u32| ((x + total / 2) / total) as u8;
+    Ok(egui::ColorImage { size, pixels: sum.into_iter().map(|s| egui::Color32::from_rgb(px(s[0]), px(s[1]), px(s[2]))).collect() })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn video_thread(path: PathBuf, w: u32, h: u32, clock: Arc<Clock>, rx: Receiver<VCmd>, shared: Arc<Shared>, blur: Arc<AtomicU32>, ctx: egui::Context) {
     let _mf = Mf::init();
     let mut v = match Video::open(&path, w, h, false) {
         Ok(v) => v,
@@ -324,11 +392,15 @@ fn video_thread(path: PathBuf, w: u32, h: u32, clock: Arc<Clock>, rx: Receiver<V
         publish(&shared, &ctx, f);
     }
     let mut playing = false;
-    let mut pending: Option<(i64, i64, IMFSample)> = None;
+    // Cuadros ya decodificados, en orden: el primero es el próximo que se muestra (con desenfoque, los que siguen
+    // se mezclan con él).
+    let mut ahead: VecDeque<(i64, Pic)> = VecDeque::new();
     loop {
+        let n = f32::from_bits(blur.load(Ordering::Relaxed));
+        let m = (n.ceil() as usize).max(1);
         let first = if playing {
-            let wait = match &pending {
-                Some((ts, _, _)) => ((ts - clock.pos()) / 10_000).clamp(0, 30) as u64,
+            let wait = match ahead.front() {
+                Some((ts, _)) => ((ts - clock.pos()) / 10_000).clamp(0, 30) as u64,
                 None => 0,
             };
             match rx.recv_timeout(Duration::from_millis(wait)) {
@@ -351,9 +423,17 @@ fn video_thread(path: PathBuf, w: u32, h: u32, clock: Arc<Clock>, rx: Receiver<V
             }
         }
         if let Some(t) = seek_to {
-            pending = None;
-            match v.frame_at(t) {
-                Ok(Some(f)) => publish(&shared, &ctx, f),
+            ahead.clear();
+            match v.timed_frame_at(t) {
+                // Sin desenfoque, la reproducción sigue desde el cuadro siguiente.
+                Ok(Some((_, f))) if m == 1 => publish(&shared, &ctx, f),
+                Ok(Some((ts, f))) => {
+                    ahead.push_back((ts, Pic::Image(f)));
+                    match fill_ahead(&mut v, &mut ahead, m, true).and_then(|_| blurred(&v, &ahead, n)) {
+                        Ok(img) => publish(&shared, &ctx, img),
+                        Err(e) => crate::log::log(&format!("editor: desenfoque: {e}")),
+                    }
+                }
                 Ok(None) => {}
                 Err(e) => crate::log::log(&format!("editor: seek: {e}")),
             }
@@ -361,26 +441,21 @@ fn video_thread(path: PathBuf, w: u32, h: u32, clock: Arc<Clock>, rx: Receiver<V
         if !playing {
             continue;
         }
-        if pending.is_none() {
-            match v.next() {
-                Ok(Some(x)) => pending = Some(x),
-                Ok(None) | Err(_) => {
-                    playing = false;
-                    clock.stop_at(clock.pos());
-                    continue;
-                }
-            }
+        if fill_ahead(&mut v, &mut ahead, m, m > 1).is_err() || ahead.is_empty() {
+            playing = false;
+            clock.stop_at(clock.pos());
+            continue;
         }
         let now = clock.pos();
-        if let Some((ts, _, _)) = &pending {
-            if *ts <= now + 20_000 {
-                let (ts, _, s) = pending.take().unwrap();
-                // Si vamos muy atrasados, se salta el cuadro sin convertirlo.
+        if let Some(&(ts, _)) = ahead.front() {
+            if ts <= now + 20_000 {
+                // Si vamos muy atrasados, se salta el cuadro sin convertirlo ni mezclarlo.
                 if now - ts < 500_000 {
-                    if let Ok(img) = v.to_image(&s) {
+                    if let Ok(img) = blurred(&v, &ahead, n) {
                         publish(&shared, &ctx, img);
                     }
                 }
+                ahead.pop_front();
             }
         }
     }
