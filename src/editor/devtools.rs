@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 
 use super::library;
-use super::media::{self, Clip, Edit, Progress};
+use super::media::{self, Clip, Edit, Frame, Progress};
 use crate::mf::Mf;
 use super::player::{self, Player};
 use super::timeline::{Piece, Track, TrackKind};
@@ -18,6 +18,22 @@ use super::EditorApp;
 /// `--test-frame <archivo> <t_s> <salida.ppm>`
 fn secs(s: &str) -> i64 {
     (s.parse::<f64>().unwrap_or(0.0) * 1e7) as i64
+}
+
+/// Con CLIPPY_FRAME="cuartos,espejo,izq,arriba,der,abajo,llenar" (ej. "1,1,0,0,0.5,1,0"), la imagen de todas las
+/// piezas girada, espejada y recortada así.
+fn test_frame() -> Frame {
+    let Ok(v) = std::env::var("CLIPPY_FRAME") else { return Frame::default() };
+    let n: Vec<f32> = v.split(',').map(|x| x.trim().parse().unwrap_or(0.0)).collect();
+    let at = |i: usize, d: f32| n.get(i).copied().unwrap_or(d);
+    Frame { turns: at(0, 0.0) as u8, flip: at(1, 0.0) != 0.0, crop: [at(2, 0.0), at(3, 0.0), at(4, 1.0), at(5, 1.0)], fill: at(6, 0.0) != 0.0 }
+}
+
+/// Con CLIPPY_RATIO="9:16", el lienzo con esa proporción.
+fn test_ratio() -> Option<media::Ratio> {
+    let v = std::env::var("CLIPPY_RATIO").ok()?;
+    let (w, h) = v.split_once(':')?;
+    Some((w.parse().ok()?, h.parse().ok()?))
 }
 
 /// Piezas por pista ("v1", "a1"...), ordenadas por inicio y con sus fundidos cruzados. Cada parte:
@@ -38,7 +54,12 @@ fn parts(args: &[String]) -> BTreeMap<String, Vec<Clip>> {
         let fade = (tok.next().map_or(0, secs), tok.next().map_or(0, secs));
         let start = at.unwrap_or_else(|| tracks.get(&names[0]).and_then(|l| l.last()).map_or(0, Clip::end));
         for n in names {
-            let clip = Clip { id: k as u64 + 1, path: PathBuf::from(&c[1]), start, src_in: secs(&c[2]), src_out: secs(&c[3]), fade, xfade: (0, 0), gain, curves: Default::default() };
+            // Con CLIPPY_SPEED, todas a esa velocidad (el mismo tramo del archivo dura menos o más).
+            let speed: f64 = std::env::var("CLIPPY_SPEED").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+            let src_in = secs(&c[2]);
+            let len = if speed > 0.0 { ((secs(&c[3]) - src_in) as f64 / speed) as i64 } else { secs(&c[3]) - src_in };
+            let frame = test_frame();
+            let clip = Clip { id: k as u64 + 1, path: PathBuf::from(&c[1]), start, len, src_in, speed, fade, xfade: (0, 0), gain, curves: Default::default(), frame };
             tracks.entry(n).or_default().push(clip);
         }
     }
@@ -73,7 +94,7 @@ impl EditorApp {
                 self.next_id += 1;
                 let link = if shared(c.id) { 1000 + c.id } else { 0 };
                 let (fade_in, fade_out) = c.fade;
-                let p = Piece { id: self.next_id, path: c.path.clone(), start: c.start, src_in: c.src_in, src_out: c.src_out, gain: c.gain, muted: false, link, fade_in, fade_out, curves: c.curves };
+                let p = Piece { id: self.next_id, path: c.path.clone(), start: c.start, len: c.len, src_in: c.src_in, speed: c.speed, gain: c.gain, muted: false, link, fade_in, fade_out, curves: c.curves, frame: c.frame };
                 self.tracks[ti].clips.push(p);
                 self.loader.want_strip(&c.path);
             }
@@ -82,6 +103,7 @@ impl EditorApp {
             self.tracks.insert(0, Track::new(1, TrackKind::Video));
         }
         self.selected = self.tracks.iter().flat_map(|t| t.clips.first()).next().map(|p| p.id);
+        self.ratio = test_ratio();
         self.next_id += 1000;
     }
 }
@@ -92,7 +114,7 @@ pub fn test_cli(args: &[String]) -> i32 {
         Some("--test-export") => {
             let out = PathBuf::from(&args[1]);
             let tracks = parts(&args[2..]);
-            let mut edit = Edit::default();
+            let mut edit = Edit { ratio: test_ratio(), ..Edit::default() };
             for (name, list) in tracks {
                 if name.starts_with('v') {
                     edit.video.push(list);

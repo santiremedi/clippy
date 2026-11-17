@@ -1,9 +1,11 @@
-//! Biblioteca de videos: lista los clips de la carpeta + los importados, y en segundo plano
-//! calcula duración, miniatura de portada, tira de miniaturas y forma de onda para la línea de tiempo.
+//! Biblioteca de videos: lista los clips de la carpeta (y de sus subcarpetas) + los importados, los mueve y los
+//! manda a la Papelera, y en segundo plano calcula duración, miniatura de portada, tira de miniaturas y forma de
+//! onda para la línea de tiempo.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
+use std::os::windows::ffi::OsStrExt;
 use std::time::SystemTime;
 
 use eframe::egui;
@@ -15,6 +17,15 @@ use crate::log::app_dir;
 
 use crate::clipcache::Wave;
 pub const VIDEO_EXTS: [&str; 6] = ["mp4", "mov", "m4v", "mkv", "wmv", "avi"];
+
+/// Una carpeta dentro de la de los clips.
+#[derive(Clone)]
+pub struct Folder {
+    pub path: PathBuf,
+    pub name: String,
+    /// Videos que tiene.
+    pub count: usize,
+}
 
 pub struct Asset {
     pub path: PathBuf,
@@ -296,8 +307,14 @@ pub fn is_video(p: &Path) -> bool {
         .is_some_and(|e| VIDEO_EXTS.iter().any(|x| x.eq_ignore_ascii_case(e)))
 }
 
-/// Clips de la carpeta (más nuevos primero) + importados.
-pub fn scan(dir: &Path, imported: &[PathBuf]) -> Vec<Asset> {
+/// Videos de `dir` que se muestran (el archivo temporal de una exportación en curso, no).
+fn videos_in(dir: &Path) -> impl Iterator<Item = PathBuf> {
+    std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| is_video(p) && !p.to_string_lossy().contains("clippy-tmp"))
+}
+
+/// Las carpetas de adentro de la de los clips (`root`) y los videos que se ven: en la de los clips (`dir` None), los
+/// suyos y los importados; dentro de una carpeta, los de ella. Los más nuevos primero.
+pub fn scan(root: &Path, dir: Option<&Path>, imported: &[PathBuf]) -> (Vec<Folder>, Vec<Asset>) {
     let mut v: Vec<Asset> = Vec::new();
     let mut seen = HashSet::new();
     let mut add = |p: PathBuf, imported: bool| {
@@ -314,20 +331,103 @@ pub fn scan(dir: &Path, imported: &[PathBuf]) -> Vec<Asset> {
             });
         }
     };
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("mp4")) && !p.to_string_lossy().contains("clippy-tmp") {
-                add(p, false);
-            }
+    for p in videos_in(dir.unwrap_or(root)) {
+        add(p, false);
+    }
+    if dir.is_none() {
+        for p in imported {
+            add(p.clone(), true);
         }
     }
-    for p in imported {
-        add(p.clone(), true);
-    }
+    let rd = std::fs::read_dir(root).into_iter().flatten().flatten();
+    let mut folders: Vec<Folder> = rd
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| Folder { name: e.file_name().to_string_lossy().into_owned(), count: videos_in(&e.path()).count(), path: e.path() })
+        .collect();
+    folders.sort_by_key(|f| f.name.to_lowercase());
     v.sort_by_key(|a| std::cmp::Reverse(a.modified));
-    v
+    (folders, v)
 }
+
+/// Repite `op` un rato si falla: el editor (o el que lee las miniaturas) puede tener el archivo abierto un
+/// instante más.
+fn retry<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    let mut left = 20;
+    loop {
+        match op() {
+            Err(_) if left > 0 => {
+                left -= 1;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            r => return r,
+        }
+    }
+}
+
+/// Manda un archivo o una carpeta a la Papelera de reciclaje. Si ese disco no tiene Papelera, Windows avisa
+/// antes de borrar para siempre.
+pub fn recycle(p: &Path) -> std::io::Result<()> {
+    use windows::Win32::UI::Shell::*;
+    let from: Vec<u16> = p.as_os_str().encode_wide().chain([0, 0]).collect();
+    retry(|| {
+        let mut op = SHFILEOPSTRUCTW {
+            wFunc: FO_DELETE,
+            pFrom: windows::core::PCWSTR(from.as_ptr()),
+            fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI | FOF_WANTNUKEWARNING).0 as u16,
+            ..Default::default()
+        };
+        let r = unsafe { SHFileOperationW(&mut op) };
+        if r == 0 && !op.fAnyOperationsAborted.as_bool() && !p.exists() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!("no se pudo mandar a la Papelera ({r})")))
+        }
+    })
+}
+
+/// Mueve un video a la carpeta `dir` (si ahí hay uno que se llama igual, le agrega un número). Su caché se va con
+/// él. Devuelve dónde quedó.
+pub fn move_into(p: &Path, dir: &Path) -> std::io::Result<PathBuf> {
+    let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let ext = p.extension().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut to = dir.join(format!("{stem}.{ext}"));
+    let mut n = 2;
+    while to.exists() {
+        to = dir.join(format!("{stem} ({n}).{ext}"));
+        n += 1;
+    }
+    let cache = crate::clipcache::cache_file(p);
+    retry(|| std::fs::rename(p, &to))?;
+    let _ = std::fs::rename(cache, crate::clipcache::cache_file(&to));
+    Ok(to)
+}
+
+/// Le cambia el nombre a una carpeta (`from` -> `to`); las cachés de sus videos se van con ellos. Devuelve dónde
+/// quedó cada video.
+pub fn rename_folder(from: &Path, to: &Path) -> std::io::Result<Vec<(PathBuf, PathBuf)>> {
+    let videos: Vec<(PathBuf, PathBuf)> = videos_in(from).map(|p| {
+        let c = crate::clipcache::cache_file(&p);
+        (p, c)
+    }).collect();
+    retry(|| std::fs::rename(from, to))?;
+    Ok(videos
+        .into_iter()
+        .map(|(p, cache)| {
+            let new = to.join(p.file_name().unwrap_or_default());
+            let _ = std::fs::rename(cache, crate::clipcache::cache_file(&new));
+            (p, new)
+        })
+        .collect())
+}
+
+/// Un nombre de carpeta que Windows acepta: sin caracteres prohibidos ni puntos o espacios al final.
+pub fn folder_name_ok(name: &str) -> bool {
+    let n = name.trim();
+    !n.is_empty() && !n.ends_with('.') && !n.chars().any(|c| BAD_NAME.contains(c) || c.is_control())
+}
+
+/// Caracteres que Windows no deja usar en un nombre de archivo o carpeta.
+pub const BAD_NAME: &str = "<>:\"/\\|?*";
 
 /// "Clippy_2026-11-15_23-38-30" -> "15/11 · 23:38:30"
 pub fn pretty_name(p: &Path) -> String {

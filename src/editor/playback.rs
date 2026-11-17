@@ -37,6 +37,13 @@ pub(super) struct Layer {
     src: (u64, u64),
 }
 
+impl Layer {
+    /// La pieza que muestra.
+    pub(super) fn piece(&self) -> u64 {
+        self.src.0
+    }
+}
+
 /// Lo que necesita una pieza en este momento.
 struct Want {
     id: u64,
@@ -46,6 +53,7 @@ struct Want {
     active: bool,
     src: i64,
     gain: f32,
+    speed: f64,
 }
 
 impl EditorApp {
@@ -138,8 +146,8 @@ impl EditorApp {
                     continue;
                 }
                 let gain = if !video && active { c.gain_at(t) } else { 0.0 };
-                let src = if active { c.src_in + t - c.start } else { c.src_in };
-                want.push(Want { id: c.id, path: c.path.clone(), video, active, src, gain });
+                let src = if active { c.src_at(t) } else { c.src_in };
+                want.push(Want { id: c.id, path: c.path.clone(), video, active, src, gain, speed: c.speed });
             }
         }
 
@@ -177,6 +185,7 @@ impl EditorApp {
                 }
             };
             let v = &mut self.voices[vi];
+            v.player.set_speed(w.speed);
             if fresh || reseek || (v.live && !w.active) {
                 v.player.seek(w.src);
                 if w.active && playing {
@@ -240,6 +249,12 @@ impl EditorApp {
     pub(super) fn preview_error(&self) -> Option<String> {
         let &(id, _) = self.shown.last()?;
         self.voices.iter().find(|v| v.piece == id).and_then(|v| v.player.shared.error.lock().unwrap().clone())
+    }
+
+    /// Suelta los reproductores de esos archivos (que los tienen abiertos), para poder moverlos o borrarlos.
+    pub(super) fn release_files(&mut self, paths: &[PathBuf]) {
+        self.voices.retain(|v| !paths.contains(&v.path));
+        self.idle.retain(|v| !paths.contains(&v.path));
     }
 
     pub(super) fn step(&mut self, dt: i64) {

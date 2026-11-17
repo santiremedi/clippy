@@ -118,11 +118,12 @@ impl SettingsApp {
             ui.add(egui::Label::new(RichText::new(format!("No se pudo actualizar: {e}")).size(12.0).color(DANGER)).wrap());
         }
         let label = if busy { format!("Bajando la {v}…") } else { format!("Actualizar a {v}") };
-        let tip = format!("Tenés la {}. Clippy se cierra y vuelve a abrir solo.", update::current());
+        let tip = format!("Tenés la {}.", update::current());
         let size = egui::vec2(ui.available_width(), 36.0);
         let r = ui.add_enabled_ui(!busy, |ui| icon_button(ui, Glyph::Download, &label, Kind::Secondary, size)).inner;
+        // Primero se confirma, viendo qué trae la versión nueva.
         if r.on_hover_text(&tip).on_disabled_hover_text(&tip).clicked() {
-            self.start_update();
+            self.confirm_update = Some((v.clone(), update::notes(&v)));
         }
     }
 
