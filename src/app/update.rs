@@ -97,30 +97,29 @@ pub fn news_seen() {
 /// Al arrancar la grabadora: si la versión subió desde la última vez, sus novedades quedan pendientes
 /// hasta que se abra la ventana principal. En una instalación nueva no hay nada que mostrar (tampoco
 /// hay consultas guardadas; las versiones anteriores a esta no anotaban `ran`).
-/// Si falta el texto de esta versión (se instaló a mano, o la anterior no lo guardaba) se consulta ya;
-/// si el release no tiene texto, no hay novedades.
+/// Si falta el texto de esta versión (se instaló a mano, o la anterior no lo guardaba) se consulta una
+/// vez ya. Si no llega (sin conexión, o el release todavía no tiene texto), las novedades quedan
+/// pendientes y aparecen cuando la consulta de siempre lo traiga.
 fn prepare_news() {
     let mut s = load();
     let cur = current();
-    if s.ran.as_deref() != Some(cur) {
-        let updated = match &s.ran {
-            Some(v) => parse(v) < parse(cur),
-            None => s.last_check != 0,
-        };
-        if updated {
-            s.news = Some(cur.to_string());
-        }
-        s.ran = Some(cur.to_string());
-        save(&s);
-    }
-    if s.news.is_none() || notes(cur).is_some() {
+    if s.ran.as_deref() == Some(cur) {
         return;
     }
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    match fetch_and_save(&mut s, now) {
-        Ok(()) if notes(cur).is_none() => news_seen(),
-        Ok(()) => {}
-        Err(e) => log(&format!("novedades: {e}")),
+    let updated = match &s.ran {
+        Some(v) => parse(v) < parse(cur),
+        None => s.last_check != 0,
+    };
+    if updated {
+        s.news = Some(cur.to_string());
+    }
+    s.ran = Some(cur.to_string());
+    save(&s);
+    if updated && notes(cur).is_none() {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        if let Err(e) = fetch_and_save(&mut s, now) {
+            log(&format!("novedades: {e}"));
+        }
     }
 }
 

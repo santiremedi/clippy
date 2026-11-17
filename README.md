@@ -88,7 +88,10 @@ Todo en `%APPDATA%\Clippy`: `config.json`, `editor.json`, `library.json`, `updat
 1. Subir la versión en `Cargo.toml`.
 2. En GitHub → Actions → **Build** → *Run workflow*, con el tag (por ejemplo `v0.3.0`) y
    "Publicar el release" tildado. El workflow compila y sube `Clippy.exe` al release de este repo
-   (lo crea si no existe). Sin tildarlo, igual compila y deja el exe como artefacto descargable.
+   (si no existe, lo crea como borrador). Sin tildarlo, igual compila y deja el exe como artefacto descargable.
+3. Escribir el texto del release para quien usa la app (Clippy lo muestra como novedades: títulos `#`,
+   viñetas `-` y párrafos, sin `**` ni comillas invertidas) y recién ahí publicarlo. Un release publicado
+   sin texto no muestra novedades.
 
 ## Licencia
 

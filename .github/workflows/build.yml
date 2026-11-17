@@ -84,5 +84,7 @@ jobs:
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             gh release upload "$TAG" Clippy.exe --repo "$GITHUB_REPOSITORY" --clobber
           else
-            gh release create "$TAG" Clippy.exe --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Clippy ${TAG#v}" --notes ""
+            # Como borrador: la app muestra el texto del release como novedades, así que nadie tiene que
+            # verlo hasta que tenga texto (se publica a mano después de escribirlo).
+            gh release create "$TAG" Clippy.exe --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Clippy ${TAG#v}" --notes "" --draft
           fi
