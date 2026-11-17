@@ -1,4 +1,4 @@
-//! Panel de la derecha: lo que se ajusta de la pieza elegida (imagen, velocidad y sonido). Las acciones
+//! Panel de la derecha: lo que se ajusta de la pieza elegida (imagen, velocidad, efectos y sonido). Las acciones
 //! (dividir, duplicar, congelar, borrar...) están en la barra de la línea de tiempo y en el clic derecho.
 
 use eframe::egui::{self, RichText};
@@ -8,6 +8,9 @@ use super::library;
 use super::media::{self, Frame, SPEED_MAX, SPEED_MIN};
 use super::shortcuts::{self, Act};
 use super::{EditorApp, HelpTab};
+
+/// Intensidad del desenfoque de movimiento al prenderlo.
+const BLUR_ON: f32 = 0.5;
 
 /// Velocidades a un toque (en el panel y en el clic derecho).
 pub(super) const SPEEDS: [f64; 5] = [0.5, 1.0, 1.5, 2.0, 3.0];
@@ -32,7 +35,7 @@ impl EditorApp {
         let Some((ti, i)) = self.selection() else {
             ui.label(RichText::new("Clip").family(bold()).size(17.0).color(TEXT));
             ui.add_space(6.0);
-            ui.label(RichText::new("Tocá un clip en la línea de tiempo para ajustar su imagen, su velocidad y su sonido.").color(MUTED));
+            ui.label(RichText::new("Tocá un clip en la línea de tiempo para ajustar su imagen, su velocidad, sus efectos y su sonido.").color(MUTED));
             ui.add_space(12.0);
             let text = format!("Ayuda y atajos ({})", shortcuts::short(&self.prefs.keys, Act::Shortcuts));
             if button(ui, &text, Kind::Ghost).clicked() {
@@ -62,6 +65,10 @@ impl EditorApp {
         }
         self.speed_section(ui, p.speed);
         ui.add_space(18.0);
+        if let Some((tv, iv)) = video {
+            self.effects_section(ui, self.tracks[tv].clips[iv].blur);
+            ui.add_space(18.0);
+        }
         self.sound_section(ui, &p.path);
     }
 
@@ -119,6 +126,36 @@ impl EditorApp {
         if speed != 1.0 && self.selected_audio().is_some() {
             ui.label(RichText::new("El sonido sube o baja de tono con la velocidad.").size(12.5).color(MUTED));
         }
+    }
+
+    fn effects_section(&mut self, ui: &mut egui::Ui, blur: f32) {
+        caption(ui, "Efectos");
+        let mut on = blur > 0.0;
+        let switched = ui
+            .horizontal(|ui| {
+                let r = toggle(ui, &mut on).on_hover_text("Mezcla cada cuadro con los que siguen: el movimiento deja una estela suave");
+                ui.label(RichText::new("Desenfoque de movimiento").color(if on { TEXT } else { MUTED }));
+                r.changed()
+            })
+            .inner;
+        if switched {
+            self.push_undo();
+            self.set_blur(if on { BLUR_ON } else { 0.0 });
+            return;
+        }
+        if !on {
+            return;
+        }
+        let mut pct = (blur * 100.0).round() as u32;
+        ui.spacing_mut().slider_width = ui.available_width() - 70.0;
+        let r = ui.add(egui::Slider::new(&mut pct, 10..=100).suffix(" %"));
+        if starts_edit(ui, &r) {
+            self.push_undo();
+        }
+        if r.changed() {
+            self.set_blur(pct as f32 / 100.0);
+        }
+        ui.label(RichText::new("Se ve en el video exportado, no en la vista previa. Se nota más con el clip acelerado.").size(12.5).color(MUTED));
     }
 
     fn sound_section(&mut self, ui: &mut egui::Ui, path: &std::path::Path) {

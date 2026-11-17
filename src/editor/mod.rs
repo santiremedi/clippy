@@ -459,8 +459,8 @@ impl EditorApp {
                 "Dividir, duplicar, congelar el cuadro, cambiar la velocidad, girar, espejar o recortar la imagen, silenciar, separar el audio y eliminar.".to_string(),
             ),
             (
-                "Velocidad, imagen y proporción",
-                "En el panel de la derecha cambiás la velocidad del clip y su imagen. Debajo de la vista previa elegís la proporción del video: horizontal, vertical para el celular o cuadrado. Si un clip no tiene esa forma, elegís si entra entero o llena el cuadro.".to_string(),
+                "Velocidad, imagen, efectos y proporción",
+                "En el panel de la derecha cambiás la velocidad del clip, su imagen y sus efectos, como el desenfoque de movimiento (se ve al exportar). Debajo de la vista previa elegís la proporción del video: horizontal, vertical para el celular o cuadrado. Si un clip no tiene esa forma, elegís si entra entero o llena el cuadro.".to_string(),
             ),
             (
                 "Congelar y marcadores",

@@ -29,6 +29,11 @@ fn test_frame() -> Frame {
     Frame { turns: at(0, 0.0) as u8, flip: at(1, 0.0) != 0.0, crop: [at(2, 0.0), at(3, 0.0), at(4, 1.0), at(5, 1.0)], fill: at(6, 0.0) != 0.0 }
 }
 
+/// Con CLIPPY_BLUR="0.5", todas las piezas con ese desenfoque de movimiento.
+fn test_blur() -> f32 {
+    std::env::var("CLIPPY_BLUR").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0)
+}
+
 /// Con CLIPPY_RATIO="9:16", el lienzo con esa proporción.
 fn test_ratio() -> Option<media::Ratio> {
     let v = std::env::var("CLIPPY_RATIO").ok()?;
@@ -59,7 +64,7 @@ fn parts(args: &[String]) -> BTreeMap<String, Vec<Clip>> {
             let src_in = secs(&c[2]);
             let len = if speed > 0.0 { ((secs(&c[3]) - src_in) as f64 / speed) as i64 } else { secs(&c[3]) - src_in };
             let frame = test_frame();
-            let clip = Clip { id: k as u64 + 1, path: PathBuf::from(&c[1]), start, len, src_in, speed, fade, xfade: (0, 0), gain, curves: Default::default(), frame };
+            let clip = Clip { id: k as u64 + 1, path: PathBuf::from(&c[1]), start, len, src_in, speed, fade, xfade: (0, 0), gain, curves: Default::default(), frame, blur: test_blur() };
             tracks.entry(n).or_default().push(clip);
         }
     }
@@ -94,7 +99,7 @@ impl EditorApp {
                 self.next_id += 1;
                 let link = if shared(c.id) { 1000 + c.id } else { 0 };
                 let (fade_in, fade_out) = c.fade;
-                let p = Piece { id: self.next_id, path: c.path.clone(), start: c.start, len: c.len, src_in: c.src_in, speed: c.speed, gain: c.gain, muted: false, link, fade_in, fade_out, curves: c.curves, frame: c.frame };
+                let p = Piece { id: self.next_id, path: c.path.clone(), start: c.start, len: c.len, src_in: c.src_in, speed: c.speed, gain: c.gain, muted: false, link, fade_in, fade_out, curves: c.curves, frame: c.frame, blur: c.blur };
                 self.tracks[ti].clips.push(p);
                 self.loader.want_strip(&c.path);
             }

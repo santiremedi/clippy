@@ -5,7 +5,7 @@
 //! - Modo recodificar: arma el video cuadro a cuadro (por GPU): corte exacto, varias pistas,
 //!   fundidos entre piezas que se superponen y clips de distinta resolución o formato.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
@@ -217,6 +217,8 @@ pub struct Clip {
     pub curves: (Curve, Curve),
     /// Cómo se ve su imagen en el lienzo.
     pub frame: Frame,
+    /// Desenfoque de movimiento, de 0 (nada) a 1 (ver `Clip::blur_span`).
+    pub blur: f32,
 }
 
 /// Velocidades que se pueden elegir. 0 no está: es la de una imagen congelada.
@@ -410,6 +412,17 @@ impl Clip {
         let (cin, cout) = self.curves;
         self.gain * cin.shape(ramp(t - self.start, self.fade.0.max(self.xfade.0))) * cout.shape(ramp(self.end() - t, self.fade.1.max(self.xfade.1)))
     }
+    /// Cuántos cuadros del archivo se mezclan en cada cuadro que sale con el desenfoque: el que se ve y los que
+    /// siguen, hasta el doble de los que pasan durante ese cuadro (`fdur`; uno a velocidad normal con los mismos
+    /// cuadros por segundo, más si el clip va acelerado o sale con menos) por la intensidad. El último cuenta en
+    /// parte, así la intensidad cambia de a poco. 0 = sin desenfoque.
+    pub fn blur_frames(&self, fdur: i64, src_fdur: i64) -> f32 {
+        if self.blur <= 0.0 {
+            return 0.0;
+        }
+        let step = (fdur as f64 * self.speed / src_fdur.max(1) as f64).max(1.0) as f32;
+        (1.0 + self.blur.clamp(0.0, 1.0) * 2.0 * step).min(MAX_BLUR as f32)
+    }
     fn name(&self) -> String {
         self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
     }
@@ -437,7 +450,7 @@ impl Edit {
     }
 
     /// Si el video es una sola pista de piezas pegadas desde el inicio, a velocidad normal, sin fundidos, sin
-    /// tocar su imagen, en un lienzo con la forma del primer clip (`first`, su tamaño) y sin nada que suene
+    /// tocar su imagen ni efectos, en un lienzo con la forma del primer clip (`first`, su tamaño) y sin nada que suene
     /// después del final, esas piezas: se pueden copiar sin recodificar.
     pub fn copy_parts(&self, first: (u32, u32)) -> Option<&[Clip]> {
         if self.ratio.is_some_and(|r| !same_shape(first, r)) {
@@ -450,7 +463,7 @@ impl Edit {
         }
         let mut t = 0;
         for c in parts {
-            if (c.start - t).abs() > 2_000 || c.fade != (0, 0) || c.xfade != (0, 0) || c.speed != 1.0 || !c.frame.is_plain() {
+            if (c.start - t).abs() > 2_000 || c.fade != (0, 0) || c.xfade != (0, 0) || c.speed != 1.0 || !c.frame.is_plain() || c.blur > 0.0 {
                 return None;
             }
             t = c.end();
@@ -948,7 +961,19 @@ struct Frames {
     stride: i32,
     /// El último cuadro que se escribió tal cual (tiempo del archivo) y cuándo (tiempo de la salida).
     written: Option<(i64, i64)>,
+    /// Con desenfoque: copias de los cuadros que se mezclan en el cuadro actual (tiempo del archivo y copia). Son
+    /// copias porque el decodificador tiene pocos cuadros y los reusa.
+    kept: VecDeque<(i64, Kept)>,
 }
+
+/// Un cuadro guardado para el desenfoque: en la GPU o en la memoria (NV12 compacto).
+enum Kept {
+    Gpu(IMFSample),
+    Cpu(Vec<u8>),
+}
+
+/// Cuadros que se mezclan como mucho en uno con desenfoque.
+const MAX_BLUR: usize = 16;
 
 impl Frames {
     unsafe fn open(c: &Clip, from: i64, (tw, th): (u32, u32), gpu: Option<&IMFDXGIDeviceManager>) -> Result<Frames> {
@@ -970,28 +995,78 @@ impl Frames {
         let alloc_h = unpack(cur.GetUINT64(&MF_MT_FRAME_SIZE).unwrap_or(pack(tw, th))).1.max(th);
         let stride = cur.GetUINT32(&MF_MT_DEFAULT_STRIDE).map(|v| v as i32).unwrap_or(tw as i32);
         seek(&r, from)?;
-        Ok(Frames { r, cur: None, next: None, eos: false, size: (tw, th), alloc_h, stride, written: None })
+        Ok(Frames { r, cur: None, next: None, eos: false, size: (tw, th), alloc_h, stride, written: None, kept: VecDeque::new() })
     }
 
-    /// Avanza hasta el cuadro que se ve en `src` (tiempo del archivo, con `tol` de margen).
-    unsafe fn seek_to(&mut self, src: i64, tol: i64) -> Result<()> {
-        loop {
-            if self.next.is_none() && !self.eos {
-                let (mut flags, mut ts, mut s) = (0u32, 0i64, None);
-                self.r.ReadSample(VIDEO, 0, None, Some(&mut flags), Some(&mut ts), Some(&mut s))?;
-                if flags & EOS != 0 {
-                    self.eos = true;
-                }
-                if let Some(s) = s {
-                    self.next = Some((ts, s));
-                }
+    /// Lee el cuadro que sigue, si todavía no está.
+    unsafe fn fill_next(&mut self) -> Result<()> {
+        if self.next.is_none() && !self.eos {
+            let (mut flags, mut ts, mut s) = (0u32, 0i64, None);
+            self.r.ReadSample(VIDEO, 0, None, Some(&mut flags), Some(&mut ts), Some(&mut s))?;
+            if flags & EOS != 0 {
+                self.eos = true;
             }
+            if let Some(s) = s {
+                self.next = Some((ts, s));
+            }
+        }
+        Ok(())
+    }
+
+    /// Avanza hasta el último cuadro que empieza antes de `until` (o al primero, si no hay ninguno); `each` recibe
+    /// cada cuadro que pasa a ser el actual.
+    unsafe fn advance(&mut self, until: i64, mut each: impl FnMut(&mut Self) -> Result<()>) -> Result<()> {
+        loop {
+            self.fill_next()?;
             match &self.next {
-                Some((ts, _)) if *ts <= src + tol || self.cur.is_none() => self.cur = self.next.take(),
+                Some((ts, _)) if *ts <= until || self.cur.is_none() => {
+                    self.cur = self.next.take();
+                    each(self)?;
+                }
                 None if !self.eos => {}
                 _ => return Ok(()),
             }
         }
+    }
+
+    /// Avanza hasta el cuadro que se ve en `src` (tiempo del archivo, con `tol` de margen).
+    unsafe fn seek_to(&mut self, src: i64, tol: i64) -> Result<()> {
+        self.advance(src + tol, |_| Ok(()))
+    }
+
+    /// Para el desenfoque: deja en `kept` copias del cuadro que se ve en `src` y de los que le siguen, `n` en total
+    /// (`src_fdur`: cuánto dura cada uno), copiados en la GPU con `gpu` o, si no, a la memoria.
+    unsafe fn seek_blur(&mut self, src: i64, tol: i64, n: usize, src_fdur: i64, gpu: Option<&Vp>) -> Result<()> {
+        let shown = src + tol;
+        let mut keep = |f: &mut Self| {
+            let Some((ts, s)) = &f.cur else { return Ok(()) };
+            let ts = *ts;
+            let k = match gpu {
+                Some(v) => Kept::Gpu(v.copy(s)?),
+                None => Kept::Cpu(nv12_bytes(s, f.size.0, f.size.1, f.alloc_h, f.stride)?),
+            };
+            // Un cuadro que todavía se ve en `src` reemplaza a los anteriores: solo se guarda la ventana.
+            if ts <= shown {
+                f.kept.clear();
+            }
+            f.kept.push_back((ts, k));
+            Ok(())
+        };
+        self.advance(shown, &mut keep)?;
+        // Lo que quedó de la ventana anterior y ya no se ve en `src`, afuera.
+        let first = self.kept.iter().rposition(|(ts, _)| *ts <= shown).unwrap_or(0);
+        self.kept.drain(..first);
+        // Los que siguen al que se ve.
+        if let Some(&(base, _)) = self.kept.front() {
+            self.advance(base + (n as i64 - 1) * src_fdur + src_fdur / 2, &mut keep)?;
+        }
+        self.kept.truncate(n);
+        Ok(())
+    }
+
+    /// Los cuadros que se mezclan en el actual con su peso, para una mezcla de `n` cuadros (`Clip::blur_frames`).
+    fn blur_mix(&self, n: f32) -> Vec<(&Kept, f32)> {
+        self.kept.iter().enumerate().map(|(k, (_, f))| (f, (n - k as f32).clamp(0.0, 1.0))).filter(|(_, w)| *w > 0.0).collect()
     }
 
     fn sample(&self) -> Option<&IMFSample> {
@@ -1082,8 +1157,8 @@ impl Vp {
         Ok(Vp { dev, ctx, vdev, vctx, en, vp, inputs, black, caps: caps.FeatureCaps, in_size, out_size })
     }
 
-    /// Copia el cuadro de `s` (una textura del decodificador o de otro procesador) a la entrada `i`.
-    unsafe fn load(&self, i: usize, s: &IMFSample) -> Result<()> {
+    /// Copia el cuadro de `s` (una textura del decodificador o de otro procesador) a `dst`.
+    unsafe fn copy_to(&self, dst: &ID3D11Texture2D, s: &IMFSample) -> Result<()> {
         let b: IMFDXGIBuffer = s.GetBufferByIndex(0)?.cast()?;
         let mut tex: Option<ID3D11Texture2D> = None;
         b.GetResource(&ID3D11Texture2D::IID, &mut tex as *mut _ as *mut *mut c_void)?;
@@ -1091,8 +1166,32 @@ impl Vp {
         // Solo el área de la imagen: el decodificador puede entregar cuadros más altos (1088).
         let (w, h) = self.in_size;
         let area = D3D11_BOX { left: 0, top: 0, front: 0, right: w, bottom: h, back: 1 };
-        self.ctx.CopySubresourceRegion(&self.inputs[i].0, 0, 0, 0, 0, &tex, b.GetSubresourceIndex()?, Some(&area));
+        self.ctx.CopySubresourceRegion(dst, 0, 0, 0, 0, &tex, b.GetSubresourceIndex()?, Some(&area));
         Ok(())
+    }
+
+    /// Copia el cuadro de `s` a la entrada `i`.
+    unsafe fn load(&self, i: usize, s: &IMFSample) -> Result<()> {
+        self.copy_to(&self.inputs[i].0, s)
+    }
+
+    /// Una copia del cuadro de `s` en una textura nueva (el decodificador reusa las suyas).
+    unsafe fn copy(&self, s: &IMFSample) -> Result<IMFSample> {
+        let t = nv12_texture(&self.dev, self.in_size.0, self.in_size.1, None)?;
+        self.copy_to(&t, s)?;
+        surface_sample(&t)
+    }
+
+    /// El promedio de `frames` (todos de `in_size`) según su peso, en un cuadro nuevo: cada uno se funde encima de
+    /// la mezcla de los anteriores con su parte del peso acumulado (con pesos iguales: 1/2, 1/3, 1/4...).
+    unsafe fn mean(&self, frames: &[(&IMFSample, f32)]) -> Result<IMFSample> {
+        let (&(first, w0), rest) = frames.split_first().ok_or_else(|| anyhow!("sin cuadros para mezclar"))?;
+        let (mut acc, mut total) = (same_image(first)?, w0);
+        for &(s, w) in rest {
+            total += w;
+            acc = self.blend(&acc, s, w / total)?;
+        }
+        Ok(acc)
     }
 
     /// Pasa las entradas por el procesador a un cuadro nuevo de la salida.
@@ -1220,6 +1319,21 @@ fn black_nv12(w: u32, h: u32) -> Vec<u8> {
     v
 }
 
+/// El promedio de varios cuadros NV12 compactos del mismo tamaño, según su peso.
+fn mean_nv12(frames: &[(&[u8], f32)]) -> Vec<u8> {
+    let mut sum = vec![0u32; frames.first().map_or(0, |f| f.0.len())];
+    let mut total = 0u32;
+    for &(f, w) in frames {
+        let w = (w * 256.0).round() as u32;
+        total += w;
+        for (s, &x) in sum.iter_mut().zip(f.iter()) {
+            *s += x as u32 * w;
+        }
+    }
+    let total = total.max(1);
+    sum.into_iter().map(|s| ((s + total / 2) / total) as u8).collect()
+}
+
 /// `b` encima de `a` con opacidad `alpha` (los dos NV12 compactos del mismo tamaño).
 fn mix_nv12(a: &[u8], b: &[u8], alpha: f32) -> Vec<u8> {
     let k = (alpha.clamp(0.0, 1.0) * 256.0) as u32;
@@ -1266,6 +1380,10 @@ struct Fit {
     placed: Option<Placed>,
     /// Tamaño al que se decodifica.
     size: (u32, u32),
+    /// Cuántos cuadros del archivo se mezclan en cada uno por el desenfoque (`Clip::blur_frames`) y cuánto dura cada
+    /// uno; 0 = sin desenfoque.
+    blur: f32,
+    src_fdur: i64,
 }
 
 impl Fit {
@@ -1274,21 +1392,34 @@ impl Fit {
     }
 }
 
-/// El cuadro actual de `f` ya en el lienzo (por GPU).
-unsafe fn canvas_sample(f: &Frames, fit: &Fit, frame: &Frame, mgr: &IMFDXGIDeviceManager, placers: &mut HashMap<(u32, u32), Vp>, size: (u32, u32)) -> Result<IMFSample> {
-    let s = f.sample().ok_or_else(|| anyhow!("sin cuadro"))?;
+/// El cuadro actual de `f` (con su desenfoque, si tiene) ya en el lienzo, por GPU. `mixers`: los procesadores que
+/// funden cuadros de un mismo tamaño.
+#[allow(clippy::too_many_arguments)]
+unsafe fn canvas_sample(f: &Frames, fit: &Fit, frame: &Frame, mgr: &IMFDXGIDeviceManager, mixers: &mut HashMap<(u32, u32), Vp>, placers: &mut HashMap<(u32, u32), Vp>, size: (u32, u32)) -> Result<IMFSample> {
+    let s = if fit.blur > 0.0 {
+        let frames: Vec<(&IMFSample, f32)> = f.blur_mix(fit.blur).into_iter().filter_map(|(k, w)| if let Kept::Gpu(s) = k { Some((s, w)) } else { None }).collect();
+        vp(mixers, mgr, f.size, f.size, 2)?.mean(&frames)?
+    } else {
+        same_image(f.sample().ok_or_else(|| anyhow!("sin cuadro"))?)?
+    };
     match &fit.placed {
-        Some(p) if !fit.direct => vp(placers, mgr, f.size, size, 1)?.place(s, p, frame),
-        _ => same_image(s),
+        Some(p) if !fit.direct => vp(placers, mgr, f.size, size, 1)?.place(&s, p, frame),
+        _ => Ok(s),
     }
 }
 
-/// El cuadro actual de `f` ya en el lienzo (por CPU).
+/// El cuadro actual de `f` (con su desenfoque, si tiene) ya en el lienzo, por CPU.
 unsafe fn canvas_bytes(f: &Frames, fit: &Fit, size: (u32, u32)) -> Result<Vec<u8>> {
-    match &fit.placed {
-        Some(p) if !fit.direct => Ok(place_nv12(&f.bytes()?, f.size, p, size)),
-        _ => f.bytes(),
-    }
+    let px = if fit.blur > 0.0 {
+        let frames: Vec<(&[u8], f32)> = f.blur_mix(fit.blur).into_iter().filter_map(|(k, w)| if let Kept::Cpu(b) = k { Some((b.as_slice(), w)) } else { None }).collect();
+        mean_nv12(&frames)
+    } else {
+        f.bytes()?
+    };
+    Ok(match &fit.placed {
+        Some(p) if !fit.direct => place_nv12(&px, f.size, p, size),
+        _ => px,
+    })
 }
 
 /// Arma el video cuadro a cuadro y lo vuelve a codificar: en cada cuadro se ve la pista visible más alta
@@ -1355,7 +1486,8 @@ unsafe fn export_reencode(edit: &Edit, probes: &HashMap<PathBuf, Probe>, out: &P
                     let src = (p.width.max(2) & !1, p.height.max(2) & !1);
                     let direct = c.frame.is_plain() && same_shape(src, size);
                     let placed = c.frame.place((src.0 as f32, src.1 as f32), (tw as f32, th as f32));
-                    Fit { direct, placed, size: if direct { size } else { src } }
+                    let src_fdur = if p.fps() > 0.0 { 10_000_000 * p.frame_rate.1.max(1) as i64 / p.frame_rate.0.max(1) as i64 } else { fdur };
+                    Fit { direct, placed, size: if direct { size } else { src }, blur: c.blur_frames(fdur, src_fdur), src_fdur }
                 })
                 .collect()
         })
@@ -1383,7 +1515,16 @@ unsafe fn export_reencode(edit: &Edit, probes: &HashMap<PathBuf, Probe>, out: &P
                 open[ti][i] = Some(Frames::open(c, src, fits[ti][i].size, gpu)?);
             }
             if let Some(f) = &mut open[ti][i] {
-                f.seek_to(src, fdur / 2)?;
+                let fit = &fits[ti][i];
+                if fit.blur > 0.0 {
+                    let copier = match gpu {
+                        Some(m) => Some(vp(&mut blend_gpu, m, f.size, f.size, 2)?),
+                        None => None,
+                    };
+                    f.seek_blur(src, fdur / 2, fit.blur.ceil() as usize, fit.src_fdur, copier)?;
+                } else {
+                    f.seek_to(src, fdur / 2)?;
+                }
             }
         }
         let ready: Vec<(usize, usize, f32)> = shown.iter().copied().filter(|&(ti, i, _)| open[ti][i].as_ref().is_some_and(|f| f.cur.is_some())).collect();
@@ -1400,7 +1541,7 @@ unsafe fn export_reencode(edit: &Edit, probes: &HashMap<PathBuf, Probe>, out: &P
                     f.written = Some((ts, t));
                     let (fit, frame) = (&fits[ti][i], &edit.video[ti][i].frame);
                     Some(match gpu {
-                        Some(m) => canvas_sample(f, fit, frame, m, &mut placers, size)?,
+                        Some(m) => canvas_sample(f, fit, frame, m, &mut blend_gpu, &mut placers, size)?,
                         None => mem_sample(&canvas_bytes(f, fit, size)?)?,
                     })
                 }
@@ -1411,7 +1552,7 @@ unsafe fn export_reencode(edit: &Edit, probes: &HashMap<PathBuf, Probe>, out: &P
                     let mut acc: Option<IMFSample> = None;
                     for &(ti, i, a) in &ready {
                         let f = open[ti][i].as_ref().unwrap();
-                        let s = canvas_sample(f, &fits[ti][i], &edit.video[ti][i].frame, m, &mut placers, size)?;
+                        let s = canvas_sample(f, &fits[ti][i], &edit.video[ti][i].frame, m, &mut blend_gpu, &mut placers, size)?;
                         let b = vp(&mut blend_gpu, m, size, size, 2)?;
                         acc = Some(match acc {
                             None if a >= 1.0 => s,

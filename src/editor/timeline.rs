@@ -56,6 +56,8 @@ pub(super) struct Piece {
     pub(super) curves: (Curve, Curve),
     /// Cómo se ve su imagen en el lienzo (solo cuenta en las pistas de video).
     pub(super) frame: Frame,
+    /// Desenfoque de movimiento al exportar, de 0 (nada) a 1 (solo cuenta en las pistas de video).
+    pub(super) blur: f32,
 }
 
 impl Piece {
@@ -441,6 +443,7 @@ impl EditorApp {
             fade_out: 0,
             curves: (Curve::Linear, Curve::Linear),
             frame: Frame::default(),
+            blur: 0.0,
         };
         if pr.audio.is_some() {
             p.link = self.new_id();
@@ -534,7 +537,7 @@ impl EditorApp {
         };
         let audio = self.find(p.id).map(|(ti, i)| self.group(self.tracks[ti].clips[i].id)).unwrap_or_default().into_iter().find(|&(tj, _)| self.tracks[tj].kind == TrackKind::Audio).map(|(tj, _)| tj);
         let link = if audio.is_some() { self.new_id() } else { 0 };
-        let still = Piece { id: self.new_id(), start: at, len: FREEZE_LEN, src_in: p.src_at(t.clamp(p.start, p.end() - 1)), speed: 0.0, link, fade_in: 0, fade_out: 0, ..p };
+        let still = Piece { id: self.new_id(), start: at, len: FREEZE_LEN, src_in: p.src_at(t.clamp(p.start, p.end() - 1)), speed: 0.0, link, fade_in: 0, fade_out: 0, blur: 0.0, ..p };
         let mut tracks = vec![(ti, still.clone())];
         if let Some(ta) = audio {
             let silence = Piece { id: self.new_id(), muted: true, curves: (Curve::Even, Curve::Even), frame: Frame::default(), ..still.clone() };
@@ -648,6 +651,13 @@ impl EditorApp {
         if frame != self.tracks[ti].clips[i].frame {
             self.push_undo();
             self.tracks[ti].clips[i].frame = frame;
+        }
+    }
+
+    /// Cambia el desenfoque de movimiento de la imagen elegida. El que llama guarda cómo estaba para deshacer.
+    pub(super) fn set_blur(&mut self, blur: f32) {
+        if let Some((ti, i)) = self.selected_video() {
+            self.tracks[ti].clips[i].blur = blur.clamp(0.0, 1.0);
         }
     }
 
@@ -1024,6 +1034,7 @@ impl EditorApp {
                         gain,
                         curves: p.curves,
                         frame: p.frame,
+                        blur: p.blur,
                     }
                 })
                 .collect();

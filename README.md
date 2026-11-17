@@ -69,10 +69,10 @@ src/
     export.rs      diálogo y trabajo de exportación
     panels.rs      barra de arriba y línea de tiempo (pistas, marcadores, clic derecho en un clip)
     browser.rs     panel de la biblioteca: elegir, carpetas, mover y mandar a la Papelera
-    inspector.rs   panel del clip: imagen, velocidad y sonido
+    inspector.rs   panel del clip: imagen, velocidad, efectos y sonido
     preview.rs     vista previa: lienzo con su proporción y recorte de la imagen
     prefs.rs       editor.json (atajos, últimas opciones de exportación, paneles, imán)
-    media.rs       exportar: copia sin recodificar o capas ubicadas y fundidas por GPU, velocidad, mezcla de audio
+    media.rs       exportar: copia sin recodificar o capas ubicadas y fundidas por GPU, velocidad, desenfoque de movimiento, mezcla de audio
     shortcuts.rs, library.rs, player.rs, devtools.rs
   ui_kit/          estilo y widgets, ventanas nativas, íconos, sonidos
     watch.rs       despierta una ventana cuando algo cambia afuera (sin repintar en reposo)
