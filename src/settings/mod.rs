@@ -65,6 +65,9 @@ struct SettingsApp {
     /// "Buscar actualizaciones": la consulta en curso y su resultado (versión nueva, si hay).
     check: Shared<Result<Option<String>, String>>,
     checking: bool,
+    /// Lo que dijo la última búsqueda ("Tenés la última versión.", un error). Queda a la vista mientras
+    /// se busca de nuevo, así la fila no se achica y vuelve a crecer.
+    check_note: Option<String>,
     maximized: bool,
     page: Page,
     confirm_quit: bool,
@@ -103,6 +106,7 @@ impl SettingsApp {
             updating: false,
             check: Default::default(),
             checking: false,
+            check_note: None,
             maximized: false,
             page: Page::Home,
             confirm_quit: false,
@@ -153,13 +157,18 @@ impl SettingsApp {
         if !self.checking {
             return;
         }
-        match &*self.check.lock().unwrap() {
-            Some(_) => self.checking = false,
-            None => ctx.request_repaint_after(Duration::from_millis(200)),
-        }
-        if !self.checking {
-            self.update = update::available();
-        }
+        let note = match &*self.check.lock().unwrap() {
+            Some(Ok(None)) => Some("Tenés la última versión.".to_string()),
+            Some(Ok(Some(_))) => None,
+            Some(Err(e)) => Some(format!("No se pudo buscar: {e}")),
+            None => {
+                ctx.request_repaint_after(Duration::from_millis(200));
+                return;
+            }
+        };
+        self.checking = false;
+        self.check_note = note;
+        self.update = update::available();
     }
 
     /// Hay una descarga en curso (todavía sin resultado).

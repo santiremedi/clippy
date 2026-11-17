@@ -199,19 +199,16 @@ impl SettingsApp {
                     }
                     None => {
                         let label = if self.checking { "Buscando…" } else { "Buscar actualizaciones" };
-                        if ui.add_enabled_ui(!self.checking, |ui| button(ui, label, Kind::Secondary)).inner.clicked() {
+                        // Ancho fijo: al pasar a "Buscando…" no se achica ni se corre.
+                        let size = egui::vec2(190.0, 0.0);
+                        if ui.add_enabled_ui(!self.checking, |ui| button_sized(ui, label, Kind::Secondary, size)).inner.clicked() {
                             self.start_check();
                         }
                     }
                 });
             });
             self.finish_check(ui.ctx());
-            let note = match &*self.check.lock().unwrap() {
-                Some(Ok(None)) => Some("Tenés la última versión.".to_string()),
-                Some(Err(e)) => Some(format!("No se pudo buscar: {e}")),
-                _ => None,
-            };
-            if let Some(note) = note {
+            if let Some(note) = self.check_note.clone() {
                 hint(ui, LABEL_W + 8.0, note);
             }
             divider(ui);
