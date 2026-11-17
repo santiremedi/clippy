@@ -18,6 +18,7 @@ use crate::ui_kit::watch::Watcher;
 use crate::ui_kit::window::{maximize_once, single_instance, window_options};
 use pages::page_title;
 
+mod news;
 mod pages;
 
 const LABEL_W: f32 = 168.0;
@@ -68,6 +69,10 @@ struct SettingsApp {
     /// Lo que dijo la última búsqueda ("Tenés la última versión.", un error). Queda a la vista mientras
     /// se busca de nuevo, así la fila no se achica y vuelve a crecer.
     check_note: Option<String>,
+    /// Novedades de la versión recién instalada (versión, texto), hasta que se cierran.
+    news: Option<(String, String)>,
+    /// "Ver qué trae": el texto de la versión nueva antes de instalarla.
+    preview: Option<(String, String)>,
     maximized: bool,
     page: Page,
     confirm_quit: bool,
@@ -107,6 +112,8 @@ impl SettingsApp {
             check: Default::default(),
             checking: false,
             check_note: None,
+            news: None,
+            preview: None,
             maximized: false,
             page: Page::Home,
             confirm_quit: false,
@@ -226,6 +233,9 @@ impl SettingsApp {
         if !self.updating {
             self.update = update::available();
         }
+        // Las novedades quedan listas cuando arranca la grabadora recién actualizada (a veces después
+        // de abrir esta ventana, si hubo que bajar el texto).
+        self.news = update::news();
         let seen = (self.cfg.output_dir.clone(), std::fs::metadata(&self.cfg.output_dir).and_then(|m| m.modified()).ok());
         if self.clips_seen.as_ref() != Some(&seen) {
             self.clips = count_clips(&self.cfg.output_dir);
@@ -323,6 +333,7 @@ impl eframe::App for SettingsApp {
                 ctx.request_repaint_after(Duration::from_millis(420));
             }
         }
+        self.news_modals(ctx);
         if self.confirm_quit {
             let mut quit = false;
             let x = modal(ctx, "quit", "¿Salir de Clippy?", "Deja de grabar y se cierra todo.", 480.0, |ui| {

@@ -117,6 +117,11 @@ impl SettingsApp {
         if let Some(Err(e)) = self.update_status.lock().unwrap().clone() {
             ui.add(egui::Label::new(RichText::new(format!("No se pudo actualizar: {e}")).size(12.0).color(DANGER)).wrap());
         }
+        if let Some(text) = update::notes(&v) {
+            if button_sized(ui, "Ver qué trae", Kind::Ghost, egui::vec2(ui.available_width(), 30.0)).clicked() {
+                self.preview = Some((v.clone(), text));
+            }
+        }
         let label = if busy { format!("Bajando la {v}…") } else { format!("Actualizar a {v}") };
         let tip = format!("Tenés la {}. Clippy se cierra y vuelve a abrir solo.", update::current());
         let size = egui::vec2(ui.available_width(), 36.0);
