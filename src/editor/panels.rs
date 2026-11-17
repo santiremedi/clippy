@@ -65,19 +65,17 @@ pub(super) enum Drag {
 }
 
 /// Una pieza en la línea de tiempo: de `a` a `b` en x, dentro de la franja `row` de su pista. En una pista de
-/// video se ven las miniaturas; en una de audio, la forma de onda. Devuelve los tramos del archivo de los
-/// cuadros visibles que todavía no tienen miniatura (quedan vacíos hasta que llega), para pedirlos primero.
+/// video se ven las miniaturas; en una de audio, la forma de onda. Devuelve las miniaturas de los cuadros
+/// visibles que todavía no llegaron (esos cuadros quedan vacíos hasta que llegan), para pedirlas primero.
 #[allow(clippy::too_many_arguments)]
-fn draw_piece(painter: &egui::Painter, p: &Piece, info: Option<&library::Info>, (a, b): (f32, f32), row: Rect, video: bool, pps: f32, selected: bool, alpha: f32, xfade: (i64, i64)) -> Vec<(i64, i64)> {
+fn draw_piece(painter: &egui::Painter, p: &Piece, info: Option<&library::Info>, (a, b): (f32, f32), row: Rect, video: bool, pps: f32, selected: bool, alpha: f32, xfade: (i64, i64)) -> Vec<usize> {
     let r = Rect::from_min_max(Pos2::new(a + 1.0, row.top()), Pos2::new(b - 1.0, row.bottom()));
     painter.rect_filled(r, 6.0, (if video { TRACK_VIDEO } else { TRACK_AUDIO }).gamma_multiply(alpha));
     let mut missing = Vec::new();
     if video {
-        // Miniaturas: en cada cuadro, la más cercana a su centro de las que caen en lo que el cuadro abarca
-        // (o a menos de un paso de la tira, si el cuadro abarca menos que eso).
+        // Miniaturas: cada cuadro muestra siempre la misma (`thumb_for`), o nada hasta que llega.
         let clip = painter.with_clip_rect(r.shrink(1.0).intersect(painter.clip_rect()));
         let thumbs = info.map_or(&[][..], |i| &i.thumbs);
-        let step = info.and_then(|i| i.probe.as_ref()).map_or(0, |pr| library::strip_step(pr.duration));
         let tile_w = (r.height() * 16.0 / 9.0).floor().max(8.0);
         let mut x = r.left();
         while x < r.right() {
@@ -87,15 +85,12 @@ fn draw_piece(painter: &egui::Painter, p: &Piece, info: Option<&library::Info>, 
                 continue;
             }
             let at = |x: f32| p.src_in + ((x - r.left()) / pps * 1e7) as i64;
-            let (lo, t, hi) = (at(tile.left()), at(tile.center().x), at(tile.right()));
-            let reach = (t - lo).max(step);
-            let k = thumbs.partition_point(|(tt, _)| *tt < t);
-            let near = [k.checked_sub(1), Some(k)].into_iter().flatten().filter_map(|k| thumbs.get(k)).min_by_key(|(tt, _)| (tt - t).abs());
-            match near.filter(|(tt, _)| (tt - t).abs() <= reach) {
-                Some((_, tex)) => {
+            let Some(i) = library::thumb_for(thumbs, at(tile.left()), at(tile.right())) else { continue };
+            match &thumbs[i].tex {
+                Some(tex) => {
                     clip.image(tex.id(), tile, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE.gamma_multiply(alpha));
                 }
-                None => missing.push((lo, hi)),
+                None => missing.push(i),
             }
         }
     } else {
@@ -1179,8 +1174,8 @@ impl EditorApp {
         let hovered = resp.hover_pos().and_then(|h| hit(h.x, h.y)).map(|(ti, i, _)| self.tracks[ti].clips[i].id);
         let info = self.loader.info.clone();
         let mut info = info.lock().unwrap();
-        // Cuadros de la tira que se ven y todavía no tienen miniatura, por archivo.
-        let mut missing: HashMap<PathBuf, Vec<(i64, i64)>> = HashMap::new();
+        // Miniaturas de la tira que se ven y todavía no llegaron, por archivo.
+        let mut missing: HashMap<PathBuf, Vec<usize>> = HashMap::new();
         let moving = if let Drag::Move { id, .. } = self.drag { self.group(id) } else { Vec::new() };
         for (ti, t) in self.tracks.iter().enumerate() {
             let Some(yr) = row_of(ti) else { continue };

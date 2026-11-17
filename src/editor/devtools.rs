@@ -142,14 +142,14 @@ pub fn test_cli(args: &[String]) -> i32 {
             println!("abrir decodificador: {:?}", t.elapsed());
             let t = Instant::now();
             let mut n = 0;
-            library::strip_frames(&mut v, pr.duration, &k, Vec::new, |_, _| n += 1);
+            library::strip_frames(&mut v, &library::strip_plan(pr.duration, &k), Vec::new, |_, _| n += 1);
             println!("{n} miniaturas (GPU): {:?}", t.elapsed());
             let t = Instant::now();
             let mut v = player::Video::open_cpu(&path, 160, 90).unwrap();
             println!("abrir decodificador CPU: {:?}", t.elapsed());
             let t = Instant::now();
             n = 0;
-            library::strip_frames(&mut v, pr.duration, &k, Vec::new, |_, _| n += 1);
+            library::strip_frames(&mut v, &library::strip_plan(pr.duration, &k), Vec::new, |_, _| n += 1);
             println!("{n} miniaturas (CPU): {:?}", t.elapsed());
             0
         }

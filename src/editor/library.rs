@@ -29,11 +29,11 @@ pub struct Info {
     pub probe: Option<Probe>,
     pub error: Option<String>,
     pub cover: Option<egui::TextureHandle>,
-    /// Miniaturas de la tira, ordenadas por tiempo (van llegando salteadas: primero las que se ven).
-    pub thumbs: Vec<(i64, egui::TextureHandle)>,
-    /// Tramos del archivo que la línea de tiempo muestra sin miniatura (uno por cuadro, de izquierda a
-    /// derecha): de cada uno se hace primero la que cueste menos.
-    pub wanted: Vec<(i64, i64)>,
+    /// La tira: todas las miniaturas que va a tener, ordenadas por tiempo. La imagen de cada una llega
+    /// después, primero las que se ven.
+    pub thumbs: Vec<Thumb>,
+    /// Miniaturas que la línea de tiempo muestra y todavía no llegaron (de izquierda a derecha): van primero.
+    pub wanted: Vec<usize>,
     pub wave: Option<Wave>,
     pub keyframes: Option<Vec<i64>>,
     /// Tamaño y fecha del archivo cuando se leyó: si cambian, se vuelve a leer.
@@ -42,37 +42,40 @@ pub struct Info {
     strip_requested: bool,
 }
 
-enum Job {
-    Cover(PathBuf),
-    Strip(PathBuf),
+/// Una miniatura de la tira: de dónde se saca, el fotograma clave anterior y la imagen cuando ya está.
+#[derive(Clone)]
+pub struct Thumb {
+    pub at: i64,
+    key: i64,
+    pub tex: Option<egui::TextureHandle>,
 }
 
-type Queue = Arc<(Mutex<VecDeque<Job>>, Condvar)>;
+type Infos = Arc<Mutex<HashMap<PathBuf, Info>>>;
+type Queue = Arc<(Mutex<VecDeque<PathBuf>>, Condvar)>;
 
+/// Portadas y tiras van en hilos separados: una tira larga no demora las portadas de la biblioteca.
 pub struct Loader {
-    pub info: Arc<Mutex<HashMap<PathBuf, Info>>>,
-    queue: Queue,
+    pub info: Infos,
+    covers: Queue,
+    strips: Queue,
 }
 
 impl Loader {
     pub fn new(ctx: egui::Context) -> Self {
-        let info: Arc<Mutex<HashMap<PathBuf, Info>>> = Arc::default();
-        let queue: Queue = Arc::default();
-        {
-            let (info, queue) = (info.clone(), queue.clone());
-            std::thread::spawn(move || worker(info, queue, ctx));
+        let info = Infos::default();
+        std::thread::spawn(crate::clipcache::prune);
+        let (covers, strips) = (Queue::default(), Queue::default());
+        for (queue, job) in [(&covers, cover as fn(&Path, &Infos, &egui::Context)), (&strips, strip)] {
+            let (info, queue, ctx) = (info.clone(), queue.clone(), ctx.clone());
+            std::thread::spawn(move || worker(info, queue, ctx, job));
         }
-        Self { info, queue }
+        Self { info, covers, strips }
     }
 
-    fn push(&self, job: Job, front: bool) {
-        let (q, cv) = &*self.queue;
-        let mut q = q.lock().unwrap();
-        if front {
-            q.push_front(job);
-        } else {
-            q.push_back(job);
-        }
+    /// Pone el archivo primero en la fila: lo último que se pidió es lo que se está mirando.
+    fn push(queue: &Queue, path: &Path) {
+        let (q, cv) = &**queue;
+        q.lock().unwrap().push_front(path.to_path_buf());
         cv.notify_one();
     }
 
@@ -92,10 +95,10 @@ impl Loader {
         e.strip_requested |= strip;
         drop(info);
         if strip {
-            self.push(Job::Strip(path.to_path_buf()), true);
+            Self::push(&self.strips, path);
         }
         if cover {
-            self.push(Job::Cover(path.to_path_buf()), true);
+            Self::push(&self.covers, path);
         }
     }
 
@@ -106,7 +109,7 @@ impl Loader {
         if !e.strip_requested {
             e.strip_requested = true;
             drop(info);
-            self.push(Job::Strip(path.to_path_buf()), true);
+            Self::push(&self.strips, path);
         }
     }
 
@@ -120,11 +123,10 @@ impl Loader {
     }
 }
 
-fn worker(info: Arc<Mutex<HashMap<PathBuf, Info>>>, queue: Queue, ctx: egui::Context) {
+fn worker(info: Infos, queue: Queue, ctx: egui::Context, job: fn(&Path, &Infos, &egui::Context)) {
     let _mf = Mf::init();
-    crate::clipcache::prune();
     loop {
-        let job = {
+        let p = {
             let (q, cv) = &*queue;
             let mut q = q.lock().unwrap();
             while q.is_empty() {
@@ -132,10 +134,7 @@ fn worker(info: Arc<Mutex<HashMap<PathBuf, Info>>>, queue: Queue, ctx: egui::Con
             }
             q.pop_front().unwrap()
         };
-        match job {
-            Job::Cover(p) => cover(&p, &info, &ctx),
-            Job::Strip(p) => strip(&p, &info, &ctx),
-        }
+        job(&p, &info, &ctx);
         ctx.request_repaint();
     }
 }
@@ -156,7 +155,7 @@ fn ensure_probe(p: &Path, info: &Mutex<HashMap<PathBuf, Info>>) -> Option<Probe>
     }
 }
 
-fn cover(p: &Path, info: &Mutex<HashMap<PathBuf, Info>>, ctx: &egui::Context) {
+fn cover(p: &Path, info: &Infos, ctx: &egui::Context) {
     let Some(pr) = ensure_probe(p, info) else { return };
     let (w, h) = fit(&pr, 256);
     let Ok(mut v) = Video::open(p, w, h, true) else { return };
@@ -167,7 +166,7 @@ fn cover(p: &Path, info: &Mutex<HashMap<PathBuf, Info>>, ctx: &egui::Context) {
     }
 }
 
-fn strip(p: &Path, info: &Arc<Mutex<HashMap<PathBuf, Info>>>, ctx: &egui::Context) {
+fn strip(p: &Path, info: &Infos, ctx: &egui::Context) {
     let Some(pr) = ensure_probe(p, info) else { return };
     // Fotogramas clave y forma de onda, de la caché si ya se calcularon. Si no, los claves salen enseguida
     // del índice del archivo; la forma de onda decodifica todo el audio (segundos), así que va en otro
@@ -176,10 +175,12 @@ fn strip(p: &Path, info: &Arc<Mutex<HashMap<PathBuf, Info>>>, ctx: &egui::Contex
         Some((w, k)) => (Some(w), k),
         None => (None, media::keyframes(p).unwrap_or_default()),
     };
+    let plan = strip_plan(pr.duration, &kf);
     {
         let mut i = info.lock().unwrap();
         let e = i.entry(p.to_path_buf()).or_default();
         e.keyframes = Some(kf.clone());
+        e.thumbs = plan.clone();
         if wave.is_some() {
             e.wave = wave;
         } else {
@@ -198,67 +199,69 @@ fn strip(p: &Path, info: &Arc<Mutex<HashMap<PathBuf, Info>>>, ctx: &egui::Contex
     let (w, h) = fit(&pr, 160);
     if let Ok(mut v) = Video::open(p, w, h, true) {
         let wanted = || info.lock().unwrap().get(p).map(|e| e.wanted.clone()).unwrap_or_default();
-        strip_frames(&mut v, pr.duration, &kf, wanted, |t, img| {
-            let tex = ctx.load_texture(format!("strip:{}:{t}", p.display()), img, egui::TextureOptions::LINEAR);
-            let mut i = info.lock().unwrap();
-            let thumbs = &mut i.entry(p.to_path_buf()).or_default().thumbs;
-            thumbs.insert(thumbs.partition_point(|(tt, _)| *tt < t), (t, tex));
+        strip_frames(&mut v, &plan, wanted, |i, img| {
+            let tex = ctx.load_texture(format!("strip:{}:{}", p.display(), plan[i].at), img, egui::TextureOptions::LINEAR);
+            // Si el archivo cambió mientras tanto, la tira es otra: esta imagen ya no va.
+            if let Some(t) = info.lock().unwrap().get_mut(p).and_then(|e| e.thumbs.get_mut(i)).filter(|t| t.at == plan[i].at) {
+                t.tex = Some(tex);
+            }
             ctx.request_repaint();
         });
     }
-}
-
-/// Distancia entre miniaturas de la tira de un clip de esa duración: una por segundo, 150 como mucho.
-pub fn strip_step(duration: i64) -> i64 {
-    (duration / 150).max(10_000_000)
 }
 
 /// Cuánto después de un fotograma clave se pide el cuadro: el índice del archivo da su tiempo redondeado
 /// y sin el corrimiento de los cuadros B, y pedirlo justo encima podría hacer buscar desde el clave anterior.
 const KEY_MARGIN: i64 = 500_000; // 50 ms
 
-/// Miniaturas de la tira: una cada `strip_step`. Si hay un fotograma clave a menos de medio paso se usa ese
-/// (se decodifica un solo cuadro). Antes de cada una se mira `wanted` (los tramos que la pantalla muestra sin
-/// miniatura) y se hace primero, del primero de esos tramos, la que menos cuadros hay que decodificar para
-/// sacar. Si no falta ninguno, se sigue en orden desde la anterior sin volver a buscar.
-pub(super) fn strip_frames(v: &mut Video, duration: i64, keys: &[i64], wanted: impl Fn() -> Vec<(i64, i64)>, mut each: impl FnMut(i64, egui::ColorImage)) {
-    let step = strip_step(duration);
-    // Plan: el tiempo de cada miniatura y el fotograma clave anterior a él.
-    let mut plan: Vec<(i64, i64)> = Vec::new();
+/// Las miniaturas que va a tener la tira: una por segundo (150 como mucho), cada una sobre el fotograma
+/// clave más cercano si hay uno a menos de medio paso (así sale de un solo cuadro).
+pub(super) fn strip_plan(duration: i64, keys: &[i64]) -> Vec<Thumb> {
+    let step = (duration / 150).max(10_000_000);
+    let mut plan: Vec<Thumb> = Vec::new();
     let mut t = 0;
     while t < duration {
-        let prev = plan.last().map_or(i64::MIN, |p| p.0);
+        let prev = plan.last().map_or(i64::MIN, |p| p.at);
         let from = keys.partition_point(|&k| k <= t - step / 2);
         let near = keys[from..].iter().copied().take_while(|&k| k < t + step / 2).filter(|&k| k > prev).min_by_key(|&k| (k - t).abs());
         let at = near.map_or(t, |k| (k + KEY_MARGIN).min(duration - 1));
         // Sin índice de claves no se sabe hasta dónde conviene seguir leyendo: se busca cada vez.
         let key = keys[..keys.partition_point(|&k| k <= at)].last().copied().unwrap_or(at);
-        plan.push((at, key));
+        plan.push(Thumb { at, key, tex: None });
         t += step;
     }
+    plan
+}
+
+/// La miniatura que muestra un cuadro de la línea de tiempo que abarca `lo..=hi` del archivo: de las que caen
+/// adentro, la más barata de sacar (y entre esas, la más cercana al centro); si el cuadro abarca menos que la
+/// distancia entre miniaturas, la más cercana. Es siempre la misma llegue cuando llegue, así el cuadro queda
+/// vacío hasta que está y después no cambia de imagen.
+pub fn thumb_for(thumbs: &[Thumb], lo: i64, hi: i64) -> Option<usize> {
+    let (a, b) = (thumbs.partition_point(|t| t.at < lo), thumbs.partition_point(|t| t.at <= hi));
+    let c = (lo + hi) / 2;
+    let dist = |i: usize| (thumbs[i].at - c).abs();
+    if a < b {
+        return (a..b).min_by_key(|&i| (thumbs[i].at - thumbs[i].key, dist(i)));
+    }
+    [a.checked_sub(1), Some(a)].into_iter().flatten().filter(|&i| i < thumbs.len()).min_by_key(|&i| dist(i))
+}
+
+/// Saca las imágenes de la tira. Antes de cada una se mira `wanted` (las que la pantalla muestra y todavía no
+/// están) y se hace la primera de esas; si no falta ninguna, se sigue en orden desde la anterior sin volver a
+/// buscar, así que casi ningún cuadro se decodifica dos veces.
+pub(super) fn strip_frames(v: &mut Video, plan: &[Thumb], wanted: impl Fn() -> Vec<usize>, mut each: impl FnMut(usize, egui::ColorImage)) {
     let mut done = vec![false; plan.len()];
-    // La que conviene hacer para un tramo: la más barata de las que caen adentro (la que está sobre un
-    // fotograma clave sale de un cuadro); si el tramo es más angosto que el paso, la más cercana.
-    let pick = |(lo, hi): (i64, i64), done: &[bool]| {
-        let (a, b) = (plan.partition_point(|p| p.0 < lo), plan.partition_point(|p| p.0 <= hi));
-        if a < b {
-            return (a..b).filter(|&i| !done[i]).min_by_key(|&i| plan[i].0 - plan[i].1);
-        }
-        let c = (lo + hi) / 2;
-        let i = if a > 0 && (a == plan.len() || c - plan[a - 1].0 < plan[a].0 - c) { a - 1 } else { a };
-        (i < plan.len() && !done[i]).then_some(i)
-    };
     let mut next = 0;
     loop {
-        let urgent = wanted().into_iter().find_map(|r| pick(r, &done));
+        let urgent = wanted().into_iter().find(|&i| i < plan.len() && !done[i]);
         while next < plan.len() && done[next] {
             next += 1;
         }
         let Some(i) = urgent.or((next < plan.len()).then_some(next)) else { break };
         done[i] = true;
-        let (at, key) = plan[i];
-        if let Ok(Some(img)) = v.frame_ahead(at, key) {
-            each(at, img);
+        if let Ok(Some(img)) = v.frame_ahead(plan[i].at, plan[i].key) {
+            each(i, img);
         }
     }
 }
