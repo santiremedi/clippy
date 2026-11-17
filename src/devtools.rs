@@ -3,7 +3,7 @@
 //! - `--test <segundos> <carpeta> [game|desktop|mic|juegos]`: graba, guarda un clip y sale.
 //! - `--test-mic`: cuánto audio entrega cada micrófono en 3 s.
 //! - `--test-download`: descarga la versión publicada como el botón "Actualizar".
-//! - `--test-export`, `--test-frame`, `--test-strip`: ver `editor::devtools`.
+//! - `--test-export`, `--test-frame`, `--test-strip`, `--test-covers`: ver `editor::devtools`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,7 +19,7 @@ pub fn run(args: &[String]) -> Option<i32> {
     if at("--test-mic").is_some() {
         return Some(test_mic());
     }
-    if let Some(i) = args.iter().position(|a| a == "--test-export" || a == "--test-frame" || a == "--test-strip") {
+    if let Some(i) = args.iter().position(|a| a == "--test-export" || a == "--test-frame" || a == "--test-strip" || a == "--test-covers") {
         return Some(crate::editor::devtools::test_cli(&args[i..]));
     }
     at("--test").map(|i| test_mode(&args[i + 1..]))

@@ -53,7 +53,11 @@ pub struct Thumb {
 type Infos = Arc<Mutex<HashMap<PathBuf, Info>>>;
 type Queue = Arc<(Mutex<VecDeque<PathBuf>>, Condvar)>;
 
-/// Portadas y tiras van en hilos separados: una tira larga no demora las portadas de la biblioteca.
+/// Hilos que sacan portadas a la vez: con una biblioteca grande, cuatro las hacen en la mitad de tiempo que uno.
+const COVER_THREADS: usize = 4;
+
+/// Cada cosa en su fila, para que ninguna espere a otra: portadas (varios hilos), tiras (un hilo que atiende
+/// primero lo que se ve de cualquier clip) y formas de onda (un hilo: decodificar audio es pesado).
 pub struct Loader {
     pub info: Infos,
     covers: Queue,
@@ -64,10 +68,18 @@ impl Loader {
     pub fn new(ctx: egui::Context) -> Self {
         let info = Infos::default();
         std::thread::spawn(crate::clipcache::prune);
-        let (covers, strips) = (Queue::default(), Queue::default());
-        for (queue, job) in [(&covers, cover as fn(&Path, &Infos, &egui::Context)), (&strips, strip)] {
-            let (info, queue, ctx) = (info.clone(), queue.clone(), ctx.clone());
-            std::thread::spawn(move || worker(info, queue, ctx, job));
+        let (covers, strips, waves) = (Queue::default(), Queue::default(), Queue::default());
+        for _ in 0..COVER_THREADS {
+            let (info, queue, ctx) = (info.clone(), covers.clone(), ctx.clone());
+            std::thread::spawn(move || worker(info, queue, ctx, cover));
+        }
+        {
+            let (info, queue, ctx) = (info.clone(), waves.clone(), ctx.clone());
+            std::thread::spawn(move || worker(info, queue, ctx, wave));
+        }
+        {
+            let (info, queue, ctx) = (info.clone(), strips.clone(), ctx.clone());
+            std::thread::spawn(move || strip_worker(info, queue, waves, ctx));
         }
         Self { info, covers, strips }
     }
@@ -157,20 +169,87 @@ fn ensure_probe(p: &Path, info: &Mutex<HashMap<PathBuf, Info>>) -> Option<Probe>
 
 fn cover(p: &Path, info: &Infos, ctx: &egui::Context) {
     let Some(pr) = ensure_probe(p, info) else { return };
-    let (w, h) = fit(&pr, 256);
-    let Ok(mut v) = Video::open(p, w, h, true) else { return };
-    let t = (pr.duration / 2).min(10_000_000);
-    if let Ok(Some(img)) = v.frame_at(t) {
+    if let Some(img) = cover_image(p, &pr) {
         let tex = ctx.load_texture(format!("cover:{}", p.display()), img, egui::TextureOptions::LINEAR);
         info.lock().unwrap().entry(p.to_path_buf()).or_default().cover = Some(tex);
     }
 }
 
-fn strip(p: &Path, info: &Infos, ctx: &egui::Context) {
-    let Some(pr) = ensure_probe(p, info) else { return };
-    // Fotogramas clave y forma de onda, de la caché si ya se calcularon. Si no, los claves salen enseguida
-    // del índice del archivo; la forma de onda decodifica todo el audio (segundos), así que va en otro
-    // hilo y las miniaturas no la esperan.
+/// Portada: el fotograma clave anterior al segundo 1 (o a la mitad, si el clip es más corto), que sale de un
+/// solo cuadro. Por CPU: para una imagen suelta, abrir el decodificador por CPU tarda unos 60 ms y por GPU 300.
+pub(super) fn cover_image(p: &Path, pr: &Probe) -> Option<egui::ColorImage> {
+    let (w, h) = fit(pr, 256);
+    let mut v = Video::open_cpu(p, w, h).ok()?;
+    v.key_frame_before((pr.duration / 2).min(10_000_000)).ok().flatten()
+}
+
+/// Forma de onda de un clip que no la tiene en la caché (los importados): decodifica todo el audio.
+fn wave(p: &Path, info: &Infos, ctx: &egui::Context) {
+    let kf = info.lock().unwrap().get(p).and_then(|e| e.keyframes.clone());
+    let kf = kf.unwrap_or_else(|| media::keyframes(p).unwrap_or_default());
+    let wave = media::waveform(p).unwrap_or_default();
+    crate::clipcache::save(p, &wave, &kf);
+    info.lock().unwrap().entry(p.to_path_buf()).or_default().wave = Some(wave);
+    ctx.request_repaint();
+}
+
+/// Decodificadores de tira abiertos a la vez, como mucho: abrir uno tarda unos 300 ms, pero cada uno ocupa
+/// memoria de video. Si hace falta otro, se cierra el que hace más que no se usa.
+const OPEN_STRIPS: usize = 3;
+
+/// Una tira en curso: qué miniaturas faltan y su decodificador (abierto mientras hace falta).
+pub(super) struct Strip {
+    path: PathBuf,
+    plan: Vec<Thumb>,
+    size: (u32, u32),
+    done: Vec<bool>,
+    next: usize,
+    video: Option<Video>,
+    used: u64,
+}
+
+impl Strip {
+    pub(super) fn new(path: &Path, plan: Vec<Thumb>, pr: &Probe) -> Strip {
+        let done = vec![false; plan.len()];
+        Strip { path: path.to_path_buf(), plan, size: fit(pr, 160), done, next: 0, video: None, used: 0 }
+    }
+
+    /// La primera de `wanted` (las que la pantalla muestra vacías) que falte.
+    fn urgent(&self, wanted: &[usize]) -> Option<usize> {
+        wanted.iter().copied().find(|&i| i < self.done.len() && !self.done[i])
+    }
+
+    /// La siguiente que falte, en orden.
+    pub(super) fn in_order(&mut self) -> Option<usize> {
+        while self.next < self.done.len() && self.done[self.next] {
+            self.next += 1;
+        }
+        (self.next < self.done.len()).then_some(self.next)
+    }
+
+    /// Saca la imagen de la miniatura `i`. Si sigue en el mismo tramo que la anterior, lee hacia adelante
+    /// sin volver a buscar, así que recorrer la tira en orden decodifica cada cuadro una sola vez.
+    pub(super) fn frame(&mut self, i: usize) -> Option<egui::ColorImage> {
+        self.done[i] = true;
+        if self.video.is_none() {
+            match Video::open(&self.path, self.size.0, self.size.1, true) {
+                Ok(v) => self.video = Some(v),
+                Err(_) => {
+                    // No se puede decodificar: no hay tira.
+                    self.done.fill(true);
+                    return None;
+                }
+            }
+        }
+        let t = &self.plan[i];
+        self.video.as_mut()?.frame_ahead(t.at, t.key).ok().flatten()
+    }
+}
+
+/// Arma la tira de un clip: el plan de miniaturas (con los fotogramas clave de la caché o del índice del
+/// archivo, que salen enseguida) y, si la forma de onda no está en la caché, la pide a su fila.
+fn start_strip(p: &Path, info: &Infos, waves: &Queue, ctx: &egui::Context) -> Option<Strip> {
+    let pr = ensure_probe(p, info)?;
     let (wave, kf) = match crate::clipcache::load(p) {
         Some((w, k)) => (Some(w), k),
         None => (None, media::keyframes(p).unwrap_or_default()),
@@ -179,34 +258,67 @@ fn strip(p: &Path, info: &Infos, ctx: &egui::Context) {
     {
         let mut i = info.lock().unwrap();
         let e = i.entry(p.to_path_buf()).or_default();
-        e.keyframes = Some(kf.clone());
+        e.keyframes = Some(kf);
         e.thumbs = plan.clone();
-        if wave.is_some() {
-            e.wave = wave;
-        } else {
-            let (p, info, ctx, kf) = (p.to_path_buf(), info.clone(), ctx.clone(), kf.clone());
-            std::thread::spawn(move || {
-                let _mf = Mf::init();
-                let wave = media::waveform(&p).unwrap_or_default();
-                crate::clipcache::save(&p, &wave, &kf);
-                info.lock().unwrap().entry(p).or_default().wave = Some(wave);
-                ctx.request_repaint();
-            });
+        match wave {
+            Some(w) => e.wave = Some(w),
+            None => Loader::push(waves, p),
         }
     }
     ctx.request_repaint();
-    // Las miniaturas van apareciendo de a una: primero las que pide la pantalla.
-    let (w, h) = fit(&pr, 160);
-    if let Ok(mut v) = Video::open(p, w, h, true) {
-        let wanted = || info.lock().unwrap().get(p).map(|e| e.wanted.clone()).unwrap_or_default();
-        strip_frames(&mut v, &plan, wanted, |i, img| {
-            let tex = ctx.load_texture(format!("strip:{}:{}", p.display(), plan[i].at), img, egui::TextureOptions::LINEAR);
+    Some(Strip::new(p, plan, &pr))
+}
+
+/// Hilo de las tiras: atiende todas las que hay en la línea de tiempo a la vez. Primero las miniaturas que la
+/// pantalla muestra vacías, de cualquier clip; cuando no falta ninguna, sigue en orden con la tira pedida
+/// más recientemente.
+fn strip_worker(info: Infos, queue: Queue, waves: Queue, ctx: egui::Context) {
+    let _mf = Mf::init();
+    let mut strips: Vec<Strip> = Vec::new();
+    let mut tick = 0;
+    loop {
+        let new: Vec<PathBuf> = {
+            let (q, cv) = &*queue;
+            let mut q = q.lock().unwrap();
+            while q.is_empty() && strips.is_empty() {
+                q = cv.wait(q).unwrap();
+            }
+            q.drain(..).collect()
+        };
+        // La fila tiene lo más reciente adelante: se agregan de la más vieja a la más nueva, cada una primera.
+        for p in new.into_iter().rev() {
+            strips.retain(|s| s.path != p);
+            if let Some(s) = start_strip(&p, &info, &waves, &ctx) {
+                strips.insert(0, s);
+            }
+        }
+        let urgent = {
+            let i = info.lock().unwrap();
+            strips.iter().enumerate().find_map(|(k, s)| Some((k, s.urgent(&i.get(&s.path)?.wanted)?)))
+        };
+        let Some((k, t)) = urgent.or_else(|| strips.iter_mut().enumerate().find_map(|(k, s)| Some((k, s.in_order()?)))) else {
+            strips.clear();
+            continue;
+        };
+        tick += 1;
+        strips[k].used = tick;
+        if strips[k].video.is_none() && strips.iter().filter(|s| s.video.is_some()).count() >= OPEN_STRIPS {
+            if let Some(old) = strips.iter_mut().filter(|s| s.video.is_some()).min_by_key(|s| s.used) {
+                old.video = None;
+            }
+        }
+        let s = &mut strips[k];
+        if let Some(img) = s.frame(t) {
+            let at = s.plan[t].at;
+            let tex = ctx.load_texture(format!("strip:{}:{at}", s.path.display()), img, egui::TextureOptions::LINEAR);
             // Si el archivo cambió mientras tanto, la tira es otra: esta imagen ya no va.
-            if let Some(t) = info.lock().unwrap().get_mut(p).and_then(|e| e.thumbs.get_mut(i)).filter(|t| t.at == plan[i].at) {
-                t.tex = Some(tex);
+            if let Some(th) = info.lock().unwrap().get_mut(&s.path).and_then(|e| e.thumbs.get_mut(t)).filter(|th| th.at == at) {
+                th.tex = Some(tex);
             }
             ctx.request_repaint();
-        });
+        }
+        // Las terminadas sueltan su decodificador.
+        strips.retain(|s| s.done.contains(&false));
     }
 }
 
@@ -245,25 +357,6 @@ pub fn thumb_for(thumbs: &[Thumb], lo: i64, hi: i64) -> Option<usize> {
         return (a..b).min_by_key(|&i| (thumbs[i].at - thumbs[i].key, dist(i)));
     }
     [a.checked_sub(1), Some(a)].into_iter().flatten().filter(|&i| i < thumbs.len()).min_by_key(|&i| dist(i))
-}
-
-/// Saca las imágenes de la tira. Antes de cada una se mira `wanted` (las que la pantalla muestra y todavía no
-/// están) y se hace la primera de esas; si no falta ninguna, se sigue en orden desde la anterior sin volver a
-/// buscar, así que casi ningún cuadro se decodifica dos veces.
-pub(super) fn strip_frames(v: &mut Video, plan: &[Thumb], wanted: impl Fn() -> Vec<usize>, mut each: impl FnMut(usize, egui::ColorImage)) {
-    let mut done = vec![false; plan.len()];
-    let mut next = 0;
-    loop {
-        let urgent = wanted().into_iter().find(|&i| i < plan.len() && !done[i]);
-        while next < plan.len() && done[next] {
-            next += 1;
-        }
-        let Some(i) = urgent.or((next < plan.len()).then_some(next)) else { break };
-        done[i] = true;
-        if let Ok(Some(img)) = v.frame_ahead(plan[i].at, plan[i].key) {
-            each(i, img);
-        }
-    }
 }
 
 fn fit(p: &Probe, w: u32) -> (u32, u32) {

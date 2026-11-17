@@ -9,7 +9,7 @@ use eframe::egui;
 use super::library;
 use super::media::{self, Clip, Edit, Progress};
 use crate::mf::Mf;
-use super::player::{self, Player};
+use super::player::Player;
 use super::timeline::{Piece, Track, TrackKind};
 use super::EditorApp;
 
@@ -138,19 +138,33 @@ pub fn test_cli(args: &[String]) -> i32 {
             let c = crate::clipcache::load(&path);
             println!("caché: {} en {:?}", if c.is_some() { "encontrada" } else { "no hay" }, t.elapsed());
             let t = Instant::now();
-            let mut v = player::Video::open(&path, 160, 90, true).unwrap();
-            println!("abrir decodificador: {:?}", t.elapsed());
-            let t = Instant::now();
+            let mut s = library::Strip::new(&path, library::strip_plan(pr.duration, &k), &pr);
             let mut n = 0;
-            library::strip_frames(&mut v, &library::strip_plan(pr.duration, &k), Vec::new, |_, _| n += 1);
-            println!("{n} miniaturas (GPU): {:?}", t.elapsed());
-            let t = Instant::now();
-            let mut v = player::Video::open_cpu(&path, 160, 90).unwrap();
-            println!("abrir decodificador CPU: {:?}", t.elapsed());
-            let t = Instant::now();
-            n = 0;
-            library::strip_frames(&mut v, &library::strip_plan(pr.duration, &k), Vec::new, |_, _| n += 1);
-            println!("{n} miniaturas (CPU): {:?}", t.elapsed());
+            while let Some(i) = s.in_order() {
+                n += s.frame(i).is_some() as usize;
+            }
+            println!("{n} miniaturas (abriendo el decodificador): {:?}", t.elapsed());
+            0
+        }
+        Some("--test-covers") => {
+            // Portadas de varios archivos, como las saca la biblioteca: una por una y en varios hilos.
+            for threads in [1, 4] {
+                let t = Instant::now();
+                let next = std::sync::atomic::AtomicUsize::new(1);
+                std::thread::scope(|s| {
+                    for _ in 0..threads {
+                        s.spawn(|| {
+                            let _mf = Mf::init();
+                            while let Some(f) = args.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
+                                let path = PathBuf::from(f);
+                                let pr = media::probe(&path).unwrap();
+                                library::cover_image(&path, &pr).unwrap();
+                            }
+                        });
+                    }
+                });
+                println!("{} portadas ({threads} hilos): {:?}", args.len() - 1, t.elapsed());
+            }
             0
         }
         Some("--test-frame") => {

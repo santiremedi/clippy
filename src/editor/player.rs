@@ -161,8 +161,7 @@ pub(super) struct Video {
 }
 
 impl Video {
-    #[cfg(feature = "devtools")]
-    /// Decodificador por CPU, para compararlo con la GPU en `--test-strip`.
+    /// Decodificador por CPU, para un cuadro suelto (la portada): abre en unos 60 ms contra 300 por GPU.
     pub(super) fn open_cpu(path: &std::path::Path, w: u32, h: u32) -> Result<Video> {
         unsafe { Self::configure(path, w, h, None, true) }
     }
@@ -265,6 +264,13 @@ impl Video {
         } else {
             self.frame_at(t)
         }
+    }
+
+    /// El fotograma clave anterior a `t` (o en `t`): sale de un solo cuadro, sin decodificar hasta `t`.
+    pub(super) fn key_frame_before(&mut self, t: i64) -> Result<Option<egui::ColorImage>> {
+        unsafe { seek(&self.r, t)? };
+        self.read = None;
+        self.next()?.map(|(_, _, s)| self.to_image(&s)).transpose()
     }
 
     fn decode_to(&mut self, t: i64) -> Result<Option<egui::ColorImage>> {
