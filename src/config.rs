@@ -13,10 +13,10 @@ use windows::Win32::UI::Shell::{FOLDERID_Videos, SHGetKnownFolderPath, KF_FLAG_D
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug, Default)]
 #[serde(from = "String", into = "&'static str")]
 pub enum CaptureMode {
-    /// Todo el monitor principal.
+    /// Todo el monitor del juego (sin juego, el de la ventana activa).
     #[default]
     Screen,
-    /// Solo mientras hay un juego en pantalla completa adelante (si no, negro).
+    /// Solo el juego en pantalla completa mientras se ve (si no, negro).
     GamesOnly,
 }
 

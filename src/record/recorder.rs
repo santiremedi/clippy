@@ -7,10 +7,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
 
 use super::audio::{self, Audio, AudioBuf, Source};
-use super::capture::{Capture, Poll};
+use super::capture::{Aim, Capture};
 use super::clock::{now_100ns, Timer};
 use super::convert::Converter;
 use super::encoder::{Encoder, Packet};
@@ -75,7 +76,8 @@ impl Drop for Recorder {
 
 enum End {
     Stop,
-    Restart,
+    /// Volver a empezar grabando este monitor (el del juego).
+    Restart(HMONITOR),
 }
 
 fn thread_main(mut cfg: Config, rx: Receiver<Cmd>, notify: Notify) {
@@ -83,13 +85,11 @@ fn thread_main(mut cfg: Config, rx: Receiver<Cmd>, notify: Notify) {
     unsafe {
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     }
+    let mut target = None;
     loop {
-        match session(&mut cfg, &rx, &notify) {
+        match session(&mut cfg, &rx, &notify, target.take()) {
             Ok(End::Stop) => break,
-            Ok(End::Restart) => {
-                log("cambió la resolución del escritorio: reiniciando captura");
-                continue;
-            }
+            Ok(End::Restart(m)) => target = Some(m),
             Err(e) => {
                 log(&format!("error de captura: {e:?}"));
                 // Cada intento fallido avisa; la bandeja muestra el globo solo al pasar de grabar a error.
@@ -205,15 +205,23 @@ impl AudioState {
     }
 }
 
-fn session(cfg: &mut Config, rx: &Receiver<Cmd>, notify: &Notify) -> Result<End> {
+/// Cada cuánto se revisa qué monitor grabar (100 ns).
+const AIM_EVERY: i64 = 2_500_000;
+
+/// `restarted`: el monitor del juego que pidió reiniciar (ya se grabó a su resolución; no se vuelve a pedir).
+fn session(cfg: &mut Config, rx: &Receiver<Cmd>, notify: &Notify, restarted: Option<HMONITOR>) -> Result<End> {
     let fps = cfg.fps.max(1);
     let frame_dur = 10_000_000i64 / fps as i64;
 
-    let mut cap = Capture::new()?;
-    let (w, h) = (cap.width & !1, cap.height & !1);
+    let mut game = game::Detector::default();
+    game.poll(0);
+    // Qué monitor grabar: el del juego; si no hay juego, el de la ventana activa; si no, el principal.
+    let mut cap = Capture::new(restarted.or_else(|| game.monitor()).or_else(game::active_monitor))?;
+    let (w, h) = (cap.width, cap.height);
     let mut enc = Encoder::new(&cap.device, cap.luid, w, h, fps, cfg.bitrate_mbps * 1_000_000)?;
     log(&format!(
-        "grabando {w}x{h} @ {fps} fps, H.264 {} Mbps, buffer {} s, encoder: {}",
+        "grabando {} a {w}x{h} @ {fps} fps, H.264 {} Mbps, buffer {} s, encoder: {}",
+        cap.describe(),
         cfg.bitrate_mbps,
         cfg.seconds,
         enc.name
@@ -227,12 +235,13 @@ fn session(cfg: &mut Config, rx: &Receiver<Cmd>, notify: &Notify) -> Result<End>
         game_ch: Channel::default(),
         desktop: Channel::default(),
         mic: Channel::default(),
-        game: game::Detector::default(),
+        game,
         next_check: 0,
         masks: Vec::new(),
     };
-    au.game.poll(0);
     notify(Event::Game(au.game.name()));
+    let mut game_monitor = restarted;
+    let mut next_aim = 0i64;
     au.sync(cfg, 0);
     let mut next_frame = 0i64;
     let mut packets: VecDeque<Packet> = VecDeque::new();
@@ -259,19 +268,28 @@ fn session(cfg: &mut Config, rx: &Receiver<Cmd>, notify: &Notify) -> Result<End>
         let keep = cfg.seconds as i64 * 10_000_000;
 
         let now = now_100ns() - t0;
-        if let Poll::SizeChanged = cap.poll(now)? {
-            return Ok(End::Restart);
-        }
-        if conv.is_none() {
-            if let Some(lat) = &cap.latest {
-                conv = Some(Converter::new(&cap.device, &cap.context, lat, w, h, fps, 8)?);
-            }
-        }
-
         if au.game.poll(now) {
             let name = au.game.name();
             log(&format!("juego detectado: {}", name.as_deref().unwrap_or("ninguno")));
             notify(Event::Game(name));
+        }
+        if now >= next_aim {
+            next_aim = now + AIM_EVERY;
+            // Cuando el juego aparece o se muda de monitor, el video toma la resolución de ese monitor.
+            let gm = au.game.monitor();
+            let native = gm.is_some() && gm != game_monitor;
+            game_monitor = gm;
+            if let Some(m) = gm.or_else(game::active_monitor) {
+                if let Aim::Restart = cap.aim(m, native) {
+                    return Ok(End::Restart(m));
+                }
+            }
+        }
+        cap.poll(now)?;
+        if let Some(f) = &cap.latest {
+            if !conv.as_ref().is_some_and(|c| c.is_for(f)) {
+                conv = Some(Converter::new(&cap.device, &cap.context, f, w, h, fps, 8)?);
+            }
         }
         au.sync(cfg, now);
         au.game_ch.poll(t0);
@@ -283,7 +301,7 @@ fn session(cfg: &mut Config, rx: &Receiver<Cmd>, notify: &Notify) -> Result<End>
 
         if now >= next_frame {
             let pts = (now / frame_dur) * frame_dur;
-            let visible = cfg.capture_mode == CaptureMode::Screen || au.game.in_front();
+            let visible = cfg.capture_mode == CaptureMode::Screen || au.game.visible();
             if let Some(c) = conv.as_mut() {
                 // Solo convertir si el encoder pidió otra imagen; si está ocupado se salta un cuadro.
                 if enc.pending_input > 0 {
@@ -379,8 +397,13 @@ fn save_clip(cfg: &Config, packets: &VecDeque<Packet>, enc: &Encoder, au: &Audio
     let base = pk[0].pts;
     let end = pk.last().map_or(base, |p| p.pts) + frame_dur;
     let audio = cfg.audio_on().then(|| mixed_audio(cfg, au, frames_at(base), frames_at(end)));
-    if cfg.game_audio && au.game.pid().is_none() {
-        log("clip sin canal de juego: no se detectó ningún juego");
+    if au.game.pid().is_none() {
+        if cfg.game_audio {
+            log("clip sin canal de juego: no se detectó ningún juego");
+        }
+        if cfg.capture_mode == CaptureMode::GamesOnly {
+            log("clip en negro: el modo \"Solo juegos\" no detectó ningún juego en pantalla completa");
+        }
     }
 
     let dir = cfg.output_dir.clone();

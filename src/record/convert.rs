@@ -1,13 +1,19 @@
 //! Conversión BGRA -> NV12 con el procesador de video de la GPU (sin shaders ni CPU).
+//! También endereza monitores verticales y encaja un monitor de otra resolución sin deformarlo.
 
 use std::mem::ManuallyDrop;
 
 use anyhow::Result;
 use windows::core::Interface;
+use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
+use super::capture::Frame;
+
 pub struct Converter {
+    /// La imagen que convierte (si `Capture` cambia de textura, hace falta otro `Converter`).
+    src: ID3D11Texture2D,
     vctx: ID3D11VideoContext,
     vp: ID3D11VideoProcessor,
     input: ID3D11VideoProcessorInputView,
@@ -20,7 +26,7 @@ impl Converter {
     pub fn new(
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
-        src: &ID3D11Texture2D,
+        frame: &Frame,
         w: u32,
         h: u32,
         fps: u32,
@@ -29,6 +35,7 @@ impl Converter {
         unsafe {
             let vdev: ID3D11VideoDevice = device.cast()?;
             let vctx: ID3D11VideoContext = context.cast()?;
+            let src = &frame.tex;
             let mut sd = D3D11_TEXTURE2D_DESC::default();
             src.GetDesc(&mut sd);
 
@@ -95,6 +102,23 @@ impl Converter {
             vctx.VideoProcessorSetStreamFrameFormat(&vp, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
             vctx.VideoProcessorSetStreamAutoProcessingMode(&vp, 0, false);
 
+            // Monitor vertical: la imagen llega acostada (DXGI_MODE_ROTATION va de 1 a 4, la del
+            // procesador de 0 a 3, en el mismo orden).
+            let quarter = frame.rotation.0 - 1;
+            if quarter > 0 {
+                vctx.VideoProcessorSetStreamRotation(&vp, 0, true, D3D11_VIDEO_PROCESSOR_ROTATION(quarter));
+            }
+            // Encajar sin deformar: un monitor con otra forma queda con bandas negras.
+            let (sw, sh) = if quarter % 2 == 1 { (sd.Height, sd.Width) } else { (sd.Width, sd.Height) };
+            let scale = (w as f64 / sw as f64).min(h as f64 / sh as f64);
+            let dw = (sw as f64 * scale).round() as i32 & !1;
+            let dh = (sh as f64 * scale).round() as i32 & !1;
+            let (x, y) = (((w as i32 - dw) / 2) & !1, ((h as i32 - dh) / 2) & !1);
+            let dest = RECT { left: x, top: y, right: x + dw, bottom: y + dh };
+            vctx.VideoProcessorSetStreamDestRect(&vp, 0, true, Some(&dest));
+            let black = D3D11_VIDEO_COLOR { Anonymous: D3D11_VIDEO_COLOR_0 { RGBA: D3D11_VIDEO_COLOR_RGBA { R: 0.0, G: 0.0, B: 0.0, A: 1.0 } } };
+            vctx.VideoProcessorSetOutputBackgroundColor(&vp, false, &black);
+
             // Cuadro negro (Y=16, UV=128) para el modo "solo juegos" cuando no hay juego en pantalla.
             let (bw, bh) = (w as usize, h as usize);
             let mut px = vec![16u8; bw * bh];
@@ -115,8 +139,12 @@ impl Converter {
             let mut black = None;
             device.CreateTexture2D(&bd, Some(&init), Some(&mut black))?;
 
-            Ok(Self { vctx, vp, input: input.unwrap(), pool, next: 0, black: black.unwrap() })
+            Ok(Self { src: src.clone(), vctx, vp, input: input.unwrap(), pool, next: 0, black: black.unwrap() })
         }
+    }
+
+    pub fn is_for(&self, frame: &Frame) -> bool {
+        self.src == frame.tex
     }
 
     pub fn black(&self) -> ID3D11Texture2D {

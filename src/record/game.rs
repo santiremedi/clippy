@@ -1,19 +1,20 @@
 //! Qué es "el juego": el proceso de la ventana activa que ocupa todo su monitor
 //! (pantalla completa o ventana sin bordes), salvo programas que no son juegos.
-//! Lo usan el modo "Solo juegos" (imagen) y el canal de audio "Juego".
+//! Lo usan la elección del monitor a grabar, el modo "Solo juegos" (imagen) y el canal de audio "Juego".
 //! Una vez detectado queda fijo mientras siga abierto, aunque hagas Alt+Tab.
 
 use windows::core::PWSTR;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, RECT};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, RECT};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
-use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL};
 use windows::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClassNameW, GetForegroundWindow, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsZoomed, GWL_STYLE, WS_CAPTION,
+    GetClassNameW, GetForegroundWindow, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindow, IsZoomed, GWL_STYLE,
+    WS_CAPTION,
 };
 
 /// Programas que pueden estar en pantalla completa sin ser juegos (en minúsculas, sin ".exe").
@@ -35,6 +36,8 @@ struct Proc {
     pid: u32,
     exe: String,
     handle: HANDLE,
+    /// Última ventana del juego que estuvo adelante en pantalla completa (dice en qué monitor está).
+    window: HWND,
 }
 
 impl Drop for Proc {
@@ -50,7 +53,7 @@ impl Drop for Proc {
 #[derive(Default)]
 pub struct Detector {
     game: Option<Proc>,
-    /// Hay un juego en pantalla completa adelante ahora mismo.
+    /// El juego está adelante en pantalla completa ahora mismo.
     in_front: bool,
     /// Último proceso en pantalla completa que resultó no ser juego (para no consultarlo de nuevo).
     not_game: u32,
@@ -73,11 +76,12 @@ impl Detector {
         if now >= self.next_fs {
             self.next_fs = now + FS_EVERY;
             self.in_front = false;
-            if let Some(pid) = fullscreen_pid() {
-                if self.game.as_ref().is_some_and(|g| g.pid == pid) {
+            if let Some((pid, window)) = fullscreen_window() {
+                if let Some(g) = self.game.as_mut().filter(|g| g.pid == pid) {
+                    g.window = window;
                     self.in_front = true;
                 } else if pid != self.not_game {
-                    match open(pid) {
+                    match open(pid, window) {
                         Some(p) if is_game(&p.exe) => {
                             self.game = Some(p);
                             self.in_front = true;
@@ -100,8 +104,43 @@ impl Detector {
         self.game.as_ref().map(|g| g.exe.clone())
     }
 
-    pub fn in_front(&self) -> bool {
-        self.in_front
+    /// Monitor del juego, si está abierto y no minimizado.
+    pub fn monitor(&self) -> Option<HMONITOR> {
+        let w = self.game.as_ref()?.window;
+        unsafe {
+            if !IsWindow(w).as_bool() || IsIconic(w).as_bool() {
+                return None;
+            }
+            let m = MonitorFromWindow(w, MONITOR_DEFAULTTONULL);
+            (!m.is_invalid()).then_some(m)
+        }
+    }
+
+    /// El juego se ve en su monitor: está adelante, o la ventana activa está en otro monitor
+    /// (con dos o más pantallas, mirar Discord en la otra no tapa el juego).
+    pub fn visible(&self) -> bool {
+        let Some(m) = self.monitor() else { return false };
+        self.in_front || foreground().is_none_or(|h| unsafe { MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST) } != m)
+    }
+}
+
+/// Monitor de la ventana activa (el escritorio y la barra de tareas no cuentan: el escritorio abarca todos).
+pub fn active_monitor() -> Option<HMONITOR> {
+    let m = unsafe { MonitorFromWindow(foreground()?, MONITOR_DEFAULTTONULL) };
+    (!m.is_invalid()).then_some(m)
+}
+
+/// Ventana activa, salvo el escritorio y las barras de tareas.
+fn foreground() -> Option<HWND> {
+    unsafe {
+        let h = GetForegroundWindow();
+        if h.is_invalid() {
+            return None;
+        }
+        let mut cls = [0u16; 64];
+        let n = GetClassNameW(h, &mut cls).max(0) as usize;
+        let cls = String::from_utf16_lossy(&cls[..n]);
+        (!matches!(cls.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd")).then_some(h)
     }
 }
 
@@ -109,7 +148,7 @@ fn is_game(exe: &str) -> bool {
     !exe.is_empty() && !NOT_GAMES.iter().any(|n| exe.eq_ignore_ascii_case(n))
 }
 
-fn open(pid: u32) -> Option<Proc> {
+fn open(pid: u32, window: HWND) -> Option<Proc> {
     if pid == 0 || pid == std::process::id() {
         return None;
     }
@@ -123,7 +162,7 @@ fn open(pid: u32) -> Option<Proc> {
             // Algunos anticheats no dejan abrir el proceso: el nombre sale de la lista de procesos.
             snapshot().into_iter().find(|(p, _)| *p == pid).map(|(_, n)| n)?
         };
-        Some(Proc { pid, exe: exe_stem(&path), handle })
+        Some(Proc { pid, exe: exe_stem(&path), handle, window })
     }
 }
 
@@ -164,23 +203,14 @@ fn snapshot() -> Vec<(u32, String)> {
     v
 }
 
-/// PID de la ventana activa si ocupa todo su monitor. El escritorio, las ventanas normales y las
+/// (PID, ventana) de la ventana activa si ocupa todo su monitor. El escritorio, las ventanas normales y las
 /// maximizadas con barra de título no cuentan (con la barra de tareas oculta, una ventana maximizada
 /// también tapa todo el monitor; un juego sin bordes no tiene barra de título).
-fn fullscreen_pid() -> Option<u32> {
+fn fullscreen_window() -> Option<(u32, HWND)> {
     unsafe {
-        let h = GetForegroundWindow();
-        if h.is_invalid() {
-            return None;
-        }
+        let h = foreground()?;
         let style = GetWindowLongW(h, GWL_STYLE) as u32;
         if IsZoomed(h).as_bool() && style & WS_CAPTION.0 == WS_CAPTION.0 {
-            return None;
-        }
-        let mut cls = [0u16; 64];
-        let n = GetClassNameW(h, &mut cls).max(0) as usize;
-        let cls = String::from_utf16_lossy(&cls[..n]);
-        if matches!(cls.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd") {
             return None;
         }
         let mut r = RECT::default();
@@ -195,6 +225,6 @@ fn fullscreen_pid() -> Option<u32> {
         }
         let mut pid = 0u32;
         GetWindowThreadProcessId(h, Some(&mut pid));
-        (pid != 0).then_some(pid)
+        (pid != 0).then_some((pid, h))
     }
 }

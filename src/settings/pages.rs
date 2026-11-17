@@ -267,9 +267,9 @@ impl SettingsApp {
                 ui,
                 LABEL_W + 8.0,
                 if self.cfg.capture_mode == CaptureMode::GamesOnly {
-                    "Graba solo lo que está en pantalla completa. Si salís del juego, esa parte del clip queda en negro y no se ve tu escritorio."
+                    "Graba solo el juego en pantalla completa, en el monitor donde esté. Si lo minimizás o lo tapás con otra ventana, esa parte del clip queda en negro y no se ve tu escritorio."
                 } else {
-                    "Graba todo lo que se ve en el monitor principal: juegos, escritorio y otras ventanas."
+                    "Graba todo lo que se ve en el monitor del juego (sin juego, el de la ventana activa): juegos, escritorio y otras ventanas."
                 },
             );
             divider(ui);
