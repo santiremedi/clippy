@@ -18,7 +18,7 @@ permissions:
   contents: read
 
 jobs:
-  # PRs y main: verificar que compila (con y sin las pruebas) y los avisos de clippy.
+  # PRs y main: verificar que compila (con y sin las pruebas) y que clippy no da avisos.
   # En debug y sin LTO: varias veces más rápido que compilar el exe final.
   # Se llama "build" porque la protección de main pide ese check.
   build:
@@ -34,10 +34,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Clippy
-        run: cargo clippy --locked
+        run: cargo clippy --locked -- -D warnings
 
       - name: Clippy con devtools
-        run: cargo clippy --locked --features devtools
+        run: cargo clippy --locked --features devtools -- -D warnings
 
   # Publicar a mano (Actions → Build → Run workflow): el exe final, una sola vez.
   release:

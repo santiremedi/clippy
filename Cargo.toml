@@ -58,6 +58,15 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
+# Para probar mientras se desarrolla (`--test`, abrir ventanas): optimizado como el exe final
+# pero sin LTO y con compilación incremental, así un cambio compila en segundos y no en un minuto.
+# Queda en target/fast/. El tamaño se mide siempre con --release.
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+
 [features]
 # Modos de prueba sin ventana (--test, --test-export, ...). No van en el exe publicado.
 devtools = []

@@ -55,10 +55,13 @@ y nada de código muerto.
 ## Probar
 
 ```bash
-cargo build --release
-cargo build --release --features devtools --target-dir target/dev
-target/dev/release/clippy.exe --test 8 <carpeta> game
+cargo clippy --features devtools -- -D warnings   # chequeo rápido, el mismo que corre el CI
+cargo build --profile fast --features devtools    # para probar: unos segundos por cambio
+target/fast/clippy.exe --test 8 <carpeta> game
+cargo build --release                             # una sola vez, al final, para medir el tamaño
 ```
+
+Compilá siempre en `target/` con estos perfiles: otra `--target-dir` recompila todo de cero.
 
 No hay tests automáticos. Después de cambiar la grabación, probá con `--test` y mirá
 `%APPDATA%\Clippy\clippy.log`. Después de cambiar ventanas, abrí `--settings` y `--editor`.

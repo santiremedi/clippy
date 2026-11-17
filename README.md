@@ -17,10 +17,11 @@ cargo build --release
 El exe queda en `target/release/clippy.exe`. Para publicar se renombra a `Clippy.exe`
 (el actualizador busca ese nombre exacto en el último release de `santiremedi/clippy`).
 
-Con los modos de prueba sin ventana (no van en el exe publicado):
+Para probar mientras desarrollás, con los modos de prueba sin ventana (no van en el exe publicado).
+Compila en segundos porque no usa LTO; queda en `target/fast/clippy.exe`:
 
 ```bash
-cargo build --release --features devtools --target-dir target/dev
+cargo build --profile fast --features devtools
 ```
 
 ## Modos del mismo .exe
