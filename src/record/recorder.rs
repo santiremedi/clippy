@@ -95,8 +95,9 @@ fn thread_main(mut cfg: Config, rx: Receiver<Cmd>, notify: Notify) {
         match session(&mut cfg, &rx, &notify, monitor, align, &mut untested) {
             Ok(End::Stop) => break,
             Ok(End::Restart(m)) => target = Some(m),
-            // Varios encoders por hardware (Quick Sync con drivers viejos) aceptan el tamaño al configurarse y
-            // fallan con el primer cuadro si no es múltiplo de 16 (1366x768): se reintenta al toque, alineado.
+            // Quick Sync acepta el tamaño al configurarse y falla con el primer cuadro si no está alineado: Intel pide
+            // ancho múltiplo de 16 y algunos drivers de 2022 (HD 620) ancho y alto múltiplos de 4. 1366x768 no cumple
+            // ninguno de los dos: se reintenta al toque, alineado a 16.
             Err(e) if untested.is_some_and(|s| align16(s) != s) => {
                 let (w, h) = untested.unwrap();
                 let (aw, ah) = align16((w, h));
@@ -249,8 +250,8 @@ fn session(cfg: &mut Config, rx: &Receiver<Cmd>, notify: &Notify, restarted: Opt
     // Si ni se pudo configurar (no hay encoder, otra placa), no es por el tamaño: se avisa como siempre.
     let mut enc = Encoder::new(&cap.device, cap.luid, w, h, fps, cfg.bitrate_mbps * 1_000_000)?;
     *untested = Some(size);
-    // Prueba (CLIPPY_TEST_ALIGN16): un encoder que, como Quick Sync con drivers viejos, falla en el primer
-    // cuadro si el tamaño no es múltiplo de 16.
+    // Prueba (CLIPPY_TEST_ALIGN16): un encoder que, como Quick Sync, falla en el primer cuadro si el tamaño no
+    // es múltiplo de 16.
     #[cfg(feature = "devtools")]
     let reject = std::env::var_os("CLIPPY_TEST_ALIGN16").is_some() && align16(size) != size;
     log(&format!(
