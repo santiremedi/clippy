@@ -16,7 +16,7 @@ use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
 
 use crate::config::fit_short;
-use crate::i18n::{tr, trf};
+use crate::i18n::tr;
 use crate::log::log;
 
 #[derive(Clone)]
@@ -33,16 +33,6 @@ pub enum Device {
     Gpu(Option<String>),
     /// El procesador: la placa no tiene encoder de video.
     Cpu,
-}
-
-impl Device {
-    pub fn label(&self) -> String {
-        match self {
-            Device::Gpu(Some(v)) => trf!("Placa de video ({v})", "Graphics card ({v})", "Placa de vídeo ({v})"),
-            Device::Gpu(None) => tr!("Placa de video", "Graphics card", "Placa de vídeo").into(),
-            Device::Cpu => tr!("Procesador", "Processor", "Processador").into(),
-        }
-    }
 }
 
 /// Lo más que se le pide al encoder por procesador (lado corto y cuadros por segundo): 1080p a 60 ocupa un
@@ -71,7 +61,6 @@ pub struct Encoder {
     provides_samples: bool,
     out_size: u32,
     pub name: String,
-    pub device: Device,
     /// Tamaño y cuadros por segundo con que codifica (el de procesador puede usar menos que lo pedido).
     pub width: u32,
     pub height: u32,
@@ -81,7 +70,7 @@ pub struct Encoder {
 /// Cómo le llegan las imágenes al encoder.
 enum Path {
     /// Encoder de la placa (asíncrono): lee las texturas de la GPU y avisa con eventos cuándo quiere otra.
-    Gpu { events: IMFMediaEventGenerator, _mgr: IMFDXGIDeviceManager },
+    Gpu { events: IMFMediaEventGenerator, _mgr: IMFDXGIDeviceManager, vendor: Option<String> },
     /// Encoder por procesador (sincrónico): cada imagen se copia a la memoria.
     Cpu(Readback),
 }
@@ -92,8 +81,8 @@ impl Encoder {
         unsafe {
             for (act, name, vendor) in gpu_encoders(luid)? {
                 let gpu = act.ActivateObject::<IMFTransform>().map_err(Into::into).and_then(|mft| {
-                    let path = gpu_path(&mft, device, &name)?;
-                    Self::open(mft, path, name.clone(), Device::Gpu(vendor), w, h, fps, bitrate)
+                    let path = gpu_path(&mft, device, &name, vendor)?;
+                    Self::open(mft, path, name.clone(), w, h, fps, bitrate)
                 });
                 match gpu {
                     Ok(e) => return Ok(e),
@@ -111,12 +100,12 @@ impl Encoder {
             })?;
             let (w, h) = fit_short((w, h), CPU_MAX_SHORT);
             let path = Path::Cpu(Readback::new(device, w, h)?);
-            Self::open(mft, path, "H.264 de Windows (procesador)".into(), Device::Cpu, w, h, fps.min(CPU_MAX_FPS), bitrate)
+            Self::open(mft, path, "H.264 de Windows (procesador)".into(), w, h, fps.min(CPU_MAX_FPS), bitrate)
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn open(mft: IMFTransform, path: Path, name: String, device: Device, w: u32, h: u32, fps: u32, bitrate: u32) -> Result<Self> {
+    unsafe fn open(mft: IMFTransform, path: Path, name: String, w: u32, h: u32, fps: u32, bitrate: u32) -> Result<Self> {
+        let cpu = matches!(path, Path::Cpu(_));
         let api = mft.cast::<ICodecAPI>().ok();
         if let Some(api) = &api {
             let set = |g: &GUID, v: VARIANT| {
@@ -128,7 +117,7 @@ impl Encoder {
             set(&CODECAPI_AVEncMPVGOPSize, VARIANT::from(fps));
             set(&CODECAPI_AVEncMPVDefaultBPictureCount, VARIANT::from(0u32));
             set(&CODECAPI_AVLowLatencyMode, VARIANT::from(true));
-            if device == Device::Cpu {
+            if cpu {
                 // Lo más rápido: el procesador también lo usa el juego.
                 set(&CODECAPI_AVEncCommonQualityVsSpeed, VARIANT::from(0u32));
             }
@@ -146,7 +135,7 @@ impl Encoder {
         it.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
         it.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
         set_video_common(&it, w, h, fps)?;
-        if let Path::Cpu(_) = path {
+        if cpu {
             it.SetUINT32(&MF_MT_DEFAULT_STRIDE, w)?;
         }
         mft.SetInputType(0, &it, 0)?;
@@ -171,11 +160,18 @@ impl Encoder {
             provides_samples: provides,
             out_size: info.cbSize.max(4 * 1024 * 1024),
             name,
-            device,
             width: w,
             height: h,
             fps,
         })
+    }
+
+    /// Con qué codifica.
+    pub fn device(&self) -> Device {
+        match &self.path {
+            Path::Gpu { vendor, .. } => Device::Gpu(vendor.clone()),
+            Path::Cpu(_) => Device::Cpu,
+        }
     }
 
     /// Junta los paquetes listos sin bloquear y anota cuántas imágenes más acepta el encoder.
@@ -358,7 +354,7 @@ unsafe fn set_video_common(t: &IMFMediaType, w: u32, h: u32, fps: u32) -> Result
 }
 
 /// Prepara un encoder de la placa: asíncrono y leyendo las texturas de la GPU que captura.
-unsafe fn gpu_path(mft: &IMFTransform, device: &ID3D11Device, name: &str) -> Result<Path> {
+unsafe fn gpu_path(mft: &IMFTransform, device: &ID3D11Device, name: &str, vendor: Option<String>) -> Result<Path> {
     let attrs = mft.GetAttributes()?;
     if attrs.GetUINT32(&MF_TRANSFORM_ASYNC).unwrap_or(0) == 0 {
         bail!("el encoder {name} no es asíncrono");
@@ -372,7 +368,7 @@ unsafe fn gpu_path(mft: &IMFTransform, device: &ID3D11Device, name: &str) -> Res
     let mgr = mgr.unwrap();
     mgr.ResetDevice(device, token)?;
     mft.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, mgr.as_raw() as usize)?;
-    Ok(Path::Gpu { events: mft.cast()?, _mgr: mgr })
+    Ok(Path::Gpu { events: mft.cast()?, _mgr: mgr, vendor })
 }
 
 /// Encoders H.264 de la placa que captura (importa en notebooks con dos GPUs), con nombre y fabricante.

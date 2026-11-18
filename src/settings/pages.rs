@@ -273,7 +273,12 @@ impl SettingsApp {
     fn encoder_row(&self, ui: &mut egui::Ui) {
         let Some(d) = self.recorder.device.as_ref().filter(|_| self.main_running && self.cfg.enabled) else { return };
         row(ui, tr!("Codifica con", "Encoding with", "Codifica com"), LABEL_W, |ui| {
-            ui.label(RichText::new(d.label()).color(TEXT));
+            let label = match d {
+                Device::Gpu(Some(v)) => trf!("Placa de video ({v})", "Graphics card ({v})", "Placa de vídeo ({v})"),
+                Device::Gpu(None) => tr!("Placa de video", "Graphics card", "Placa de vídeo").into(),
+                Device::Cpu => tr!("Procesador", "Processor", "Processador").into(),
+            };
+            ui.label(RichText::new(label).color(TEXT));
         });
         if *d == Device::Cpu {
             let (p, fps) = (CPU_MAX_SHORT, CPU_MAX_FPS);

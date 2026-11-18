@@ -34,7 +34,6 @@ pub enum Cmd {
 pub enum Event {
     /// Empezó a grabar, codificando con esto.
     Started(Device),
-
     Saved(std::path::PathBuf),
     SaveFailed(String),
     Error(String),
@@ -83,6 +82,9 @@ enum End {
     Restart(HMONITOR),
 }
 
+/// Cada cuánto se vuelve a intentar grabar después de un error.
+const RETRY: Duration = Duration::from_secs(3);
+
 fn thread_main(mut cfg: Config, rx: Receiver<Cmd>, notify: Notify) {
     let _mf = Mf::init();
     unsafe {
@@ -98,11 +100,11 @@ fn thread_main(mut cfg: Config, rx: Receiver<Cmd>, notify: Notify) {
             Err(e) => {
                 let msg = e.to_string();
                 if failing.as_ref() != Some(&msg) {
-                    log(&format!("error de captura: {e:?} (se reintenta cada 3 s)"));
+                    log(&format!("error de captura: {e:?} (se reintenta cada {} s)", RETRY.as_secs()));
                     notify(Event::Error(msg.clone()));
                     failing = Some(msg);
                 }
-                match rx.recv_timeout(Duration::from_secs(3)) {
+                match rx.recv_timeout(RETRY) {
                     Ok(Cmd::Stop) | Err(RecvTimeoutError::Disconnected) => break,
                     Ok(Cmd::Update(c)) => cfg = c,
                     Ok(Cmd::Save) => notify(Event::SaveFailed(tr!("Clippy no está grabando en este momento", "Clippy isn't recording right now", "O Clippy não está gravando agora").into())),
@@ -240,7 +242,7 @@ fn session(cfg: &mut Config, rx: &Receiver<Cmd>, notify: &Notify, restarted: Opt
         enc.name
     ));
     *failing = None;
-    notify(Event::Started(enc.device.clone()));
+    notify(Event::Started(enc.device()));
 
     let mut conv: Option<Converter> = None;
     let timer = Timer::new();

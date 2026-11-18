@@ -54,7 +54,8 @@ Con `gh`, armá el cuerpo con las mismas secciones que la plantilla.
   `src/app/mode.rs` (`Mode`, `Window`). No escribas `"--settings"` ni `"Local\\Clippy..."` en otro lado.
 - Atajos globales: `config::GlobalAction` (ids, etiqueta, tecla). Atajos del editor: `editor/shortcuts.rs`.
 - Qué cuenta como juego: solo `src/record/game.rs` (lo usan el modo "Solo juegos" y el canal de audio).
-- `config.json` lo escriben la ventana de ajustes y la bandeja; `editor.json` solo el editor.
+- `config.json` lo escriben la ventana de ajustes y la bandeja; `editor.json` solo el editor;
+  `recorder.json` (con qué graba y por qué no puede, `app/status.rs`) solo la bandeja.
 - Código que solo sirve para probar va detrás de `#[cfg(feature = "devtools")]`.
 
 ## Interfaz y movimiento
