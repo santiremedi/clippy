@@ -286,9 +286,9 @@ impl SettingsApp {
                 ui,
                 LABEL_W + 8.0,
                 trf!(
-                    "Tu placa de video no tiene codificador de video, así que Clippy usa el procesador y graba hasta {p}p a {fps} cuadros por segundo para no frenar el juego.",
-                    "Your graphics card has no video encoder, so Clippy uses the processor and records up to {p}p at {fps} frames per second so it doesn't slow down your game.",
-                    "Sua placa de vídeo não tem codificador de vídeo, então o Clippy usa o processador e grava até {p}p a {fps} quadros por segundo para não deixar o jogo lento."
+                    "Tu placa de video no tiene codificador de video o no se pudo usar, así que Clippy usa el procesador y graba hasta {p}p a {fps} cuadros por segundo para no frenar el juego.",
+                    "Your graphics card has no video encoder or it couldn't be used, so Clippy uses the processor and records up to {p}p at {fps} frames per second so it doesn't slow down your game.",
+                    "Sua placa de vídeo não tem codificador de vídeo ou ele não pôde ser usado, então o Clippy usa o processador e grava até {p}p a {fps} quadros por segundo para não deixar o jogo lento."
                 ),
             );
         }

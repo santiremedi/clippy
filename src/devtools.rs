@@ -1,6 +1,7 @@
 //! Modos de prueba sin ventana (solo con `--features devtools`; no van en el exe publicado).
 //!
-//! - `--test <segundos> <carpeta> [game|desktop|mic|juegos]`: graba, guarda un clip y sale.
+//! - `--test <segundos> <carpeta> [game|desktop|mic|juegos|resolución]`: graba, guarda un clip y sale. Con
+//!   `CLIPPY_TEST_ALIGN16=1`, el encoder falla con tamaños que no son múltiplo de 16 (`--test 8 <carpeta> 766`).
 //! - `--test-mic`: cuánto audio entrega cada micrófono en 3 s.
 //! - `--test-download`: descarga la versión publicada como el botón "Actualizar".
 //! - `--test-export`, `--test-frame`, `--test-strip`, `--test-covers`: ver `editor::devtools`.
