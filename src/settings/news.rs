@@ -5,6 +5,7 @@ use eframe::egui::{self, Align, Layout, RichText};
 
 use super::SettingsApp;
 use crate::app::update;
+use crate::i18n::{tr, trf};
 use crate::ui_kit::theme::*;
 
 const WIDTH: f32 = 520.0;
@@ -16,8 +17,10 @@ impl SettingsApp {
     pub(super) fn news_modals(&mut self, ctx: &egui::Context) {
         if let Some((v, text)) = self.news.clone() {
             let mut done = false;
-            let x = notes_modal(ctx, "news", &format!("Novedades de la {v}"), "Clippy se actualizó. Esto es lo que cambió.", Some(&text), |ui| {
-                done = button_sized(ui, "Listo", Kind::Primary, BUTTON).clicked();
+            let title = trf!("Novedades de la {v}", "What's new in {v}", "Novidades da {v}");
+            let sub = tr!("Clippy se actualizó. Esto es lo que cambió.", "Clippy was updated. Here's what changed.", "O Clippy foi atualizado. Veja o que mudou.");
+            let x = notes_modal(ctx, "news", &title, sub, Some(&text), |ui| {
+                done = button_sized(ui, tr!("Listo", "Done", "Pronto"), Kind::Primary, BUTTON).clicked();
             });
             if x || done {
                 self.news = None;
@@ -25,10 +28,16 @@ impl SettingsApp {
             }
         } else if let Some((v, text)) = self.confirm_update.clone() {
             let (mut install, mut later) = (false, false);
-            let sub = format!("Tenés la {}. Clippy se cierra y vuelve a abrir solo.", update::current());
-            let x = notes_modal(ctx, "confirm_update", &format!("Actualizar a la {v}"), &sub, text.as_deref(), |ui| {
-                install = button_sized(ui, "Actualizar", Kind::Primary, BUTTON).clicked();
-                later = button_sized(ui, "Ahora no", Kind::Secondary, BUTTON).clicked();
+            let cur = update::current();
+            let sub = trf!(
+                "Tenés la {cur}. Clippy se cierra y vuelve a abrir solo.",
+                "You have {cur}. Clippy closes and reopens by itself.",
+                "Você tem a {cur}. O Clippy fecha e abre de novo sozinho."
+            );
+            let title = trf!("Actualizar a la {v}", "Update to {v}", "Atualizar para a {v}");
+            let x = notes_modal(ctx, "confirm_update", &title, &sub, text.as_deref(), |ui| {
+                install = button_sized(ui, tr!("Actualizar", "Update", "Atualizar"), Kind::Primary, BUTTON).clicked();
+                later = button_sized(ui, tr!("Ahora no", "Not now", "Agora não"), Kind::Secondary, BUTTON).clicked();
             });
             if install {
                 self.start_update();

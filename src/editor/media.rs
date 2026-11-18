@@ -21,6 +21,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Media::MediaFoundation::*;
 
 use crate::clipcache::{Wave, WaveBuilder};
+use crate::i18n::{tr, trf};
 use crate::mf::{aac_type, frames_at, pcm_sample, pcm_type, sample_bytes, time_of, FRAME_BYTES};
 
 pub const VIDEO: u32 = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
@@ -118,7 +119,7 @@ impl Probe {
         } else if self.subtype == MFVideoFormat_HEVC {
             "HEVC"
         } else {
-            "otro"
+            tr!("otro", "other", "outro")
         }
     }
 
@@ -136,7 +137,7 @@ pub fn probe(path: &Path) -> Result<Probe> {
             .ok()
             .and_then(|p| u64::try_from(&p).ok())
             .unwrap_or(0) as i64;
-        let vt = r.GetNativeMediaType(VIDEO, 0).map_err(|_| anyhow!("el archivo no tiene video"))?;
+        let vt = r.GetNativeMediaType(VIDEO, 0).map_err(|_| anyhow!(tr!("el archivo no tiene video", "the file has no video", "o arquivo não tem vídeo")))?;
         let (width, height) = unpack(vt.GetUINT64(&MF_MT_FRAME_SIZE).unwrap_or(0));
         let mut seq = Vec::new();
         if let Ok(n) = vt.GetBlobSize(&MF_MT_MPEG_SEQUENCE_HEADER) {
@@ -566,11 +567,15 @@ pub fn on_keyframe(keys: &[i64], t: i64) -> bool {
     keys.iter().any(|&x| (x - t).abs() <= 2_000)
 }
 
+fn no_video() -> anyhow::Error {
+    anyhow!(tr!("no hay video para exportar", "there's no video to export", "não há vídeo para exportar"))
+}
+
 /// Exporta la edición a `out`. Si el video es una sola pista de piezas pegadas, del mismo formato y con
 /// cortes en fotogramas clave, lo copia sin recodificar (instantáneo, sin pérdida); si no, lo arma cuadro
 /// a cuadro con la GPU. Devuelve una descripción del modo usado.
 pub fn export(edit: &Edit, out: &Path, opts: &ExportOpts, prog: &Progress) -> Result<String> {
-    let first = edit.first_video().ok_or_else(|| anyhow!("no hay video para exportar"))?;
+    let first = edit.first_video().ok_or_else(no_video)?;
     if let Some(dir) = out.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -600,9 +605,18 @@ pub fn export(edit: &Edit, out: &Path, opts: &ExportOpts, prog: &Progress) -> Re
         if let Some(parts) = copy {
             let plain = edit.plain_audio(parts);
             export_copy(&edit, parts, info, &tmp, prog, plain)?;
-            return Ok(if plain { "sin recodificar: instantáneo y sin pérdida" } else { "video sin recodificar, audio ajustado" }.to_string());
+            return Ok(if plain {
+                tr!("sin recodificar: instantáneo y sin pérdida", "no re-encoding: instant and lossless", "sem recodificar: instantâneo e sem perda")
+            } else {
+                tr!("video sin recodificar, audio ajustado", "video not re-encoded, audio adjusted", "vídeo sem recodificar, áudio ajustado")
+            }
+            .to_string());
         }
-        let why = if opts.target.is_none() && edit.copy_parts(size).is_some() { "renderizado con la GPU para cortar exacto" } else { "renderizado con la GPU" };
+        let why = if opts.target.is_none() && edit.copy_parts(size).is_some() {
+            tr!("renderizado con la GPU para cortar exacto", "rendered on the GPU for exact cuts", "renderizado na GPU para cortar exato")
+        } else {
+            tr!("renderizado con la GPU", "rendered on the GPU", "renderizado na GPU")
+        };
         // Todo en la GPU; si esa placa o ese archivo no se dejan, se decodifica por CPU (con devtools,
         // CLIPPY_CPU=1 fuerza ese camino para probarlo).
         let gpu = d3d_manager().ok().filter(|_| !cfg!(feature = "devtools") || std::env::var_os("CLIPPY_CPU").is_none());
@@ -787,7 +801,10 @@ unsafe fn export_copy(edit: &Edit, parts: &[Clip], info: &Probe, out: &Path, pro
                 }
             }
         }
-        let b = base.ok_or_else(|| anyhow!("no se encontró video en {}", seg.name()))?;
+        let b = base.ok_or_else(|| {
+            let name = seg.name();
+            anyhow!(trf!("no se encontró video en {name}", "no video found in {name}", "nenhum vídeo encontrado em {name}"))
+        })?;
         if let (Some(m), Some(ms)) = (&mut mix, mix_stream) {
             m.write(&w, ms, seg.start, seg.end(), offset)?;
         }
@@ -976,9 +993,14 @@ impl Frames {
         t.SetUINT64(&MF_MT_FRAME_SIZE, pack(tw, th))?;
         if r.SetCurrentMediaType(VIDEO, None, &t).is_err() {
             if r.GetNativeMediaType(VIDEO, 0).and_then(|t| t.GetGUID(&MF_MT_SUBTYPE)).ok() == Some(MFVideoFormat_HEVC) {
-                bail!("para recodificar clips HEVC hace falta instalar \"Extensiones de video HEVC\" (Microsoft Store)");
+                bail!(tr!(
+                    "para recodificar clips HEVC hace falta instalar \"Extensiones de video HEVC\" (Microsoft Store)",
+                    "re-encoding HEVC clips needs \"HEVC Video Extensions\" (Microsoft Store)",
+                    "para recodificar clipes HEVC é preciso instalar \"Extensões de Vídeo HEVC\" (Microsoft Store)"
+                ));
             }
-            bail!("no se pudo decodificar {}", c.name());
+            let name = c.name();
+            bail!(trf!("no se pudo decodificar {name}", "couldn't decode {name}", "não foi possível decodificar {name}"));
         }
         // Alto real de los cuadros que entrega el decodificador (puede ser 1088 en vez de 1080).
         let cur = r.GetCurrentMediaType(VIDEO)?;
@@ -1067,7 +1089,11 @@ impl Vp {
         let mut caps = D3D11_VIDEO_PROCESSOR_CAPS::default();
         en.GetVideoProcessorCaps(&mut caps)?;
         if streams > 1 && (caps.MaxInputStreams < streams || caps.FeatureCaps & D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_ALPHA_STREAM.0 as u32 == 0) {
-            bail!("el procesador de video de esta GPU no funde dos imágenes");
+            bail!(tr!(
+                "el procesador de video de esta GPU no funde dos imágenes",
+                "this GPU's video processor can't blend two images",
+                "o processador de vídeo desta GPU não funde duas imagens"
+            ));
         }
         let vp = vdev.CreateVideoProcessor(&en, 0)?;
         let ivd = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
@@ -1146,7 +1172,7 @@ impl Vp {
     unsafe fn place(&self, s: &IMFSample, p: &Placed, f: &Frame) -> Result<IMFSample> {
         let turns = f.turns % 4;
         if turns != 0 && self.caps & D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_ROTATION.0 as u32 == 0 {
-            bail!("la GPU no puede girar la imagen");
+            bail!(tr!("la GPU no puede girar la imagen", "the GPU can't rotate the picture", "a GPU não consegue girar a imagem"));
         }
         self.load(0, s)?;
         let (w, h) = (self.in_size.0 as f32, self.in_size.1 as f32);
@@ -1167,7 +1193,7 @@ impl Vp {
         if let Ok(v1) = self.vctx.cast::<ID3D11VideoContext1>() {
             v1.VideoProcessorSetStreamMirror(&self.vp, 0, f.flip, f.flip, false);
         } else if f.flip {
-            bail!("la GPU no puede espejar la imagen");
+            bail!(tr!("la GPU no puede espejar la imagen", "the GPU can't mirror the picture", "a GPU não consegue espelhar a imagem"));
         }
         self.run()
     }
@@ -1312,7 +1338,7 @@ unsafe fn canvas_bytes(f: &Frames, fit: &Fit, size: (u32, u32)) -> Result<Vec<u8
 /// video (la GPU decodifica, escala, ubica, funde y codifica); sin ella se decodifica y se arma por CPU y se
 /// codifica por GPU.
 unsafe fn export_reencode(edit: &Edit, probes: &HashMap<PathBuf, Probe>, out: &Path, opts: &ExportOpts, prog: &Progress, gpu: Option<&IMFDXGIDeviceManager>) -> Result<()> {
-    let info = edit.first_video().map(|c| &probes[&c.path]).ok_or_else(|| anyhow!("no hay video para exportar"))?;
+    let info = edit.first_video().map(|c| &probes[&c.path]).ok_or_else(no_video)?;
     let src_rate = if info.fps() > 0.0 { info.frame_rate } else { (60, 1) };
     let target = opts.target.unwrap_or(Target { height: 0, fps: 0, bitrate: opts.bitrate, constant: false });
     let (tw, th) = canvas_size((info.width, info.height), edit.ratio, target.height);

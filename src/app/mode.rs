@@ -9,6 +9,7 @@ use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
 use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, GetWindowThreadProcessId, PostMessageW, WM_APP, WM_CLOSE};
 
+use crate::i18n::{self, Lang};
 use crate::ui_kit::window::find_own_window;
 
 const APPLY_UPDATE: &str = "--apply-update";
@@ -83,11 +84,23 @@ pub enum Window {
 }
 
 impl Window {
+    /// Título en el idioma actual.
     pub fn title(self) -> &'static str {
-        match self {
-            Window::Settings => "Clippy",
-            Window::Editor => "Editor de Clippy",
+        self.title_in(i18n::lang())
+    }
+
+    fn title_in(self, lang: Lang) -> &'static str {
+        match (self, lang) {
+            (Window::Settings, _) => "Clippy",
+            (Window::Editor, Lang::Es) => "Editor de Clippy",
+            (Window::Editor, Lang::En) => "Clippy Editor",
+            (Window::Editor, Lang::Pt) => "Editor do Clippy",
         }
+    }
+
+    /// La ventana abierta en otro proceso, aunque se haya abierto con otro idioma.
+    pub fn find(self) -> Option<HWND> {
+        Lang::ALL.into_iter().find_map(|l| find_own_window(self.title_in(l)))
     }
 
     /// Candado de instancia única.
@@ -105,7 +118,7 @@ impl Window {
 
     /// Pide cerrarla (como si el usuario tocara la X).
     pub fn close(self) {
-        if let Some(h) = find_own_window(self.title()) {
+        if let Some(h) = self.find() {
             unsafe {
                 let _ = PostMessageW(h, WM_CLOSE, WPARAM(0), LPARAM(0));
             }

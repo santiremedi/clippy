@@ -47,7 +47,8 @@ Solo con `--features devtools`:
 ```
 src/
   main.rs          elige el modo
-  config.rs        config.json (grabación, audio, atajos globales)
+  config.rs        config.json (grabación, audio, atajos globales, idioma)
+  i18n.rs          idioma de la interfaz (español, inglés, portugués; "auto" sigue a Windows) y `tr!`
   log.rs           %APPDATA%\Clippy, clippy.log y marcas de tiempo
   mf.rs            Media Foundation y el formato de audio de toda la app (PCM 48 kHz estéreo, AAC)
   clipcache.rs     caché de forma de onda y fotogramas clave por clip (la escribe la grabadora, la lee el editor)

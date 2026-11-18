@@ -7,6 +7,7 @@ use std::time::Duration;
 use eframe::egui::{self, Align, Layout, RichText};
 
 use crate::log::file_stamp;
+use crate::i18n::{tr, trf};
 use crate::ui_kit::theme::*;
 use super::media::Progress;
 use crate::mf::Mf;
@@ -186,12 +187,14 @@ impl EditorApp {
         let plan = self.export_plan(&d);
         let max_h = (ctx.screen_rect().height() - 240.0).max(200.0);
         let mut action = 0;
-        let x = modal(ctx, "export", "Exportar video", "Elegí cómo querés guardar tu video.", 720.0, |ui| {
+        let title = tr!("Exportar video", "Export video", "Exportar vídeo");
+        let sub = tr!("Elegí cómo querés guardar tu video.", "Choose how you want to save your video.", "Escolha como quer salvar seu vídeo.");
+        let x = modal(ctx, "export", title, sub, 720.0, |ui| {
             modal_body(ui, |ui| {
                 // Con la ventana baja, el cuerpo se desplaza y los botones de abajo siguen a la vista.
                 egui::ScrollArea::vertical().max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
-                    caption(ui, "Archivo");
-                    row(ui, "Nombre", 170.0, |ui| {
+                    caption(ui, tr!("Archivo", "File", "Arquivo"));
+                    row(ui, tr!("Nombre", "Name", "Nome"), 170.0, |ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut d.name)
                                 .desired_width(ui.available_width() - 50.0)
@@ -200,10 +203,11 @@ impl EditorApp {
                         );
                         ui.label(RichText::new(".mp4").color(MUTED));
                     });
-                    row(ui, "Guardar en", 170.0, |ui| {
+                    row(ui, tr!("Guardar en", "Save to", "Salvar em"), 170.0, |ui| {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if button(ui, "Cambiar", Kind::Secondary).clicked() {
-                                if let Some(p) = rfd::FileDialog::new().set_title("Carpeta de destino").set_directory(&d.dir).pick_folder() {
+                            if button(ui, tr!("Cambiar", "Change", "Alterar"), Kind::Secondary).clicked() {
+                                let dialog = rfd::FileDialog::new().set_title(tr!("Carpeta de destino", "Destination folder", "Pasta de destino"));
+                                if let Some(p) = dialog.set_directory(&d.dir).pick_folder() {
                                     d.dir = p;
                                 }
                             }
@@ -213,7 +217,7 @@ impl EditorApp {
                         });
                     });
                     ui.add_space(10.0);
-                    caption(ui, "Formato");
+                    caption(ui, tr!("Formato", "Format", "Formato"));
                     let orig_res = format!("Original · {src_h}p");
                     let mut res_opts: Vec<(u32, String)> = vec![(0, orig_res)];
                     for h in [1440u32, 1080, 720] {
@@ -221,7 +225,7 @@ impl EditorApp {
                             res_opts.push((h, format!("{h}p")));
                         }
                     }
-                    row(ui, "Resolución", 170.0, |ui| {
+                    row(ui, tr!("Resolución", "Resolution", "Resolução"), 170.0, |ui| {
                         let opts: Vec<(u32, &str)> = res_opts.iter().map(|(v, l)| (*v, l.as_str())).collect();
                         seg(ui, &mut d.height, &opts);
                     });
@@ -232,25 +236,25 @@ impl EditorApp {
                             fps_opts.push((f, f.to_string()));
                         }
                     }
-                    row(ui, "Cuadros por segundo", 170.0, |ui| {
+                    row(ui, tr!("Cuadros por segundo", "Frames per second", "Quadros por segundo"), 170.0, |ui| {
                         let opts: Vec<(u32, &str)> = fps_opts.iter().map(|(v, l)| (*v, l.as_str())).collect();
                         seg(ui, &mut d.fps, &opts);
                     });
-                    row(ui, "Calidad", 170.0, |ui| {
+                    row(ui, tr!("Calidad", "Quality", "Qualidade"), 170.0, |ui| {
                         seg(
                             ui,
                             &mut d.quality,
                             &[
-                                (Quality::Recommended, "Recomendada"),
-                                (Quality::High, "Alta"),
-                                (Quality::Medium, "Media"),
-                                (Quality::Low, "Baja"),
-                                (Quality::MaxSize, "Por tamaño"),
+                                (Quality::Recommended, tr!("Recomendada", "Recommended", "Recomendada")),
+                                (Quality::High, tr!("Alta", "High", "Alta")),
+                                (Quality::Medium, tr!("Media", "Medium", "Média")),
+                                (Quality::Low, tr!("Baja", "Low", "Baixa")),
+                                (Quality::MaxSize, tr!("Por tamaño", "By size", "Por tamanho")),
                             ],
                         );
                     });
                     if d.quality == Quality::MaxSize {
-                        row(ui, "Tamaño máximo", 170.0, |ui| {
+                        row(ui, tr!("Tamaño máximo", "Maximum size", "Tamanho máximo"), 170.0, |ui| {
                             seg(ui, &mut d.size_mb, &[(10, "10 MB"), (25, "25 MB"), (50, "50 MB"), (100, "100 MB")]);
                         });
                     }
@@ -258,7 +262,7 @@ impl EditorApp {
                     note_box(ui, |ui| match &plan {
                         Some(p) => {
                             let format = if p.copy == Some(true) {
-                                format!("{}×{} · {:.0} fps · igual al original", p.width, p.height, p.fps)
+                                format!("{}×{} · {:.0} fps · {}", p.width, p.height, p.fps, tr!("igual al original", "same as the original", "igual ao original"))
                             } else {
                                 format!("{}×{} · {:.0} fps · {:.1} Mbps · MP4 H.264", p.width, p.height, p.fps, p.bitrate as f64 / 1e6)
                             };
@@ -269,41 +273,75 @@ impl EditorApp {
                                 });
                             });
                             let how = match p.copy {
-                                Some(true) => "Se copia sin recodificar: es instantáneo y no pierde calidad.".to_string(),
-                                None => "Si los cortes caen en fotogramas clave se copia al instante; si no, se renderiza con la GPU.".to_string(),
+                                Some(true) => tr!(
+                                    "Se copia sin recodificar: es instantáneo y no pierde calidad.",
+                                    "It's copied without re-encoding: instant and lossless.",
+                                    "É copiado sem recodificar: é instantâneo e não perde qualidade."
+                                )
+                                .to_string(),
+                                None => tr!(
+                                    "Si los cortes caen en fotogramas clave se copia al instante; si no, se renderiza con la GPU.",
+                                    "If the cuts land on keyframes it's copied instantly; if not, it's rendered on the GPU.",
+                                    "Se os cortes caírem em quadros-chave é copiado na hora; se não, é renderizado na GPU."
+                                )
+                                .to_string(),
                                 Some(false) => {
-                                    let why = if p.original { " para cortar justo donde marcaste" } else { "" };
-                                    format!("Se renderiza con la GPU{why}: tarda unos {}.", fmt_secs((p.seconds / 3.0).ceil().max(1.0) as u32))
+                                    let secs = fmt_secs((p.seconds / 3.0).ceil().max(1.0) as u32);
+                                    match p.original {
+                                        true => trf!(
+                                            "Se renderiza con la GPU para cortar justo donde marcaste: tarda unos {secs}.",
+                                            "It's rendered on the GPU to cut exactly where you marked: takes about {secs}.",
+                                            "É renderizado na GPU para cortar exatamente onde você marcou: leva uns {secs}."
+                                        ),
+                                        false => trf!(
+                                            "Se renderiza con la GPU: tarda unos {secs}.",
+                                            "It's rendered on the GPU: takes about {secs}.",
+                                            "É renderizado na GPU: leva uns {secs}."
+                                        ),
+                                    }
                                 }
                             };
-                            ui.label(RichText::new(format!("Duración {} · {how}", fmt_time((p.seconds * 1e7) as i64))).size(12.5).color(MUTED));
+                            let len = fmt_time((p.seconds * 1e7) as i64);
+                            ui.label(RichText::new(trf!("Duración {len} · {how}", "Duration {len} · {how}", "Duração {len} · {how}")).size(12.5).color(MUTED));
                             if p.low_quality {
                                 ui.label(
-                                    RichText::new("Con ese tamaño la imagen se va a ver con poca calidad. Probá bajar la resolución o los cuadros por segundo.")
+                                    RichText::new(tr!(
+                                        "Con ese tamaño la imagen se va a ver con poca calidad. Probá bajar la resolución o los cuadros por segundo.",
+                                        "At that size the picture will look low quality. Try lowering the resolution or the frames per second.",
+                                        "Com esse tamanho a imagem vai ficar com pouca qualidade. Tente baixar a resolução ou os quadros por segundo."
+                                    ))
                                         .size(12.5)
                                         .color(DANGER),
                                 );
                             }
                         }
                         None => {
-                            ui.label(RichText::new("No hay video para exportar: mostrá una pista de video o agregá un clip.").color(DANGER));
+                            let msg = tr!(
+                                "No hay video para exportar: mostrá una pista de video o agregá un clip.",
+                                "There's no video to export: show a video track or add a clip.",
+                                "Não há vídeo para exportar: mostre uma faixa de vídeo ou adicione um clipe."
+                            );
+                            ui.label(RichText::new(msg).color(DANGER));
                         }
                     });
                 });
             });
             modal_footer(ui, |ui| {
-                if button_sized(ui, "Restablecer", Kind::Secondary, egui::vec2(0.0, 38.0)).on_hover_text("Volver a Original / Recomendada").clicked() {
+                if button_sized(ui, tr!("Restablecer", "Reset", "Restaurar"), Kind::Secondary, egui::vec2(0.0, 38.0))
+                    .on_hover_text(tr!("Volver a Original / Recomendada", "Back to Original / Recommended", "Voltar para Original / Recomendada"))
+                    .clicked()
+                {
                     d.height = 0;
                     d.fps = 0;
                     d.quality = Quality::Recommended;
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let ok = plan.is_some() && !d.name.trim().is_empty();
-                    let r = ui.add_enabled_ui(ok, |ui| icon_button(ui, Glyph::Export, "Exportar", Kind::Primary, egui::vec2(130.0, 38.0))).inner;
+                    let r = ui.add_enabled_ui(ok, |ui| icon_button(ui, Glyph::Export, tr!("Exportar", "Export", "Exportar"), Kind::Primary, egui::vec2(130.0, 38.0))).inner;
                     if r.clicked() {
                         action = 2;
                     }
-                    if button_sized(ui, "Cancelar", Kind::Secondary, egui::vec2(120.0, 38.0)).clicked() {
+                    if button_sized(ui, tr!("Cancelar", "Cancel", "Cancelar"), Kind::Secondary, egui::vec2(120.0, 38.0)).clicked() {
                         action = 1;
                     }
                 });
@@ -373,14 +411,18 @@ impl EditorApp {
         match res {
             Some(Ok(mode)) => {
                 let name = job.out.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                self.message = Some((true, format!("Listo: {name} ({mode})"), Some(job.out.clone())));
+                self.message = Some((true, trf!("Listo: {name} ({mode})", "Done: {name} ({mode})", "Pronto: {name} ({mode})"), Some(job.out.clone())));
                 self.dirty = false;
                 self.job = None;
                 self.scan();
             }
             Some(Err(e)) => {
                 let canceled = job.progress.cancel.load(std::sync::atomic::Ordering::Relaxed);
-                let msg = if canceled { "Exportación cancelada.".to_string() } else { format!("No se pudo exportar: {e}") };
+                let msg = if canceled {
+                    tr!("Exportación cancelada.", "Export canceled.", "Exportação cancelada.").to_string()
+                } else {
+                    trf!("No se pudo exportar: {e}", "Couldn't export: {e}", "Não foi possível exportar: {e}")
+                };
                 self.message = Some((false, msg, None));
                 self.job = None;
             }
