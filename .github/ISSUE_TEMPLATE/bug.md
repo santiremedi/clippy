@@ -35,4 +35,4 @@ Las líneas relevantes de %APPDATA%\Clippy\clippy.log
 ## Hecho cuando
 
 - [ ]
-- [ ] Textos nuevos en los tres idiomas y tamaño del exe medido antes y después
+- [ ] Textos nuevos en los tres idiomas

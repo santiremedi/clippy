@@ -19,7 +19,6 @@ Closes #
 
 - `cargo clippy --features devtools -- -D warnings`:
 - Prueba a mano (`--test`, `--settings`, `--editor`…):
-- Exe release: X → Y bytes
 
 ## Notas
 
