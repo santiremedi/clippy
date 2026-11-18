@@ -9,7 +9,7 @@
 
 ## Por qué
 
-<!-- El problema que resuelve. Si hay issue, "Closes #N". -->
+<!-- El problema que resuelve y el issue que cierra. Solo las chore/ de versión o CI van sin issue. -->
 
 Closes #
 

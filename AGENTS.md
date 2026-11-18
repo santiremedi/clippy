@@ -20,6 +20,8 @@ Ver `README.md` para el mapa del código y los modos del exe.
 
 Todo cambio entra a `main` por PR; nunca se commitea directo en `main`.
 
+- **Primero el issue, después la PR.** Cada PR cierra su issue con `Closes #N`; si no existe, abrilo antes de
+  crear la rama (ver "Issues y PRs"). Solo las `chore/` de versión o CI van sin issue.
 - **Cada cosa nueva arranca de `main` al día y en un worktree propio**, nunca en el checkout principal:
 
   ```bash
