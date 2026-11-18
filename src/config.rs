@@ -7,6 +7,7 @@ use crate::log::app_dir;
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows::Win32::UI::Shell::{FOLDERID_Videos, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
 
 /// Qué imagen se graba. En config.json se guarda como "pantalla" / "juegos".
@@ -39,7 +40,13 @@ impl From<CaptureMode> for &'static str {
     }
 }
 
-pub const MAX_SECONDS: u32 = 300;
+/// Duración del clip que se puede elegir. El máximo real de cada PC sale de su RAM (`max_seconds`).
+pub const MIN_SECONDS: u32 = 5;
+pub const MAX_SECONDS: u32 = 600;
+/// Parte de la RAM total que puede ocupar el buffer en el peor caso (1/4).
+const RAM_SHARE: u64 = 4;
+/// Audio en crudo de cada canal en el buffer (bytes por segundo).
+const AUDIO_BYTES_PER_SEC: u64 = 192_000;
 /// Calidad de video (Mbps) que se puede elegir a mano en "Personalizada".
 pub const MIN_MBPS: u32 = 5;
 pub const MAX_MBPS: u32 = 150;
@@ -165,11 +172,11 @@ impl Config {
     }
 
     pub fn sanitize(&mut self) {
-        self.seconds = self.seconds.clamp(5, MAX_SECONDS);
         if !matches!(self.fps, 30 | 60 | 120) {
             self.fps = 60;
         }
         self.bitrate_mbps = self.bitrate_mbps.clamp(MIN_MBPS, MAX_MBPS);
+        self.seconds = self.seconds.clamp(MIN_SECONDS, self.max_seconds());
         if !RESOLUTIONS.contains(&self.resolution) {
             self.resolution = 0;
         }
@@ -211,9 +218,18 @@ impl Config {
     /// (solo con mucho movimiento), así que se cuenta una décima parte: da un número realista, no el máximo.
     pub fn typical_ram_mb(&self) -> u32 {
         let channels = self.game_audio as u32 + self.desktop_audio as u32 + self.mic_audio as u32;
-        let audio = channels * self.seconds * 192 / 1000;
+        let audio = channels * self.seconds * (AUDIO_BYTES_PER_SEC / 1000) as u32 / 1000;
         let video = self.bitrate_mbps * self.seconds / 80;
         (40 + audio + video).div_ceil(10) * 10
+    }
+
+    /// Duración máxima del clip en esta PC con la calidad elegida (múltiplo de 5 s): aunque el video
+    /// llegue al bitrate completo (todo en movimiento), el buffer no pasa de un cuarto de la RAM.
+    pub fn max_seconds(&self) -> u32 {
+        // Se cuentan los tres canales de audio: así prender el micrófono no recorta la duración.
+        let per_sec = self.bitrate_mbps as u64 * 125_000 + 3 * AUDIO_BYTES_PER_SEC;
+        let secs = (total_ram() / RAM_SHARE / per_sec).min(MAX_SECONDS as u64) as u32;
+        (secs / 5 * 5).max(MIN_SECONDS)
     }
 
     pub fn hotkey_mut(&mut self, a: GlobalAction) -> (&mut u32, &mut u32) {
@@ -224,6 +240,18 @@ impl Config {
             GlobalAction::OpenFolder => (&mut self.folder_vk, &mut self.folder_mods),
         }
     }
+}
+
+/// RAM física total (bytes). Si Windows no contesta, se asume una PC de 8 GB.
+fn total_ram() -> u64 {
+    static RAM: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *RAM.get_or_init(|| {
+        let mut m = MEMORYSTATUSEX { dwLength: size_of::<MEMORYSTATUSEX>() as u32, ..Default::default() };
+        match unsafe { GlobalMemoryStatusEx(&mut m) } {
+            Ok(()) if m.ullTotalPhys > 0 => m.ullTotalPhys,
+            _ => 8 << 30,
+        }
+    })
 }
 
 pub fn config_path() -> PathBuf {

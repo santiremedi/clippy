@@ -8,7 +8,7 @@ use crate::app::autostart;
 use crate::app::keys::hotkey_name;
 use crate::app::mode::Mode;
 use crate::app::update;
-use crate::config::{CaptureMode, GlobalAction, MAX_MBPS, MAX_SECONDS, MIN_MBPS, RESOLUTIONS};
+use crate::config::{CaptureMode, GlobalAction, MAX_MBPS, MAX_SECONDS, MIN_MBPS, MIN_SECONDS, RESOLUTIONS};
 
 /// Calidades de video de un toque (Mbps): baja, media y alta.
 const QUALITY: [u32; 3] = [15, 30, 60];
@@ -228,15 +228,20 @@ impl SettingsApp {
 
     fn recording_section(&mut self, ui: &mut egui::Ui) {
         section(ui, "Grabación", |ui| {
+            let max = self.cfg.max_seconds();
             row(ui, "Duración del clip", LABEL_W, |ui| {
                 ui.spacing_mut().slider_width = (ui.available_width() - 104.0).max(80.0);
                 ui.add(
-                    egui::Slider::new(&mut self.cfg.seconds, 5..=MAX_SECONDS)
+                    egui::Slider::new(&mut self.cfg.seconds, MIN_SECONDS..=max)
                         .step_by(5.0)
                         .custom_formatter(|v, _| fmt_secs(v as u32)),
                 );
             });
-            hint(ui, LABEL_W + 8.0, format!("Guarda los últimos {} antes de apretar la tecla.", fmt_secs(self.cfg.seconds)));
+            let mut why = format!("Guarda los últimos {} antes de apretar la tecla.", fmt_secs(self.cfg.seconds));
+            if max < MAX_SECONDS {
+                why += &format!(" Con esta calidad y la RAM de tu PC, llega hasta {}.", fmt_secs(max));
+            }
+            hint(ui, LABEL_W + 8.0, why);
             divider(ui);
             row(ui, "Calidad", LABEL_W, |ui| {
                 // 0 = "Personalizada": se elige el bitrate a mano.
@@ -255,6 +260,8 @@ impl SettingsApp {
                 });
                 hint(ui, LABEL_W + 8.0, "Más Mbps, mejor imagen y clips más pesados. A 1080p y 60 fps, 40 a 60 ya se ve muy bien; a 1440p o 4K, conviene 80 o más.");
             }
+            // Más calidad, menos segundos entran en la RAM: se recorta en el mismo cuadro.
+            self.cfg.seconds = self.cfg.seconds.min(self.cfg.max_seconds());
             row(ui, "Resolución", LABEL_W, |ui| {
                 let labels = RESOLUTIONS.map(|r| if r == 0 { "Como el monitor".to_string() } else { format!("{r}p") });
                 let opts: Vec<(u32, &str)> = RESOLUTIONS.iter().zip(&labels).map(|(&r, l)| (r, l.as_str())).collect();
@@ -280,7 +287,8 @@ impl SettingsApp {
             );
             divider(ui);
             row(ui, "Memoria", LABEL_W, |ui| {
-                ui.label(RichText::new(format!("Unos {} MB de RAM mientras graba", self.cfg.typical_ram_mb())).family(bold()).color(TEXT));
+                let ram = fmt_bytes(self.cfg.typical_ram_mb() as f64 * 1e6);
+                ui.label(RichText::new(format!("Unos {ram} de RAM mientras graba")).family(bold()).color(TEXT));
             });
             hint(ui, LABEL_W + 8.0, "Aproximado, como lo muestra el Administrador de tareas. Sube un poco con más segundos, más calidad o mucho movimiento en pantalla.");
             divider(ui);

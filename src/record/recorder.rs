@@ -223,10 +223,11 @@ fn session(cfg: &mut Config, rx: &Receiver<Cmd>, notify: &Notify, restarted: Opt
     let (w, h) = cfg.video_size((cap.width, cap.height));
     let mut enc = Encoder::new(&cap.device, cap.luid, w, h, fps, cfg.bitrate_mbps * 1_000_000)?;
     log(&format!(
-        "grabando {} a {w}x{h} @ {fps} fps, H.264 {} Mbps, buffer {} s, encoder: {}",
+        "grabando {} a {w}x{h} @ {fps} fps, H.264 {} Mbps, buffer {} s (máximo en esta PC: {} s), encoder: {}",
         cap.describe(),
         cfg.bitrate_mbps,
         cfg.seconds,
+        cfg.max_seconds(),
         enc.name
     ));
     notify(Event::Started(enc.name.clone()));
