@@ -16,6 +16,7 @@ use super::clock::{now_100ns, Timer};
 use super::convert::Converter;
 use super::encoder::{Encoder, Packet};
 use super::{game, mux};
+use crate::i18n::tr;
 use crate::config::{CaptureMode, Config};
 use crate::log::{file_stamp, log};
 use crate::mf::{frames_at, Mf};
@@ -97,7 +98,7 @@ fn thread_main(mut cfg: Config, rx: Receiver<Cmd>, notify: Notify) {
                 match rx.recv_timeout(Duration::from_secs(3)) {
                     Ok(Cmd::Stop) | Err(RecvTimeoutError::Disconnected) => break,
                     Ok(Cmd::Update(c)) => cfg = c,
-                    Ok(Cmd::Save) => notify(Event::SaveFailed("Clippy no está grabando en este momento".into())),
+                    Ok(Cmd::Save) => notify(Event::SaveFailed(tr!("Clippy no está grabando en este momento", "Clippy isn't recording right now", "O Clippy não está gravando agora").into())),
                     Err(RecvTimeoutError::Timeout) => {}
                 }
             }
@@ -392,17 +393,18 @@ fn mixed_audio(cfg: &Config, au: &AudioState, from: i64, to: i64) -> Vec<i16> {
 /// Arma el trabajo de guardado y lo lanza en otro hilo. Devuelve false si no había nada que guardar.
 fn save_clip(cfg: &Config, packets: &VecDeque<Packet>, enc: &Encoder, au: &AudioState, now: i64, frame_dur: i64, notify: &Notify) -> bool {
     let keep = cfg.seconds as i64 * 10_000_000;
+    let no_video = || tr!("todavía no hay video en el buffer", "there's no video in the buffer yet", "ainda não há vídeo no buffer");
     let fail = |m: &str| {
         notify(Event::SaveFailed(m.into()));
         false
     };
-    let Some(video_type) = enc.type_blob() else { return fail("todavía no hay video en el buffer") };
+    let Some(video_type) = enc.type_blob() else { return fail(no_video()) };
     let min = now - keep;
     let start = packets
         .iter()
         .rposition(|p| p.key && p.pts <= min)
         .or_else(|| packets.iter().position(|p| p.key));
-    let Some(start) = start else { return fail("todavía no hay video en el buffer") };
+    let Some(start) = start else { return fail(no_video()) };
     let pk: Vec<Packet> = packets.iter().skip(start).cloned().collect();
     log(&format!("clip: {} cuadros, {} fotogramas clave", pk.len(), pk.iter().filter(|p| p.key).count()));
     let base = pk[0].pts;

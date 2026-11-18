@@ -26,6 +26,7 @@ use eframe::egui::{self, Align, Align2, FontId, Layout, Margin, RichText, Stroke
 
 use crate::app::mode::Window;
 use crate::config::{self, Config};
+use crate::i18n::{tr, trf};
 use crate::mf::Mf;
 use crate::ui_kit::theme::*;
 use crate::ui_kit::watch::Watcher;
@@ -51,7 +52,7 @@ const PREVIEW_MIN_W: f32 = 320.0;
 
 pub fn run(file: Option<PathBuf>) {
     let win = Window::Editor;
-    let Some(_mutex) = single_instance(win.mutex(), win.title()) else { return };
+    let Some(_mutex) = single_instance(win.mutex(), || win.find()) else { return };
     let _ = eframe::run_native(
         win.title(),
         window_options(win.title(), MIN_SIZE),
@@ -301,7 +302,8 @@ impl EditorApp {
             self.scan();
         }
         if !bad.is_empty() {
-            self.message = Some((false, format!("No se pudo abrir: {}", bad.join(", ")), None));
+            let files = bad.join(", ");
+            self.message = Some((false, trf!("No se pudo abrir: {files}", "Couldn't open: {files}", "Não foi possível abrir: {files}"), None));
         }
     }
 
@@ -381,7 +383,9 @@ impl EditorApp {
     }
 
     fn import_dialog(&mut self) {
-        if let Some(files) = rfd::FileDialog::new().set_title("Importar videos").add_filter("Videos", &library::VIDEO_EXTS).pick_files() {
+        if let Some(files) = rfd::FileDialog::new()
+            .set_title(tr!("Importar videos", "Import videos", "Importar vídeos"))
+            .add_filter(tr!("Videos", "Videos", "Vídeos"), &library::VIDEO_EXTS).pick_files() {
             self.import(files, false);
         }
     }
@@ -415,13 +419,19 @@ impl EditorApp {
         let max_h = (ctx.screen_rect().height() - 340.0).clamp(220.0, 560.0);
         let mut done = false;
         let subtitle = match tab {
-            HelpTab::Keys => "Tocá un atajo para cambiarlo. Los que funcionan mientras jugás están en la ventana de Clippy.",
-            HelpTab::Guide => "Lo que conviene saber para editar rápido.",
+            HelpTab::Keys => tr!(
+                "Tocá un atajo para cambiarlo. Los que funcionan mientras jugás están en la ventana de Clippy.",
+                "Click a shortcut to change it. The ones that work while you play are in the Clippy window.",
+                "Clique em um atalho para mudá-lo. Os que funcionam enquanto você joga estão na janela do Clippy."
+            ),
+            HelpTab::Guide => tr!("Lo que conviene saber para editar rápido.", "What's worth knowing to edit fast.", "O que vale saber para editar rápido."),
         };
-        let x = modal(ctx, "keys", "Ajustes del editor", subtitle, 820.0, |ui| {
+        let title = tr!("Ajustes del editor", "Editor settings", "Configurações do editor");
+        let x = modal(ctx, "keys", title, subtitle, 820.0, |ui| {
             modal_body(ui, |ui| {
                 ui.allocate_ui(egui::vec2(320.0, 32.0), |ui| {
-                    if seg(ui, &mut tab, &[(HelpTab::Keys, "Atajos"), (HelpTab::Guide, "Cómo se usa")]) {
+                    let tabs = [(HelpTab::Keys, tr!("Atajos", "Shortcuts", "Atalhos")), (HelpTab::Guide, tr!("Cómo se usa", "How to use it", "Como usar"))];
+                    if seg(ui, &mut tab, &tabs) {
                         self.keys_editor.capturing = None;
                     }
                 });
@@ -432,12 +442,12 @@ impl EditorApp {
                 });
             });
             modal_footer(ui, |ui| {
-                if tab == HelpTab::Keys && button_sized(ui, "Restablecer atajos", Kind::Secondary, egui::vec2(0.0, 38.0)).clicked() {
+                if tab == HelpTab::Keys && button_sized(ui, tr!("Restablecer atajos", "Reset shortcuts", "Restaurar atalhos"), Kind::Secondary, egui::vec2(0.0, 38.0)).clicked() {
                     self.keys_editor.reset(&mut self.prefs.keys);
                     self.prefs.save();
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if button_sized(ui, "Listo", Kind::Primary, egui::vec2(120.0, 38.0)).clicked() {
+                    if button_sized(ui, tr!("Listo", "Done", "Pronto"), Kind::Primary, egui::vec2(120.0, 38.0)).clicked() {
                         done = true;
                     }
                 });
@@ -454,37 +464,67 @@ impl EditorApp {
     /// "Cómo se usa": lo que no se descubre solo (arrastres, Alt, clic derecho), con los atajos de ahora.
     fn guide(&self, ui: &mut egui::Ui) {
         let k = |a: Act| shortcuts::short(&self.prefs.keys, a);
+        let (magnet, freeze, marker) = (k(Act::Magnet), k(Act::Freeze), k(Act::Marker));
         let topics = [
             (
-                "Biblioteca",
-                "Un clic elige un video (con Ctrl se suman, con Shift se elige un tramo) y arrastrando elegís varios con un recuadro. Doble clic o el + lo suma a la línea de tiempo; también podés arrastrar videos del Explorador a la ventana. Con el clic derecho los movés a una carpeta o los mandás a la Papelera de reciclaje.".to_string(),
+                tr!("Biblioteca", "Library", "Biblioteca"),
+                tr!(
+                    "Un clic elige un video (con Ctrl se suman, con Shift se elige un tramo) y arrastrando elegís varios con un recuadro. Doble clic o el + lo suma a la línea de tiempo; también podés arrastrar videos del Explorador a la ventana. Con el clic derecho los movés a una carpeta o los mandás a la Papelera de reciclaje.",
+                    "A click selects a video (Ctrl adds more, Shift selects a range) and dragging selects several with a box. Double-click or the + adds it to the timeline; you can also drag videos from File Explorer into the window. Right-click to move them to a folder or send them to the Recycle Bin.",
+                    "Um clique escolhe um vídeo (com Ctrl você soma, com Shift escolhe um intervalo) e arrastando você escolhe vários com um retângulo. Clique duplo ou o + o adiciona à linha do tempo; você também pode arrastar vídeos do Explorador para a janela. Com o botão direito você os move para uma pasta ou os manda para a Lixeira."
+                )
+                .to_string(),
             ),
             (
-                "Recortar y mover",
-                "Arrastrá los bordes de un clip para recortarlo y del medio para cambiarlo de lugar o de pista. Con Alt apretado, el borde o la esquina cambia solo la imagen o solo el sonido.".to_string(),
+                tr!("Recortar y mover", "Trim and move", "Cortar e mover"),
+                tr!(
+                    "Arrastrá los bordes de un clip para recortarlo y del medio para cambiarlo de lugar o de pista. Con Alt apretado, el borde o la esquina cambia solo la imagen o solo el sonido.",
+                    "Drag a clip's edges to trim it and its middle to move it in time or to another track. Holding Alt, the edge or corner changes only the picture or only the sound.",
+                    "Arraste as bordas de um clipe para cortá-lo e o meio para mudá-lo de lugar ou de faixa. Com Alt apertado, a borda ou o canto muda só a imagem ou só o som."
+                )
+                .to_string(),
             ),
             (
-                "Fundidos",
-                "Arrastrá una esquina de arriba de un clip para que aparezca desde negro o se vaya a negro. Si toca a otro clip, se funden uno en el otro. Con el clic derecho sobre el fundido elegís su curva.".to_string(),
+                tr!("Fundidos", "Fades", "Transições"),
+                tr!(
+                    "Arrastrá una esquina de arriba de un clip para que aparezca desde negro o se vaya a negro. Si toca a otro clip, se funden uno en el otro. Con el clic derecho sobre el fundido elegís su curva.",
+                    "Drag a clip's top corner to fade it in from black or out to black. If it touches another clip, they crossfade. Right-click the fade to pick its curve.",
+                    "Arraste um canto de cima de um clipe para ele surgir do preto ou sumir no preto. Se encostar em outro clipe, um se funde no outro. Com o botão direito sobre a transição você escolhe a curva."
+                )
+                .to_string(),
             ),
             (
-                "Imán",
-                format!("Prendido ({}), los clips de cada pista quedan pegados uno detrás del otro. Apagado, quedan donde los soltás y, si se superponen, se funden.", k(Act::Magnet)),
+                tr!("Imán", "Magnet", "Ímã"),
+                trf!(
+                    "Prendido ({magnet}), los clips de cada pista quedan pegados uno detrás del otro. Apagado, quedan donde los soltás y, si se superponen, se funden.",
+                    "On ({magnet}), the clips on each track stay stuck one after another. Off, they stay where you drop them and, if they overlap, they crossfade.",
+                    "Ligado ({magnet}), os clipes de cada faixa ficam grudados um atrás do outro. Desligado, ficam onde você os solta e, se se sobrepõem, se fundem."
+                ),
             ),
             (
-                "Clic derecho en un clip",
-                "Dividir, duplicar, congelar el cuadro, cambiar la velocidad, girar, espejar o recortar la imagen, silenciar, separar el audio y eliminar.".to_string(),
+                tr!("Clic derecho en un clip", "Right-click a clip", "Botão direito em um clipe"),
+                tr!(
+                    "Dividir, duplicar, congelar el cuadro, cambiar la velocidad, girar, espejar o recortar la imagen, silenciar, separar el audio y eliminar.",
+                    "Split, duplicate, freeze the frame, change the speed, rotate, mirror or crop the picture, mute, unlink the audio and delete.",
+                    "Dividir, duplicar, congelar o quadro, mudar a velocidade, girar, espelhar ou recortar a imagem, silenciar, separar o áudio e excluir."
+                )
+                .to_string(),
             ),
             (
-                "Velocidad, imagen y proporción",
-                "En el panel de la derecha cambiás la velocidad del clip y su imagen. Debajo de la vista previa elegís la proporción del video: horizontal, vertical para el celular o cuadrado. Si un clip no tiene esa forma, elegís si entra entero o llena el cuadro.".to_string(),
+                tr!("Velocidad, imagen y proporción", "Speed, picture and aspect ratio", "Velocidade, imagem e proporção"),
+                tr!(
+                    "En el panel de la derecha cambiás la velocidad del clip y su imagen. Debajo de la vista previa elegís la proporción del video: horizontal, vertical para el celular o cuadrado. Si un clip no tiene esa forma, elegís si entra entero o llena el cuadro.",
+                    "In the right panel you change the clip's speed and picture. Below the preview you pick the video's aspect ratio: landscape, portrait for phones or square. If a clip doesn't have that shape, you choose whether it fits whole or fills the frame.",
+                    "No painel da direita você muda a velocidade do clipe e sua imagem. Abaixo da prévia você escolhe a proporção do vídeo: horizontal, vertical para o celular ou quadrado. Se um clipe não tiver esse formato, você escolhe se ele cabe inteiro ou preenche o quadro."
+                )
+                .to_string(),
             ),
             (
-                "Congelar y marcadores",
-                format!(
-                    "{} deja quieto el cuadro del cursor 3 segundos (arrastrá su borde para que dure más o menos). {} pone un marcador: tocalo para ir ahí, arrastralo para moverlo o sacalo con el clic derecho. Con el imán, los bordes se enganchan en los marcadores.",
-                    k(Act::Freeze),
-                    k(Act::Marker)
+                tr!("Congelar y marcadores", "Freeze and markers", "Congelar e marcadores"),
+                trf!(
+                    "{freeze} deja quieto el cuadro del cursor 3 segundos (arrastrá su borde para que dure más o menos). {marker} pone un marcador: tocalo para ir ahí, arrastralo para moverlo o sacalo con el clic derecho. Con el imán, los bordes se enganchan en los marcadores.",
+                    "{freeze} holds the frame at the playhead for 3 seconds (drag its edge to make it longer or shorter). {marker} adds a marker: click it to jump there, drag it to move it or remove it with a right-click. With the magnet on, edges snap to markers.",
+                    "{freeze} congela o quadro do cursor por 3 segundos (arraste a borda para durar mais ou menos). {marker} põe um marcador: clique para ir até ele, arraste para movê-lo ou tire-o com o botão direito. Com o ímã, as bordas grudam nos marcadores."
                 ),
             ),
         ];
@@ -510,9 +550,19 @@ impl EditorApp {
         }
         let exporting = self.job.is_some();
         let (title, body) = if exporting {
-            ("Se está exportando el video", "Si cerrás ahora, se cancela la exportación.")
+            (
+                tr!("Se está exportando el video", "The video is being exported", "O vídeo está sendo exportado"),
+                tr!("Si cerrás ahora, se cancela la exportación.", "If you close now, the export is canceled.", "Se você fechar agora, a exportação é cancelada."),
+            )
         } else {
-            ("¿Cerrar sin exportar?", "Tenés cambios en la línea de tiempo que todavía no exportaste. Si cerrás, se pierden.")
+            (
+                tr!("¿Cerrar sin exportar?", "Close without exporting?", "Fechar sem exportar?"),
+                tr!(
+                    "Tenés cambios en la línea de tiempo que todavía no exportaste. Si cerrás, se pierden.",
+                    "You have timeline changes you haven't exported yet. If you close, they're lost.",
+                    "Você tem mudanças na linha do tempo que ainda não exportou. Se fechar, elas se perdem."
+                ),
+            )
         };
         let mut action = 0;
         let x = modal(ctx, "close", title, "", 480.0, |ui| {
@@ -520,14 +570,14 @@ impl EditorApp {
                 ui.add(egui::Label::new(RichText::new(body).color(MUTED)).wrap());
             });
             modal_footer(ui, |ui| {
-                if button_sized(ui, "Seguir editando", Kind::Secondary, egui::vec2(0.0, 38.0)).clicked() {
+                if button_sized(ui, tr!("Seguir editando", "Keep editing", "Continuar editando"), Kind::Secondary, egui::vec2(0.0, 38.0)).clicked() {
                     action = 1;
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if !exporting && button_sized(ui, "Exportar", Kind::Primary, egui::vec2(120.0, 38.0)).clicked() {
+                    if !exporting && button_sized(ui, tr!("Exportar", "Export", "Exportar"), Kind::Primary, egui::vec2(120.0, 38.0)).clicked() {
                         action = 3;
                     }
-                    if button_sized(ui, "Cerrar sin guardar", Kind::Danger, egui::vec2(0.0, 38.0)).clicked() {
+                    if button_sized(ui, tr!("Cerrar sin guardar", "Close without saving", "Fechar sem salvar"), Kind::Danger, egui::vec2(0.0, 38.0)).clicked() {
                         action = 2;
                     }
                 });
@@ -568,7 +618,7 @@ impl EditorApp {
             let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop")));
             p.rect_filled(screen, 0.0, SCRIM.gamma_multiply(a));
             p.rect_stroke(screen.shrink(24.0), 16.0, Stroke::new(2.0_f32, WHITE.gamma_multiply(a)));
-            p.text(screen.center(), Align2::CENTER_CENTER, "Soltá los videos para agregarlos", FontId::proportional(24.0), WHITE.gamma_multiply(a));
+            p.text(screen.center(), Align2::CENTER_CENTER, tr!("Soltá los videos para agregarlos", "Drop the videos to add them", "Solte os vídeos para adicioná-los"), FontId::proportional(24.0), WHITE.gamma_multiply(a));
         }
     }
 }

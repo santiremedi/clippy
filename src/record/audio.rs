@@ -18,6 +18,7 @@ use windows::Win32::Media::Audio::*;
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL};
 use windows::Win32::System::Threading::CreateEventW;
 
+use crate::i18n::tr;
 use crate::mf::{frames_at, RATE};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -286,7 +287,7 @@ pub fn capture_devices() -> Vec<(String, String)> {
                 .OpenPropertyStore(STGM_READ)
                 .and_then(|ps| ps.GetValue(&PKEY_Device_FriendlyName))
                 .map(|p| p.to_string())
-                .unwrap_or_else(|_| "Micrófono".into());
+                .unwrap_or_else(|_| tr!("Micrófono", "Microphone", "Microfone").into());
             v.push((id, name));
         }
     }

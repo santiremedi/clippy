@@ -21,6 +21,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Media::MediaFoundation::*;
 
 use crate::clipcache::{Wave, WaveBuilder};
+use crate::i18n::tr;
 use crate::mf::{aac_type, frames_at, pcm_sample, pcm_type, sample_bytes, time_of, FRAME_BYTES};
 
 pub const VIDEO: u32 = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
@@ -118,7 +119,7 @@ impl Probe {
         } else if self.subtype == MFVideoFormat_HEVC {
             "HEVC"
         } else {
-            "otro"
+            tr!("otro", "other", "outro")
         }
     }
 
@@ -600,9 +601,18 @@ pub fn export(edit: &Edit, out: &Path, opts: &ExportOpts, prog: &Progress) -> Re
         if let Some(parts) = copy {
             let plain = edit.plain_audio(parts);
             export_copy(&edit, parts, info, &tmp, prog, plain)?;
-            return Ok(if plain { "sin recodificar: instantáneo y sin pérdida" } else { "video sin recodificar, audio ajustado" }.to_string());
+            return Ok(if plain {
+                tr!("sin recodificar: instantáneo y sin pérdida", "no re-encoding: instant and lossless", "sem recodificar: instantâneo e sem perda")
+            } else {
+                tr!("video sin recodificar, audio ajustado", "video not re-encoded, audio adjusted", "vídeo sem recodificar, áudio ajustado")
+            }
+            .to_string());
         }
-        let why = if opts.target.is_none() && edit.copy_parts(size).is_some() { "renderizado con la GPU para cortar exacto" } else { "renderizado con la GPU" };
+        let why = if opts.target.is_none() && edit.copy_parts(size).is_some() {
+            tr!("renderizado con la GPU para cortar exacto", "rendered on the GPU for exact cuts", "renderizado na GPU para cortar exato")
+        } else {
+            tr!("renderizado con la GPU", "rendered on the GPU", "renderizado na GPU")
+        };
         // Todo en la GPU; si esa placa o ese archivo no se dejan, se decodifica por CPU (con devtools,
         // CLIPPY_CPU=1 fuerza ese camino para probarlo).
         let gpu = d3d_manager().ok().filter(|_| !cfg!(feature = "devtools") || std::env::var_os("CLIPPY_CPU").is_none());

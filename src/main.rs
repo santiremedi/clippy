@@ -6,6 +6,7 @@ mod config;
 #[cfg(feature = "devtools")]
 mod devtools;
 mod editor;
+mod i18n;
 mod log;
 mod mf;
 mod record;
@@ -20,6 +21,8 @@ fn main() {
     if let Some(code) = devtools::run(&args) {
         std::process::exit(code);
     }
+    // Aplica el idioma elegido antes de abrir cualquier ventana (sus títulos ya van traducidos).
+    config::load();
     match Mode::parse(&args) {
         Mode::ApplyUpdate(target) => std::process::exit(app::update::apply(&target)),
         Mode::Settings => settings::run(),

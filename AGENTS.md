@@ -9,7 +9,9 @@ Ver `README.md` para el mapa del código y los modos del exe.
   antes y después de cada cambio. No sumes dependencias si Windows ya trae la API.
 - **Que se comporte como una app de verdad** (Medal, NVIDIA Instant Replay): nada hardcodeado
   para un juego, nada que el usuario tenga que configurar si se puede detectar.
-- **Textos de la interfaz en español rioplatense** ("vos", "tocá", "apretá"). Comentarios en español.
+- **Textos de la interfaz en tres idiomas**: español rioplatense ("vos", "tocá", "apretá"), inglés y
+  portugués de Brasil. Cada texto va donde se usa con `tr!(es, en, pt)` o, con valores, `trf!` (ver
+  `src/i18n.rs`); nunca un literal suelto en la interfaz. El registro (`clippy.log`) y los comentarios, en español.
 - **Commits y PRs sin atribución de IA**: nada de `Co-Authored-By`, "Generated with" ni links de sesión.
 - No publicar releases sin que el usuario lo pida.
 

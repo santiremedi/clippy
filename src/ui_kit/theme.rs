@@ -9,6 +9,8 @@ use eframe::egui::text::{LayoutJob, TextWrapping};
 use eframe::egui::{self, Align, Color32, CursorIcon, FontFamily, FontId, Galley, Layout, Margin, Pos2, Rect, RichText, Sense, Shape, Stroke, TextStyle, Vec2};
 use eframe::egui::emath::TSTransform;
 
+use crate::i18n::tr;
+
 pub const BG: Color32 = Color32::from_rgb(10, 10, 10);
 pub const CARD: Color32 = Color32::from_rgb(18, 18, 18);
 pub const LINE: Color32 = Color32::from_rgb(38, 38, 38);
@@ -782,7 +784,7 @@ fn close_button(ui: &mut egui::Ui) -> egui::Response {
     shapes.push(Shape::line_segment([c + egui::vec2(-s, -s), c + egui::vec2(s, s)], stroke));
     shapes.push(Shape::line_segment([c + egui::vec2(-s, s), c + egui::vec2(s, -s)], stroke));
     paint_pressed(ui, c, press(ui, &resp), PRESS_DEPTH_ICON, shapes);
-    resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text("Cerrar (Esc)")
+    resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text(tr!("Cerrar (Esc)", "Close (Esc)", "Fechar (Esc)"))
 }
 
 /// Ítem de navegación lateral (texto a la izquierda, resaltado si está activo).

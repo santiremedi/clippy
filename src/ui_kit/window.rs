@@ -3,15 +3,15 @@
 use eframe::egui;
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM};
 
-/// Si la ventana ya está abierta (en otro proceso de Clippy), la trae al frente y devuelve None.
-pub fn single_instance(mutex: windows::core::PCWSTR, title: &str) -> Option<windows::Win32::Foundation::HANDLE> {
+/// Si la ventana ya está abierta (en otro proceso de Clippy, `find` la busca), la trae al frente y devuelve None.
+pub fn single_instance(mutex: windows::core::PCWSTR, find: impl FnOnce() -> Option<HWND>) -> Option<windows::Win32::Foundation::HANDLE> {
     use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
     use windows::Win32::System::Threading::CreateMutexW;
     use windows::Win32::UI::WindowsAndMessaging::{IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE};
     unsafe {
         let m = CreateMutexW(None, true, mutex).ok();
         if GetLastError() == ERROR_ALREADY_EXISTS {
-            if let Some(h) = find_own_window(title) {
+            if let Some(h) = find() {
                 if IsIconic(h).as_bool() {
                     let _ = ShowWindow(h, SW_RESTORE);
                 }

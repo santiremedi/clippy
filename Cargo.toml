@@ -24,6 +24,7 @@ features = [
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Security",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",

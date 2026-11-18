@@ -11,6 +11,7 @@ use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::CoTaskMemFree;
 
+use crate::i18n::tr;
 use crate::log::log;
 
 #[derive(Clone)]
@@ -315,7 +316,11 @@ unsafe fn find_encoder(luid: LUID) -> Result<(IMFTransform, String)> {
             Err(e) => log(&format!("no se pudo activar {name}: {e}")),
         }
     }
-    bail!("tu GPU no tiene encoder por hardware para H.264")
+    bail!(tr!(
+        "tu GPU no tiene encoder por hardware para H.264",
+        "your GPU has no H.264 hardware encoder",
+        "sua GPU não tem encoder de hardware para H.264"
+    ))
 }
 
 unsafe fn activate_name(act: &IMFActivate) -> String {

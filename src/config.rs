@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::i18n::{self, tr, Language};
 use crate::log::app_dir;
 
 use windows::Win32::Foundation::HANDLE;
@@ -80,6 +81,8 @@ pub struct Config {
     /// Atajo global para abrir la carpeta de clips (vk 0 = sin asignar).
     pub folder_vk: u32,
     pub folder_mods: u32,
+    /// Idioma de la interfaz ("auto" = el de Windows).
+    pub language: Language,
 }
 
 /// Atajos globales: funcionan en cualquier momento, incluso dentro del juego.
@@ -106,10 +109,10 @@ impl GlobalAction {
 
     pub fn label(self) -> &'static str {
         match self {
-            GlobalAction::SaveClip => "Guardar clip",
-            GlobalAction::ToggleRecording => "Pausar / reanudar grabación",
-            GlobalAction::OpenEditor => "Abrir el editor",
-            GlobalAction::OpenFolder => "Abrir la carpeta de clips",
+            GlobalAction::SaveClip => tr!("Guardar clip", "Save clip", "Salvar clipe"),
+            GlobalAction::ToggleRecording => tr!("Pausar / reanudar grabación", "Pause / resume recording", "Pausar / retomar gravação"),
+            GlobalAction::OpenEditor => tr!("Abrir el editor", "Open the editor", "Abrir o editor"),
+            GlobalAction::OpenFolder => tr!("Abrir la carpeta de clips", "Open the clips folder", "Abrir a pasta de clipes"),
         }
     }
 }
@@ -140,6 +143,7 @@ impl Default for Config {
             editor_mods: 0,
             folder_vk: 0,
             folder_mods: 0,
+            language: Language::Auto,
         }
     }
 }
@@ -234,12 +238,14 @@ pub fn exists() -> bool {
     config_path().exists()
 }
 
+/// Lee config.json y aplica su idioma a este proceso (así cada ventana y la bandeja lo siguen al recargar).
 pub fn load() -> Config {
     let mut cfg: Config = std::fs::read_to_string(config_path())
         .ok()
         .and_then(|s| serde_json::from_str(s.trim_start_matches('\u{feff}')).ok())
         .unwrap_or_default();
     cfg.sanitize();
+    i18n::set(cfg.language);
     cfg
 }
 
