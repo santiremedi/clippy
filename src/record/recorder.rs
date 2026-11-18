@@ -14,7 +14,7 @@ use super::audio::{self, Audio, AudioBuf, Source};
 use super::capture::{Aim, Capture};
 use super::clock::{now_100ns, Timer};
 use super::convert::Converter;
-use super::encoder::{Encoder, Packet};
+use super::encoder::{Device, Encoder, Packet};
 use super::{game, mux};
 use crate::i18n::tr;
 use crate::config::{CaptureMode, Config};
@@ -32,7 +32,9 @@ pub enum Cmd {
 /// La bandeja solo usa algunos datos; los modos de prueba (`devtools`) los imprimen todos.
 #[cfg_attr(not(feature = "devtools"), allow(dead_code))]
 pub enum Event {
-    Started(String),
+    /// Empezó a grabar, codificando con esto.
+    Started(Device),
+
     Saved(std::path::PathBuf),
     SaveFailed(String),
     Error(String),
@@ -87,14 +89,19 @@ fn thread_main(mut cfg: Config, rx: Receiver<Cmd>, notify: Notify) {
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     }
     let mut target = None;
+    // El último error avisado: mientras se repita en cada reintento, no se vuelve a anotar ni avisar.
+    let mut failing = None;
     loop {
-        match session(&mut cfg, &rx, &notify, target.take()) {
+        match session(&mut cfg, &rx, &notify, target.take(), &mut failing) {
             Ok(End::Stop) => break,
             Ok(End::Restart(m)) => target = Some(m),
             Err(e) => {
-                log(&format!("error de captura: {e:?}"));
-                // Cada intento fallido avisa; la bandeja muestra el globo solo al pasar de grabar a error.
-                notify(Event::Error(e.to_string()));
+                let msg = e.to_string();
+                if failing.as_ref() != Some(&msg) {
+                    log(&format!("error de captura: {e:?} (se reintenta cada 3 s)"));
+                    notify(Event::Error(msg.clone()));
+                    failing = Some(msg);
+                }
                 match rx.recv_timeout(Duration::from_secs(3)) {
                     Ok(Cmd::Stop) | Err(RecvTimeoutError::Disconnected) => break,
                     Ok(Cmd::Update(c)) => cfg = c,
@@ -213,16 +220,17 @@ const AIM_EVERY: i64 = 2_500_000;
 const PROBE_AFTER: i64 = 20_000_000;
 
 /// `restarted`: el monitor del juego que pidió reiniciar (ya se grabó a su resolución; no se vuelve a pedir).
-fn session(cfg: &mut Config, rx: &Receiver<Cmd>, notify: &Notify, restarted: Option<HMONITOR>) -> Result<End> {
-    let fps = cfg.fps.max(1);
-    let frame_dur = 10_000_000i64 / fps as i64;
-
+/// `failing`: el error que se avisó; se olvida al volver a grabar.
+fn session(cfg: &mut Config, rx: &Receiver<Cmd>, notify: &Notify, restarted: Option<HMONITOR>, failing: &mut Option<String>) -> Result<End> {
     let mut game = game::Detector::default();
     game.poll(0);
     // Qué monitor grabar: el del juego; si no hay juego, el de la ventana activa; si no, el principal.
     let mut cap = Capture::new(restarted.or_else(|| game.monitor()).or_else(game::active_monitor))?;
     let (w, h) = cfg.video_size((cap.width, cap.height));
-    let mut enc = Encoder::new(&cap.device, cap.luid, w, h, fps, cfg.bitrate_mbps * 1_000_000)?;
+    let mut enc = Encoder::new(&cap.device, cap.luid, w, h, cfg.fps.max(1), cfg.bitrate_mbps * 1_000_000)?;
+    // El encoder por procesador puede pedir menos que lo elegido.
+    let (w, h, fps) = (enc.width, enc.height, enc.fps);
+    let frame_dur = 10_000_000i64 / fps as i64;
     log(&format!(
         "grabando {} a {w}x{h} @ {fps} fps, H.264 {} Mbps, buffer {} s (máximo en esta PC: {} s), encoder: {}",
         cap.describe(),
@@ -231,7 +239,8 @@ fn session(cfg: &mut Config, rx: &Receiver<Cmd>, notify: &Notify, restarted: Opt
         cfg.max_seconds(),
         enc.name
     ));
-    notify(Event::Started(enc.name.clone()));
+    *failing = None;
+    notify(Event::Started(enc.device.clone()));
 
     let mut conv: Option<Converter> = None;
     let timer = Timer::new();

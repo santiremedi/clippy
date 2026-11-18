@@ -155,6 +155,16 @@ impl Default for Config {
     }
 }
 
+/// `full` achicado sin deformar (en pares) para que el lado corto no pase de `short`.
+pub fn fit_short(full: (u32, u32), short: u32) -> (u32, u32) {
+    let s = full.0.min(full.1);
+    if short >= s {
+        return full;
+    }
+    let k = |x: u32| ((x as u64 * short as u64 / s as u64) as u32).max(2) & !1;
+    (k(full.0), k(full.1))
+}
+
 impl Config {
     /// Valores que obligan a reiniciar la captura de video si cambian (se pierde el buffer).
     pub fn video_params(&self) -> (bool, u32, u32, u32) {
@@ -163,12 +173,10 @@ impl Config {
 
     /// Tamaño del video (pares) para un monitor que se grabaría a `full`, con la resolución elegida.
     pub fn video_size(&self, full: (u32, u32)) -> (u32, u32) {
-        let short = full.0.min(full.1);
-        if self.resolution == 0 || self.resolution >= short {
-            return full;
+        match self.resolution {
+            0 => full,
+            r => fit_short(full, r),
         }
-        let k = |x: u32| ((x as u64 * self.resolution as u64 / short as u64) as u32).max(2) & !1;
-        (k(full.0), k(full.1))
     }
 
     pub fn audio_on(&self) -> bool {

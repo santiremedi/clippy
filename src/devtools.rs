@@ -109,7 +109,7 @@ fn test_mode(args: &[String]) -> i32 {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while std::time::Instant::now() < deadline {
         match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(crate::record::recorder::Event::Started(n)) => println!("encoder: {n}"),
+            Ok(crate::record::recorder::Event::Started(d)) => println!("encoder: {d:?}"),
             Ok(crate::record::recorder::Event::Game(g)) => println!("juego: {}", g.as_deref().unwrap_or("ninguno")),
             Ok(crate::record::recorder::Event::Saved(p)) => {
                 println!("OK {}", p.display());

@@ -3,5 +3,6 @@
 pub mod autostart;
 pub mod keys;
 pub mod mode;
+pub mod status;
 pub mod tray;
 pub mod update;

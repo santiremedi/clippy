@@ -16,6 +16,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::autostart;
 use super::keys::hotkey_name;
+use super::status::{self, Status};
 use super::mode::{Mode, Window, TRAY_CLASS, TRAY_MUTEX, WM_HOTKEY_SUSPEND, WM_REC_EVENT, WM_RELOAD, WM_TRAY, WM_UPDATE};
 use super::update;
 use crate::config::{self, Config, GlobalAction};
@@ -47,7 +48,8 @@ struct App {
     rec: Option<Recorder>,
     icon_on: HICON,
     icon_off: HICON,
-    error: Option<String>,
+    /// Con qué graba y por qué no puede (lo muestra también la ventana principal).
+    status: Status,
     /// Juego detectado por la grabadora (para el tooltip).
     game: Option<String>,
 }
@@ -100,10 +102,11 @@ pub fn run(background: bool) {
             rec: None,
             icon_on: icon::hicon(size, true),
             icon_off: icon::hicon(size, false),
-            error: None,
+            status: Status::default(),
             game: None,
         };
         app.tray(NIM_ADD);
+        status::save(&app.status);
         APP.with(|a| *a.borrow_mut() = Some(app));
         with_app(|a| a.apply(cfg.clone(), true));
         log("Clippy iniciado");
@@ -165,7 +168,7 @@ impl App {
         self.cfg = new;
         if restart || (self.cfg.enabled && self.rec.is_none()) {
             self.rec = None; // detiene la grabadora anterior
-            self.error = None;
+            self.set_status(Status::default());
             self.game = None;
             if self.cfg.enabled {
                 self.rec = Some(Recorder::start(self.cfg.clone(), notifier(self.hwnd)));
@@ -219,7 +222,7 @@ impl App {
     }
 
     fn tip(&self) -> String {
-        if let Some(e) = &self.error {
+        if let Some(e) = &self.status.error {
             return trf!("Clippy · error: {e}", "Clippy · error: {e}", "Clippy · erro: {e}");
         }
         if self.cfg.enabled {
@@ -247,7 +250,7 @@ impl App {
         let mut n = self.nid();
         n.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         n.uCallbackMessage = WM_TRAY;
-        n.hIcon = if self.cfg.enabled && self.error.is_none() { self.icon_on } else { self.icon_off };
+        n.hIcon = if self.cfg.enabled && self.status.error.is_none() { self.icon_on } else { self.icon_off };
         set_wstr(&mut n.szTip, &self.tip());
         unsafe {
             let _ = Shell_NotifyIconW(op, &n);
@@ -278,10 +281,18 @@ impl App {
         self.apply(c, false);
     }
 
+    /// Cambia el estado y, si es otro, lo deja escrito para la ventana principal.
+    fn set_status(&mut self, s: Status) {
+        if s != self.status {
+            self.status = s;
+            status::save(&self.status);
+        }
+    }
+
     fn handle_event(&mut self, ev: Event) {
         match ev {
-            Event::Started(_) => {
-                self.error = None;
+            Event::Started(d) => {
+                self.set_status(Status { device: Some(d), error: None });
                 self.tray(NIM_MODIFY);
             }
             Event::Game(g) => {
@@ -291,9 +302,9 @@ impl App {
             Event::Saved(_) => {} // el sonido lo reproduce la grabadora al instante
             Event::SaveFailed(e) => self.balloon(tr!("No se pudo guardar el clip", "Couldn't save the clip", "Não foi possível salvar o clipe"), &e, true),
             Event::Error(e) => {
-                // La grabadora avisa en cada reintento: el globo sale solo al pasar de grabar a error.
-                let new = self.error.is_none();
-                self.error = Some(e.clone());
+                // El globo sale al pasar de grabar a error, no si cambia el motivo mientras se reintenta.
+                let new = self.status.error.is_none();
+                self.set_status(Status { device: None, error: Some(e.clone()) });
                 self.tray(NIM_MODIFY);
                 if new {
                     self.balloon(

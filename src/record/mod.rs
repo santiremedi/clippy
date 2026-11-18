@@ -9,3 +9,5 @@ mod game;
 mod mux;
 mod screen;
 pub mod recorder;
+
+pub use encoder::{Device, CPU_MAX_FPS, CPU_MAX_SHORT};

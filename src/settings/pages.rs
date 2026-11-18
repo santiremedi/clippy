@@ -14,7 +14,7 @@ use crate::i18n::{tr, trf, Lang, Language};
 /// Calidades de video de un toque (Mbps): baja, media y alta.
 const QUALITY: [u32; 3] = [15, 30, 60];
 use crate::log::app_dir;
-use crate::record::audio;
+use crate::record::{audio, Device, CPU_MAX_FPS, CPU_MAX_SHORT};
 use crate::ui_kit::sound;
 use crate::ui_kit::theme::*;
 use crate::ui_kit::window::open_folder;
@@ -39,8 +39,12 @@ impl SettingsApp {
         egui::Frame::none().fill(BG).stroke(egui::Stroke::new(1.0_f32, LINE)).rounding(8.0).inner_margin(Margin::same(12.0)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             if self.main_running {
+                // Si no puede grabar se ve acá, en todas las páginas, con el motivo (la bandeja avisa una sola vez).
+                let error = self.recorder.error.clone().filter(|_| self.cfg.enabled);
                 ui.horizontal(|ui| {
-                    let (txt, col) = if self.cfg.enabled {
+                    let (txt, col) = if error.is_some() {
+                        (tr!("No puede grabar", "Can't record", "Não consegue gravar"), DANGER)
+                    } else if self.cfg.enabled {
                         (tr!("Grabando", "Recording", "Gravando"), TEXT)
                     } else {
                         (tr!("En pausa", "Paused", "Pausado"), MUTED)
@@ -52,13 +56,15 @@ impl SettingsApp {
                         toggle(ui, &mut self.cfg.enabled).on_hover_text(if self.cfg.enabled { tr!("Pausar", "Pause", "Pausar") } else { tr!("Reanudar", "Resume", "Retomar") });
                     });
                 });
-                let sub = if self.cfg.enabled {
+                let sub = if let Some(e) = error {
+                    trf!("{e} Clippy vuelve a intentar solo.", "{e} Clippy keeps trying by itself.", "{e} O Clippy tenta de novo sozinho.")
+                } else if self.cfg.enabled {
                     let (key, secs) = (hotkey_name(self.cfg.hotkey_vk, self.cfg.hotkey_mods), fmt_secs(self.cfg.seconds));
                     trf!("{key} guarda los últimos {secs}", "{key} saves the last {secs}", "{key} salva os últimos {secs}")
                 } else {
                     tr!("No se está guardando nada", "Nothing is being saved", "Nada está sendo salvo").into()
                 };
-                ui.label(RichText::new(sub).size(12.5).color(MUTED));
+                ui.add(egui::Label::new(RichText::new(sub).size(12.5).color(MUTED)).wrap());
             } else {
                 ui.label(RichText::new(tr!("La grabadora está cerrada", "The recorder is closed", "O gravador está fechado")).color(TEXT));
                 ui.add_space(4.0);
@@ -263,6 +269,26 @@ impl SettingsApp {
         });
     }
 
+    /// Con qué se codifica, mientras graba. Si es el procesador, por qué y qué cambia.
+    fn encoder_row(&self, ui: &mut egui::Ui) {
+        let Some(d) = self.recorder.device.as_ref().filter(|_| self.main_running && self.cfg.enabled) else { return };
+        row(ui, tr!("Codifica con", "Encoding with", "Codifica com"), LABEL_W, |ui| {
+            ui.label(RichText::new(d.label()).color(TEXT));
+        });
+        if *d == Device::Cpu {
+            let (p, fps) = (CPU_MAX_SHORT, CPU_MAX_FPS);
+            hint(
+                ui,
+                LABEL_W + 8.0,
+                trf!(
+                    "Tu placa de video no tiene codificador de video, así que Clippy usa el procesador y graba hasta {p}p a {fps} cuadros por segundo para no frenar el juego.",
+                    "Your graphics card has no video encoder, so Clippy uses the processor and records up to {p}p at {fps} frames per second so it doesn't slow down your game.",
+                    "Sua placa de vídeo não tem codificador de vídeo, então o Clippy usa o processador e grava até {p}p a {fps} quadros por segundo para não deixar o jogo lento."
+                ),
+            );
+        }
+    }
+
     fn recording_section(&mut self, ui: &mut egui::Ui) {
         section(ui, tr!("Grabación", "Recording", "Gravação"), |ui| {
             let max = self.cfg.max_seconds();
@@ -350,6 +376,7 @@ impl SettingsApp {
                     "Vídeo MP4 (H.264): roda em qualquer PC, celular, Discord ou WhatsApp."
                 ),
             );
+            self.encoder_row(ui);
             divider(ui);
             row(ui, tr!("Qué se graba", "What's recorded", "O que é gravado"), LABEL_W, |ui| {
                 let opts = [

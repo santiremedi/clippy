@@ -2,7 +2,8 @@
 
 Grabador de repeticiones instantáneas para Windows, ultraliviano: graba siempre en segundo plano
 (en RAM) y con una tecla (F9) guarda los últimos segundos como MP4. Todo el video pasa por la GPU
-(DXGI Desktop Duplication → D3D11 NV12 → encoder H.264 por hardware de Media Foundation).
+(DXGI Desktop Duplication → D3D11 NV12 → encoder H.264 por hardware de Media Foundation). Si la placa no
+tiene encoder de video, usa el H.264 de Windows por procesador, hasta 1080p a 30 fps.
 
 Descarga y novedades en [clpy.vercel.app](https://clpy.vercel.app). Las versiones se publican en
 los [Releases](https://github.com/santiremedi/clippy/releases) de este repo, que es donde las busca
@@ -37,7 +38,7 @@ Solo con `--features devtools`:
 
 | Argumentos | Qué hace |
 | --- | --- |
-| `--test <seg> <carpeta> [game\|desktop\|mic\|juegos\|720\|1080\|1440]` | Graba, guarda un clip y sale (imprime el encoder y el juego detectado; un número elige la resolución del clip). |
+| `--test <seg> <carpeta> [game\|desktop\|mic\|juegos\|720\|1080\|1440]` | Graba, guarda un clip y sale (imprime el encoder y el juego detectado; un número elige la resolución del clip). Con la variable `CLIPPY_CPU_ENCODER=1`, codifica con el procesador como en una placa sin encoder. |
 | `--test-mic` | Cuánto audio entrega cada micrófono en 3 s. |
 | `--test-download` | Descarga la versión publicada como el botón "Actualizar". |
 | `--test-export`, `--test-frame`, `--test-strip` | Pruebas del editor (ver `src/editor/devtools.rs`). |
@@ -56,6 +57,7 @@ src/
     mode.rs        modos, argumentos, candados, títulos de ventana, mensajes a la bandeja
     tray.rs        bandeja, atajos globales, controla la grabadora
     update.rs      actualizaciones (una consulta por día a Releases, como mucho)
+    status.rs      recorder.json: con qué graba y por qué no puede (lo lee la ventana principal)
     autostart.rs   inicio con Windows (HKCU\...\Run)
     keys.rs        nombres de teclas Win32
   record/          grabación

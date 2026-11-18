@@ -9,6 +9,7 @@ use eframe::egui::{self, Align, Layout, Margin, RichText};
 use crate::app::autostart;
 use crate::app::keys::{self, hotkey_name};
 use crate::app::mode::{close_tray, find_tray, post_tray, Window, WM_HOTKEY_SUSPEND, WM_RELOAD};
+use crate::app::status::{self, Status};
 use crate::app::update;
 use crate::config::{self, Config, GlobalAction};
 use crate::i18n::{self, tr, trf};
@@ -59,6 +60,8 @@ struct SettingsApp {
     ignore_clicks_until: Instant,
     autostart: bool,
     main_running: bool,
+    /// Con qué graba la grabadora y por qué no puede.
+    recorder: Status,
     /// Avisa cuando cambia algo afuera (config, clips, la grabadora): no se sondea.
     watcher: Watcher,
     mtime: Option<SystemTime>,
@@ -108,6 +111,7 @@ impl SettingsApp {
             ignore_clicks_until: Instant::now(),
             autostart: autostart::enabled(),
             main_running: false,
+            recorder: Status::default(),
             watcher,
             mtime: config::config_mtime(),
             clips: (0, None),
@@ -235,6 +239,7 @@ impl SettingsApp {
             return;
         }
         self.main_running = find_tray().is_some();
+        self.recorder = status::load();
         // La grabadora escribe update.json cuando encuentra una versión nueva: el botón aparece al toque,
         // aunque esta ventana se haya abierto antes de que terminara la consulta.
         if !self.updating {
