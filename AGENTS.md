@@ -14,8 +14,39 @@ Ver `README.md` para el mapa del código y los modos del exe.
   `src/i18n.rs`); nunca un literal suelto en la interfaz. Los errores que llegan a la pantalla se traducen
   donde se crean (`bail!(tr!(…))`), así que en `clippy.log` quedan en el idioma de la interfaz; el resto del
   registro y los comentarios, en español.
-- **Commits y PRs sin atribución de IA**: nada de `Co-Authored-By`, "Generated with" ni links de sesión.
 - No publicar releases sin que el usuario lo pida.
+
+## Flujo de trabajo
+
+Todo cambio entra a `main` por PR; nunca se commitea directo en `main`.
+
+- **Cada cosa nueva arranca de `main` al día y en un worktree propio**, nunca en el checkout principal:
+
+  ```bash
+  git switch main && git pull --ff-only
+  git worktree add .claude/worktrees/<nombre> -b <tipo>/<nombre> main
+  ```
+
+  Si el checkout principal está en otra rama o tiene cambios sin commitear, no lo toques: `git fetch origin`
+  y creá el worktree desde `origin/main`.
+- **Ramas `<tipo>/<nombre>`**: `feature/` (algo nuevo), `fix/` (un bug), `chore/` (versiones, CI,
+  dependencias, limpieza) o `docs/` (solo documentación). `<nombre>` corto, en español y en kebab-case, dice
+  qué cambia (`feature/cursor-en-escritorio`, `fix/encoder-1366`); el worktree se llama igual.
+- Una rama por cambio y PRs chicos. El primer `cargo build` en un worktree nuevo compila todo de cero.
+- Cuando la PR se mergea, borrá el worktree: `git worktree remove .claude/worktrees/<nombre>`.
+- **Commits y PRs sin atribución de IA**: nada de `Co-Authored-By`, "Generated with" ni links de sesión.
+
+## Issues y PRs
+
+Todas siguen las plantillas de `.github/`, ya sea que las abra una persona en GitHub o un agente con `gh`.
+Con `gh`, armá el cuerpo con las mismas secciones que la plantilla.
+
+- **Issues**: `.github/ISSUE_TEMPLATE/bug.md` (algo no anda) y `mejora.md` (algo nuevo o distinto). El título
+  dice el síntoma o el resultado, con el dato que lo identifica: "El encoder falla con resoluciones que no son
+  múltiplo de 16 (1366×768, 0x80004005)".
+- **PRs**: `.github/pull_request_template.md`. El título, en español y sin prefijos tipo `feat:`, dice el
+  comportamiento nuevo: "Duración máxima de clips según la RAM, hasta 10 min".
+- Bullets cortos, sin repetir el diff y sin secciones vacías: la opcional que no aplica se borra.
 
 ## Dónde va cada cosa
 
