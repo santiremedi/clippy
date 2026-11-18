@@ -6,17 +6,24 @@
 //! Se captura en el formato del dispositivo (float, con sus canales) y Clippy lo baja a estéreo:
 //! la conversión de Windows de 5.1/7.1 a estéreo atenúa el sonido 10 dB o más.
 //! Se guarda en RAM como PCM 48 kHz estéreo y se mezcla/comprime a AAC recién al guardar.
+//!
+//! Cada captura lee sus paquetes en un hilo propio apenas llegan (cada 10 ms). La captura por proceso guarda
+//! muy poco audio: leída desde el hilo de video, a 30 fps (cada 33 ms) Windows tiraba paquetes sin avisar y
+//! el clip salía entrecortado.
 
 use std::collections::VecDeque;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use windows::core::{implement, Interface, GUID, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Media::Audio::*;
-use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL};
-use windows::Win32::System::Threading::CreateEventW;
+use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED};
+use windows::Win32::System::Threading::{
+    CreateEventW, GetCurrentThread, SetThreadPriority, WaitForSingleObject, THREAD_PRIORITY_TIME_CRITICAL,
+};
 
 use crate::i18n::tr;
 use crate::mf::{frames_at, RATE};
@@ -33,16 +40,37 @@ pub enum Source {
     Mic(String),
 }
 
+/// Una captura abierta. Su hilo lee los paquetes y `poll` los pasa al buffer desde el hilo de grabación.
 pub struct Audio {
+    pub source: Source,
+    pub device_id: String,
+    shared: Arc<Shared>,
+}
+
+/// Lo que comparten la captura y su hilo.
+#[derive(Default)]
+struct Shared {
+    /// Paquetes leídos que todavía no pasaron al buffer, y el error si la lectura se cortó.
+    read: Mutex<(Vec<Packet>, Option<anyhow::Error>)>,
+    stop: AtomicBool,
+}
+
+/// Un paquete de WASAPI ya en estéreo (None = silencio), con su marca QPC (0 si no trae).
+struct Packet {
+    qpc: i64,
+    frames: usize,
+    stereo: Option<Vec<i16>>,
+}
+
+/// El cliente de WASAPI. Se abre en el hilo de grabación (multihilo de COM, igual que el de la captura)
+/// y después lo usa solo el hilo de su captura.
+struct Client {
     client: IAudioClient,
     cap: IAudioCaptureClient,
     event: HANDLE,
-    pub source: Source,
-    pub device_id: String,
+    device_id: String,
     /// Cuánto de cada canal capturado va a la izquierda y a la derecha.
     downmix: Vec<(f32, f32)>,
-    /// Búfer reutilizado para el estéreo de cada paquete.
-    stereo: Vec<i16>,
 }
 
 const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
@@ -86,105 +114,152 @@ fn downmix(channels: u16, mask: u32) -> Vec<(f32, f32)> {
 }
 
 impl Audio {
+    /// Abre la captura y le deja la lectura a un hilo propio.
     pub fn open(source: Source) -> Result<Self> {
-        unsafe {
-            let mic = matches!(source, Source::Mic(_));
-            let (client, device_id) = match &source {
-                Source::System => {
-                    let dev = default_device()?;
-                    let id = device_id(&dev);
-                    (dev.Activate::<IAudioClient>(CLSCTX_ALL, None)?, id)
-                }
-                Source::Only(pid) => (activate_process(*pid, true)?, String::new()),
-                Source::AllBut(pid) => (activate_process(*pid, false)?, String::new()),
-                Source::Mic(id) => {
-                    let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-                    let dev = if id.is_empty() {
-                        en.GetDefaultAudioEndpoint(eCapture, eConsole)?
-                    } else {
-                        en.GetDevice(&windows::core::HSTRING::from(id.as_str()))?
-                    };
-                    (dev.Activate::<IAudioClient>(CLSCTX_ALL, None)?, device_id(&dev))
-                }
-            };
-            let loopback = if mic { 0 } else { AUDCLNT_STREAMFLAGS_LOOPBACK };
-            let event = CreateEventW(None, false, false, PCWSTR::null())?;
-            // Los canales del dispositivo (la captura por proceso no tiene formato propio: usa el de la
-            // salida por defecto). Windows solo cambia la frecuencia a 48 kHz; los canales los baja Clippy.
-            let (channels, mask) = match &source {
-                Source::Only(_) | Source::AllBut(_) => mix_layout(&default_device()?.Activate::<IAudioClient>(CLSCTX_ALL, None)?),
-                _ => mix_layout(&client),
-            };
-            let format = WAVEFORMATEXTENSIBLE {
-                Format: WAVEFORMATEX {
-                    wFormatTag: WAVE_FORMAT_EXTENSIBLE,
-                    nChannels: channels,
-                    nSamplesPerSec: RATE as u32,
-                    nAvgBytesPerSec: RATE as u32 * channels as u32 * 4,
-                    nBlockAlign: channels * 4,
-                    wBitsPerSample: 32,
-                    cbSize: 22,
-                },
-                Samples: WAVEFORMATEXTENSIBLE_0 { wValidBitsPerSample: 32 },
-                dwChannelMask: if mask == 0 { (1u32 << channels) - 1 } else { mask },
-                SubFormat: SUBTYPE_IEEE_FLOAT,
-            };
-            client.Initialize(
-                AUDCLNT_SHAREMODE_SHARED,
-                loopback
-                    | AUDCLNT_STREAMFLAGS_EVENTCALLBACK
-                    | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
-                    | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
-                2_000_000,
-                0,
-                &format.Format,
-                None,
-            )?;
-            client.SetEventHandle(event)?;
-            let cap: IAudioCaptureClient = client.GetService()?;
-            client.Start()?;
-            Ok(Self { client, cap, event, source, device_id, downmix: downmix(channels, mask), stereo: Vec::new() })
-        }
-    }
-
-    /// Vacía los paquetes disponibles y los ubica en la línea de tiempo según su marca QPC.
-    pub fn poll(&mut self, buf: &mut AudioBuf, t0: i64) -> Result<()> {
-        unsafe {
-            loop {
-                if self.cap.GetNextPacketSize()? == 0 {
+        let client = unsafe { Client::open(&source)? };
+        let device_id = client.device_id.clone();
+        let shared = Arc::new(Shared::default());
+        let s = shared.clone();
+        std::thread::Builder::new().name("audio".into()).spawn(move || unsafe {
+            let com = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+            // Solo espera eventos y baja cada paquete a estéreo: la prioridad no le suma CPU, solo
+            // hace que llegue a tiempo aunque el juego ocupe el procesador.
+            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+            let mut got = Vec::new();
+            while !s.stop.load(Ordering::Relaxed) {
+                // Con tope: la captura por proceso no avisa nada mientras el juego está callado.
+                WaitForSingleObject(client.event, 100);
+                let r = client.read(&mut got);
+                let mut read = s.read.lock().unwrap();
+                read.0.append(&mut got);
+                if let Err(e) = r {
+                    read.1 = Some(e);
                     break;
                 }
-                let mut data = std::ptr::null_mut();
-                let mut frames = 0u32;
-                let mut flags = 0u32;
-                let mut qpc = 0u64;
-                self.cap.GetBuffer(&mut data, &mut frames, &mut flags, None, Some(&mut qpc))?;
-                let pos = if qpc != 0 { frames_at(qpc as i64 - t0) } else { buf.end() };
-                if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 || data.is_null() {
-                    buf.push_at(pos, None, frames as usize);
-                } else {
-                    let ch = self.downmix.len();
-                    let src = std::slice::from_raw_parts(data as *const f32, frames as usize * ch);
-                    self.stereo.clear();
-                    for f in src.chunks_exact(ch) {
-                        let (mut l, mut r) = (0.0f32, 0.0f32);
-                        for (x, (gl, gr)) in f.iter().zip(&self.downmix) {
-                            l += x * gl;
-                            r += x * gr;
-                        }
-                        self.stereo.push((l.clamp(-1.0, 1.0) * 32767.0) as i16);
-                        self.stereo.push((r.clamp(-1.0, 1.0) * 32767.0) as i16);
-                    }
-                    buf.push_at(pos, Some(&self.stereo), frames as usize);
-                }
-                self.cap.ReleaseBuffer(frames)?;
             }
+            drop(client);
+            if com {
+                CoUninitialize();
+            }
+        })?;
+        Ok(Self { source, device_id, shared })
+    }
+
+    /// Pasa al buffer los paquetes que leyó el hilo, ubicados en la línea de tiempo según su marca QPC.
+    pub fn poll(&mut self, buf: &mut AudioBuf, t0: i64) -> Result<()> {
+        let (got, err) = {
+            let mut read = self.shared.read.lock().unwrap();
+            (std::mem::take(&mut read.0), read.1.take())
+        };
+        for p in got {
+            let pos = if p.qpc != 0 { frames_at(p.qpc - t0) } else { buf.end() };
+            buf.push_at(pos, p.stereo.as_deref(), p.frames);
+        }
+        err.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for Audio {
+    fn drop(&mut self) {
+        // El hilo lo ve en su próxima vuelta (10 ms, o 100 ms si no suena nada) y cierra el cliente.
+        self.shared.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+// Los objetos de WASAPI son de COM multihilo: se pueden pasar de un hilo MTA a otro.
+unsafe impl Send for Client {}
+
+impl Client {
+    unsafe fn open(source: &Source) -> Result<Self> {
+        let mic = matches!(source, Source::Mic(_));
+        let (client, device_id) = match source {
+            Source::System => {
+                let dev = default_device()?;
+                let id = device_id(&dev);
+                (dev.Activate::<IAudioClient>(CLSCTX_ALL, None)?, id)
+            }
+            Source::Only(pid) => (activate_process(*pid, true)?, String::new()),
+            Source::AllBut(pid) => (activate_process(*pid, false)?, String::new()),
+            Source::Mic(id) => {
+                let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+                let dev = if id.is_empty() {
+                    en.GetDefaultAudioEndpoint(eCapture, eConsole)?
+                } else {
+                    en.GetDevice(&windows::core::HSTRING::from(id.as_str()))?
+                };
+                (dev.Activate::<IAudioClient>(CLSCTX_ALL, None)?, device_id(&dev))
+            }
+        };
+        let loopback = if mic { 0 } else { AUDCLNT_STREAMFLAGS_LOOPBACK };
+        let event = CreateEventW(None, false, false, PCWSTR::null())?;
+        // Los canales del dispositivo (la captura por proceso no tiene formato propio: usa el de la
+        // salida por defecto). Windows solo cambia la frecuencia a 48 kHz; los canales los baja Clippy.
+        let (channels, mask) = match source {
+            Source::Only(_) | Source::AllBut(_) => mix_layout(&default_device()?.Activate::<IAudioClient>(CLSCTX_ALL, None)?),
+            _ => mix_layout(&client),
+        };
+        let format = WAVEFORMATEXTENSIBLE {
+            Format: WAVEFORMATEX {
+                wFormatTag: WAVE_FORMAT_EXTENSIBLE,
+                nChannels: channels,
+                nSamplesPerSec: RATE as u32,
+                nAvgBytesPerSec: RATE as u32 * channels as u32 * 4,
+                nBlockAlign: channels * 4,
+                wBitsPerSample: 32,
+                cbSize: 22,
+            },
+            Samples: WAVEFORMATEXTENSIBLE_0 { wValidBitsPerSample: 32 },
+            dwChannelMask: if mask == 0 { (1u32 << channels) - 1 } else { mask },
+            SubFormat: SUBTYPE_IEEE_FLOAT,
+        };
+        client.Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            loopback
+                | AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+                | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+                | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+            2_000_000,
+            0,
+            &format.Format,
+            None,
+        )?;
+        client.SetEventHandle(event)?;
+        let cap: IAudioCaptureClient = client.GetService()?;
+        client.Start()?;
+        Ok(Self { client, cap, event, device_id, downmix: downmix(channels, mask) })
+    }
+
+    /// Suma a `got` los paquetes disponibles, ya en estéreo.
+    unsafe fn read(&self, got: &mut Vec<Packet>) -> Result<()> {
+        while self.cap.GetNextPacketSize()? != 0 {
+            let mut data = std::ptr::null_mut();
+            let mut frames = 0u32;
+            let mut flags = 0u32;
+            let mut qpc = 0u64;
+            self.cap.GetBuffer(&mut data, &mut frames, &mut flags, None, Some(&mut qpc))?;
+            let stereo = (flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 == 0 && !data.is_null()).then(|| {
+                let ch = self.downmix.len();
+                let src = std::slice::from_raw_parts(data as *const f32, frames as usize * ch);
+                let mut out = Vec::with_capacity(frames as usize * 2);
+                for f in src.chunks_exact(ch) {
+                    let (mut l, mut r) = (0.0f32, 0.0f32);
+                    for (x, (gl, gr)) in f.iter().zip(&self.downmix) {
+                        l += x * gl;
+                        r += x * gr;
+                    }
+                    out.push((l.clamp(-1.0, 1.0) * 32767.0) as i16);
+                    out.push((r.clamp(-1.0, 1.0) * 32767.0) as i16);
+                }
+                out
+            });
+            self.cap.ReleaseBuffer(frames)?;
+            got.push(Packet { qpc: qpc as i64, frames: frames as usize, stereo });
         }
         Ok(())
     }
 }
 
-impl Drop for Audio {
+impl Drop for Client {
     fn drop(&mut self) {
         unsafe {
             let _ = self.client.Stop();
