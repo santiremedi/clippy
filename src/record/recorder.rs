@@ -87,10 +87,23 @@ fn thread_main(mut cfg: Config, rx: Receiver<Cmd>, notify: Notify) {
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     }
     let mut target = None;
+    // Una vez que el encoder rechazó un tamaño que no es múltiplo de 16, se graba siempre alineado.
+    let mut align = false;
     loop {
-        match session(&mut cfg, &rx, &notify, target.take()) {
+        let monitor = target.take();
+        let mut untested = None;
+        match session(&mut cfg, &rx, &notify, monitor, align, &mut untested) {
             Ok(End::Stop) => break,
             Ok(End::Restart(m)) => target = Some(m),
+            // Varios encoders por hardware (Quick Sync con drivers viejos) aceptan el tamaño al configurarse y
+            // fallan con el primer cuadro si no es múltiplo de 16 (1366x768): se reintenta al toque, alineado.
+            Err(e) if untested.is_some_and(|s| align16(s) != s) => {
+                let (w, h) = untested.unwrap();
+                let (aw, ah) = align16((w, h));
+                log(&format!("el encoder no acepta {w}x{h} ({e:?}): se graba a {aw}x{ah}"));
+                align = true;
+                target = monitor;
+            }
             Err(e) => {
                 log(&format!("error de captura: {e:?}"));
                 // Cada intento fallido avisa; la bandeja muestra el globo solo al pasar de grabar a error.
@@ -212,8 +225,15 @@ const AIM_EVERY: i64 = 2_500_000;
 /// Cuánto después de empezar a convertir un monitor se controla la imagen para el log (100 ns).
 const PROBE_AFTER: i64 = 20_000_000;
 
+/// El tamaño más grande que entra en `(w, h)` con los dos lados múltiplos de 16 (la imagen se encaja adentro).
+fn align16((w, h): (u32, u32)) -> (u32, u32) {
+    ((w & !15).max(16), (h & !15).max(16))
+}
+
 /// `restarted`: el monitor del juego que pidió reiniciar (ya se grabó a su resolución; no se vuelve a pedir).
-fn session(cfg: &mut Config, rx: &Receiver<Cmd>, notify: &Notify, restarted: Option<HMONITOR>) -> Result<End> {
+/// `align`: grabar a un tamaño múltiplo de 16. `untested`: el tamaño del video mientras el encoder todavía no
+/// entregó ningún cuadro (None hasta que se configura y otra vez cuando codifica).
+fn session(cfg: &mut Config, rx: &Receiver<Cmd>, notify: &Notify, restarted: Option<HMONITOR>, align: bool, untested: &mut Option<(u32, u32)>) -> Result<End> {
     let fps = cfg.fps.max(1);
     let frame_dur = 10_000_000i64 / fps as i64;
 
@@ -221,8 +241,18 @@ fn session(cfg: &mut Config, rx: &Receiver<Cmd>, notify: &Notify, restarted: Opt
     game.poll(0);
     // Qué monitor grabar: el del juego; si no hay juego, el de la ventana activa; si no, el principal.
     let mut cap = Capture::new(restarted.or_else(|| game.monitor()).or_else(game::active_monitor))?;
-    let (w, h) = cfg.video_size((cap.width, cap.height));
+    let mut size = cfg.video_size((cap.width, cap.height));
+    if align {
+        size = align16(size);
+    }
+    let (w, h) = size;
+    // Si ni se pudo configurar (no hay encoder, otra placa), no es por el tamaño: se avisa como siempre.
     let mut enc = Encoder::new(&cap.device, cap.luid, w, h, fps, cfg.bitrate_mbps * 1_000_000)?;
+    *untested = Some(size);
+    // Prueba (CLIPPY_TEST_ALIGN16): un encoder que, como Quick Sync con drivers viejos, falla en el primer
+    // cuadro si el tamaño no es múltiplo de 16.
+    #[cfg(feature = "devtools")]
+    let reject = std::env::var_os("CLIPPY_TEST_ALIGN16").is_some() && align16(size) != size;
     log(&format!(
         "grabando {} a {w}x{h} @ {fps} fps, H.264 {} Mbps, buffer {} s (máximo en esta PC: {} s), encoder: {}",
         cap.describe(),
@@ -306,6 +336,9 @@ fn session(cfg: &mut Config, rx: &Receiver<Cmd>, notify: &Notify, restarted: Opt
 
         enc.poll(&mut out)?;
         packets.extend(out.drain(..));
+        if !packets.is_empty() {
+            *untested = None;
+        }
 
         if now >= next_frame {
             let pts = (now / frame_dur) * frame_dur;
@@ -317,6 +350,10 @@ fn session(cfg: &mut Config, rx: &Receiver<Cmd>, notify: &Notify, restarted: Opt
                     if visible && probe_at.is_some_and(|t| now >= t) {
                         probe_at = None;
                         log(&c.probe(&tex));
+                    }
+                    #[cfg(feature = "devtools")]
+                    if reject {
+                        anyhow::bail!("encoder de prueba: {w}x{h} no es múltiplo de 16 (0x80004005)");
                     }
                     enc.feed(&tex, pts, frame_dur)?;
                 }
