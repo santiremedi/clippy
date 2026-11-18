@@ -609,13 +609,14 @@ pub fn fmt_bytes(b: f64) -> String {
     }
 }
 
-/// 1284 -> "1.284"
+/// 1284 -> "1.284" (en inglés, "1,284")
 pub fn fmt_count(n: usize) -> String {
     let d = n.to_string();
+    let sep = tr!('.', ',', '.');
     let mut out = String::new();
     for (i, c) in d.chars().enumerate() {
         if i > 0 && (d.len() - i).is_multiple_of(3) {
-            out.push('.');
+            out.push(sep);
         }
         out.push(c);
     }

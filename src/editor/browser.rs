@@ -631,7 +631,7 @@ impl EditorApp {
                 let imported = paths.iter().filter(|p| self.imported.contains(p)).count();
                 let own = n - imported;
                 let used = paths.iter().filter(|p| self.is_used(p)).count();
-let v = videos(n);
+                let v = videos(n);
                 let title = match (own, n) {
                     (0, 1) => tr!("¿Quitar este video de la biblioteca?", "Remove this video from the library?", "Remover este vídeo da biblioteca?").to_string(),
                     (0, _) => trf!("¿Quitar {v} de la biblioteca?", "Remove {v} from the library?", "Remover {v} da biblioteca?"),

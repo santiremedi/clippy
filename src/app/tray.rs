@@ -220,7 +220,7 @@ impl App {
 
     fn tip(&self) -> String {
         if let Some(e) = &self.error {
-            return format!("Clippy · error: {e}");
+            return trf!("Clippy · error: {e}", "Clippy · error: {e}", "Clippy · erro: {e}");
         }
         if self.cfg.enabled {
             let (key, secs) = (hotkey_name(self.cfg.hotkey_vk, self.cfg.hotkey_mods), fmt_secs(self.cfg.seconds));

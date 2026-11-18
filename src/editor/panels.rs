@@ -1166,7 +1166,7 @@ impl EditorApp {
             let text = if crossed {
                 trf!("Fundido {len}", "Crossfade {len}", "Transição {len}")
             } else if *out {
-                trf!("Se va en {len}", "Fades out in {len}", "Some em {len}")
+                trf!("Se va en {len}", "Fades out over {len}", "Desaparece em {len}")
             } else {
                 trf!("Aparece en {len}", "Fades in over {len}", "Surge em {len}")
             };

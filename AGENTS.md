@@ -11,7 +11,9 @@ Ver `README.md` para el mapa del código y los modos del exe.
   para un juego, nada que el usuario tenga que configurar si se puede detectar.
 - **Textos de la interfaz en tres idiomas**: español rioplatense ("vos", "tocá", "apretá"), inglés y
   portugués de Brasil. Cada texto va donde se usa con `tr!(es, en, pt)` o, con valores, `trf!` (ver
-  `src/i18n.rs`); nunca un literal suelto en la interfaz. El registro (`clippy.log`) y los comentarios, en español.
+  `src/i18n.rs`); nunca un literal suelto en la interfaz. Los errores que llegan a la pantalla se traducen
+  donde se crean (`bail!(tr!(…))`), así que en `clippy.log` quedan en el idioma de la interfaz; el resto del
+  registro y los comentarios, en español.
 - **Commits y PRs sin atribución de IA**: nada de `Co-Authored-By`, "Generated with" ni links de sesión.
 - No publicar releases sin que el usuario lo pida.
 

@@ -248,7 +248,11 @@ unsafe fn activate_process(pid: u32, include: bool) -> Result<IAudioClient> {
     )?;
     // Esto corre en el hilo de video: si Windows no contesta enseguida, se sigue sin este audio
     // (se reintenta en unos segundos) en vez de congelar la grabación.
-    rx.recv_timeout(Duration::from_secs(1)).map_err(|_| anyhow!("la captura de audio por proceso no respondió"))?;
+    rx.recv_timeout(Duration::from_secs(1)).map_err(|_| anyhow!(tr!(
+        "la captura de audio por proceso no respondió",
+        "per-process audio capture didn't respond",
+        "a captura de áudio por processo não respondeu"
+    )))?;
     let mut hr = windows::core::HRESULT(0);
     let mut unk = None;
     op.GetActivateResult(&mut hr, &mut unk)?;

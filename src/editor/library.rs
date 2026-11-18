@@ -11,6 +11,7 @@ use std::time::SystemTime;
 use eframe::egui;
 
 use super::media::{self, Probe};
+use crate::i18n::{tr, trf};
 use crate::mf::Mf;
 use super::player::Video;
 use crate::log::app_dir;
@@ -473,7 +474,11 @@ pub fn recycle(p: &Path) -> std::io::Result<()> {
         if r == 0 && !op.fAnyOperationsAborted.as_bool() && !p.exists() {
             Ok(())
         } else {
-            Err(std::io::Error::other(format!("no se pudo mandar a la Papelera ({r})")))
+            Err(std::io::Error::other(trf!(
+                "no se pudo mandar a la Papelera ({r})",
+                "couldn't send it to the Recycle Bin ({r})",
+                "não foi possível mandar para a Lixeira ({r})"
+            )))
         }
     })
 }
@@ -522,14 +527,16 @@ pub fn folder_name_ok(name: &str) -> bool {
 /// Caracteres que Windows no deja usar en un nombre de archivo o carpeta.
 pub const BAD_NAME: &str = "<>:\"/\\|?*";
 
-/// "Clippy_2026-11-15_23-38-30" -> "15/11 · 23:38:30"
+/// "Clippy_2026-11-15_23-38-30" -> "15/11 · 23:38:30" (en inglés, "11/15 · 23:38:30")
 pub fn pretty_name(p: &Path) -> String {
     let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     if let Some(rest) = stem.strip_prefix("Clippy_") {
         let parts: Vec<&str> = rest.split(['_', '-']).collect();
         if parts.len() >= 6 && parts[..6].iter().all(|x| x.chars().all(|c| c.is_ascii_digit())) {
             let extra = if parts.len() > 6 { format!(" ({})", parts[6..].join(" ")) } else { String::new() };
-            return format!("{}/{} · {}:{}:{}{}", parts[2], parts[1], parts[3], parts[4], parts[5], extra);
+            // Día y mes en el orden de cada idioma (en inglés, mes/día).
+            let (a, b) = tr!((parts[2], parts[1]), (parts[1], parts[2]), (parts[2], parts[1]));
+            return format!("{a}/{b} · {}:{}:{}{extra}", parts[3], parts[4], parts[5]);
         }
     }
     stem

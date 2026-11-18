@@ -31,7 +31,7 @@ fn starts_edit(ui: &egui::Ui, r: &egui::Response) -> bool {
 impl EditorApp {
     pub(super) fn props_panel(&mut self, ui: &mut egui::Ui) {
         let Some((ti, i)) = self.selection() else {
-            ui.label(RichText::new("Clip").family(bold()).size(17.0).color(TEXT));
+            ui.label(RichText::new(tr!("Clip", "Clip", "Clipe")).family(bold()).size(17.0).color(TEXT));
             ui.add_space(6.0);
             let hint = tr!(
                 "Tocá un clip en la línea de tiempo para ajustar su imagen, su velocidad y su sonido.",

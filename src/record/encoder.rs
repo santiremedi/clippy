@@ -11,7 +11,7 @@ use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::CoTaskMemFree;
 
-use crate::i18n::tr;
+use crate::i18n::{tr, trf};
 use crate::log::log;
 
 #[derive(Clone)]
@@ -52,7 +52,7 @@ impl Encoder {
 
             let attrs = mft.GetAttributes()?;
             if attrs.GetUINT32(&MF_TRANSFORM_ASYNC).unwrap_or(0) == 0 {
-                bail!("el encoder {name} no es asíncrono");
+                bail!(trf!("el encoder {name} no es asíncrono", "the {name} encoder isn't asynchronous", "o encoder {name} não é assíncrono"));
             }
             attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)?;
             let _ = attrs.SetUINT32(&MF_LOW_LATENCY, 1);
