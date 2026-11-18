@@ -79,7 +79,12 @@ impl Encoder {
     /// Usa el encoder de la placa que captura; si no hay o no arranca, el de Windows por procesador.
     pub fn new(device: &ID3D11Device, luid: LUID, w: u32, h: u32, fps: u32, bitrate: u32) -> Result<Self> {
         unsafe {
-            for (act, name, vendor) in gpu_encoders(luid)? {
+            // Si ni se pueden buscar (máquinas virtuales, el adaptador básico de Windows), también va el procesador.
+            let gpu_encoders = gpu_encoders(luid).unwrap_or_else(|e| {
+                log(&format!("no se pudieron buscar encoders en la placa: {e}"));
+                Vec::new()
+            });
+            for (act, name, vendor) in gpu_encoders {
                 let gpu = act.ActivateObject::<IMFTransform>().map_err(Into::into).and_then(|mft| {
                     let path = gpu_path(&mft, device, &name, vendor)?;
                     Self::open(mft, path, name.clone(), w, h, fps, bitrate)
@@ -373,10 +378,8 @@ unsafe fn gpu_path(mft: &IMFTransform, device: &ID3D11Device, name: &str, vendor
 
 /// Encoders H.264 de la placa que captura (importa en notebooks con dos GPUs), con nombre y fabricante.
 unsafe fn gpu_encoders(luid: LUID) -> Result<Vec<(IMFActivate, String, Option<String>)>> {
-    if skip_gpu() {
-        log("devtools: CLIPPY_CPU_ENCODER pide no usar la placa");
-        return Ok(Vec::new());
-    }
+    // Prueba: en una placa que no existe la búsqueda falla, y se tiene que seguir con el procesador.
+    let luid = if skip_gpu() { LUID { LowPart: u32::MAX, HighPart: i32::MAX } } else { luid };
     let input = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_NV12 };
     let output = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_H264 };
     let mut attrs = None;
@@ -412,7 +415,7 @@ unsafe fn gpu_encoders(luid: LUID) -> Result<Vec<(IMFActivate, String, Option<St
     Ok(v)
 }
 
-/// Con `devtools`, la variable CLIPPY_CPU_ENCODER salta la placa para probar el encoder por procesador.
+/// Con `devtools`, la variable CLIPPY_CPU_ENCODER hace que no se encuentre ningún encoder en la placa.
 #[cfg(feature = "devtools")]
 fn skip_gpu() -> bool {
     std::env::var_os("CLIPPY_CPU_ENCODER").is_some()
