@@ -94,10 +94,18 @@ y nada de código muerto.
 ```bash
 cargo clippy --features devtools -- -D warnings   # chequeo rápido, el mismo que corre el CI
 cargo build --profile fast --features devtools    # para probar: unos segundos por cambio
-target/fast/clippy.exe --test 8 <carpeta> game
+APPDATA=<carpeta>/datos target/fast/clippy.exe --test 8 <carpeta> game
 ```
 
-Compilá siempre en `target/` con estos perfiles: otra `--target-dir` recompila todo de cero.
+Compilá siempre en el `target/` de tu worktree con estos perfiles (el primer build tarda ~1,5 min). Un
+`--target-dir` o `build-dir` compartido entre worktrees mezcla los exe: uno termina probando el código de otro.
 
-No hay tests automáticos. Después de cambiar la grabación, probá con `--test` y mirá
-`%APPDATA%\Clippy\clippy.log`. Después de cambiar ventanas, abrí `--settings` y `--editor`.
+No hay tests automáticos. Varios agentes prueban a la vez, cada uno en su worktree, así que cada prueba
+corre aislada y sin ventanas:
+
+- **Grabación**: `--test` con `APPDATA` apuntando a una carpeta propia. Así el `clippy.log` y el
+  `config.json` (los de fábrica) son solo de esa corrida.
+- **Editor**: `--test-export`, `--test-frame`, `--test-strip`, `--test-covers` (ver `editor/devtools.rs`).
+- **De a uno por vez**, porque tocan cosas de toda la PC: `--settings` y `--editor` (candado de instancia
+  única y título de ventana: chocan con otro agente o con el Clippy del usuario), `CLIPPY_TEST_MODE` (cambia
+  la resolución del monitor) y medir FPS o CPU. Abrí ventanas solo si el cambio toca la interfaz, al final.
