@@ -236,6 +236,10 @@ const AIM_EVERY: i64 = 2_500_000;
 /// Cuánto después de empezar a convertir un monitor se controla la imagen para el log (100 ns).
 const PROBE_AFTER: i64 = 20_000_000;
 
+/// Audio que se guarda de más antes de la ventana del clip (100 ns): el video arranca en el fotograma clave
+/// anterior, que puede estar hasta 1,5 intervalos antes si el encoder no lo puso a tiempo (`feed` lo pide).
+const AUDIO_MARGIN: i64 = 2 * super::encoder::KEY_EVERY;
+
 /// El tamaño más grande que entra en `(w, h)` con los dos lados múltiplos de 16 (la imagen se encaja adentro).
 fn align16((w, h): (u32, u32)) -> (u32, u32) {
     ((w & !15).max(16), (h & !15).max(16))
@@ -382,11 +386,11 @@ fn session(
         }
 
         trim_video(&mut packets, now - keep);
-        let a_min = frames_at(now - keep - 20_000_000);
+        let a_min = frames_at(now - keep - AUDIO_MARGIN);
         au.game_ch.buf.trim_before(a_min);
         au.desktop.buf.trim_before(a_min);
         au.mic.buf.trim_before(a_min);
-        au.masks.retain(|m| m.1 > now - keep - 20_000_000);
+        au.masks.retain(|m| m.1 > now - keep - AUDIO_MARGIN);
 
         timer.sleep(next_frame - (now_100ns() - t0));
     }

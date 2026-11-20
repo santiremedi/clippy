@@ -10,4 +10,4 @@ mod mux;
 mod screen;
 pub mod recorder;
 
-pub use encoder::{Device, CPU_MAX_FPS, CPU_MAX_SHORT};
+pub use encoder::{Device, CPU_MAX_FPS, CPU_MAX_SHORT, KEY_EVERY};

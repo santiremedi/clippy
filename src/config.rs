@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use crate::i18n::{self, tr, Language};
 use crate::log::app_dir;
+use crate::record::KEY_EVERY;
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Com::CoTaskMemFree;
@@ -48,6 +49,8 @@ pub const MAX_SECONDS: u32 = 600;
 const RAM_SHARE: u64 = 4;
 /// Audio en crudo de cada canal en el buffer (bytes por segundo).
 const AUDIO_BYTES_PER_SEC: u64 = 192_000;
+/// Video de más en el buffer, como mucho (s): el clip arranca en el fotograma clave anterior a lo pedido.
+const KEY_SECS: u32 = (KEY_EVERY / 10_000_000) as u32;
 /// Calidad de video (Mbps) que se puede elegir a mano en "Personalizada".
 pub const MIN_MBPS: u32 = 5;
 pub const MAX_MBPS: u32 = 150;
@@ -133,7 +136,7 @@ impl Default for Config {
             hotkey_vk: 0x78, // F9
             hotkey_mods: 0,
             fps: 60,
-            bitrate_mbps: 30, // "Media"
+            bitrate_mbps: 25, // "Media"
             resolution: 0,
             game_audio: true,
             game_volume: 100,
@@ -231,7 +234,7 @@ impl Config {
     pub fn typical_ram_mb(&self) -> u32 {
         let channels = self.game_audio as u32 + self.desktop_audio as u32 + self.mic_audio as u32;
         let audio = channels * self.seconds * (AUDIO_BYTES_PER_SEC / 1000) as u32 / 1000;
-        let video = self.bitrate_mbps * self.seconds / 80;
+        let video = self.bitrate_mbps * (self.seconds + KEY_SECS) / 80;
         (40 + audio + video).div_ceil(10) * 10
     }
 
@@ -240,7 +243,7 @@ impl Config {
     pub fn max_seconds(&self) -> u32 {
         // Se cuentan los tres canales de audio: así prender el micrófono no recorta la duración.
         let per_sec = self.bitrate_mbps as u64 * 125_000 + 3 * AUDIO_BYTES_PER_SEC;
-        let secs = (total_ram() / RAM_SHARE / per_sec).min(MAX_SECONDS as u64) as u32;
+        let secs = (total_ram() / RAM_SHARE / per_sec).saturating_sub(KEY_SECS as u64).min(MAX_SECONDS as u64) as u32;
         (secs / 5 * 5).max(MIN_SECONDS)
     }
 

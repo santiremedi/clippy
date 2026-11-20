@@ -40,15 +40,19 @@ pub enum Device {
 pub const CPU_MAX_SHORT: u32 = 1080;
 pub const CPU_MAX_FPS: u32 = 30;
 
-/// Cada cuánto se pide un fotograma clave (100 ns): permite recortar el buffer al segundo exacto.
-const KEY_EVERY: i64 = 10_000_000;
+/// Cada cuánto hay un fotograma clave en la placa (100 ns). Es el cuadro más pesado (unas 10 veces uno común):
+/// con uno cada 2 s quedan más bits para la imagen. El buffer y el clip arrancan en uno, así que guardan hasta
+/// esto de más.
+pub const KEY_EVERY: i64 = 20_000_000;
 
-/// Si pasa esto sin fotogramas clave, el buffer no se puede recortar ni el clip empezar bien (100 ns).
-const KEY_LATE: i64 = 5 * KEY_EVERY;
+/// En el procesador, uno por segundo como siempre.
+const CPU_KEY_EVERY: i64 = 10_000_000;
 
 pub struct Encoder {
     mft: IMFTransform,
     api: Option<ICodecAPI>,
+    /// Cada cuánto hay un fotograma clave con este encoder (100 ns).
+    key_every: i64,
     /// Antes de esto no se vuelve a pedir un fotograma clave a mano.
     next_key: i64,
     last_key: i64,
@@ -111,6 +115,7 @@ impl Encoder {
 
     unsafe fn open(mft: IMFTransform, path: Path, name: String, w: u32, h: u32, fps: u32, bitrate: u32) -> Result<Self> {
         let cpu = matches!(path, Path::Cpu(_));
+        let key_every = if cpu { CPU_KEY_EVERY } else { KEY_EVERY };
         let api = mft.cast::<ICodecAPI>().ok();
         if let Some(api) = &api {
             let set = |g: &GUID, v: VARIANT| {
@@ -118,12 +123,14 @@ impl Encoder {
             };
             set(&CODECAPI_AVEncCommonRateControlMode, VARIANT::from(eAVEncCommonRateControlMode_UnconstrainedVBR.0 as u32));
             set(&CODECAPI_AVEncCommonMeanBitRate, VARIANT::from(bitrate));
-            // Un fotograma clave por segundo (si no aparecen, `feed` los pide a mano: hay encoders que ignoran esto).
-            set(&CODECAPI_AVEncMPVGOPSize, VARIANT::from(fps));
+            // Si no aparecen, `feed` los pide a mano: hay encoders que ignoran esto.
+            set(&CODECAPI_AVEncMPVGOPSize, VARIANT::from((fps as i64 * key_every / 10_000_000) as u32));
             set(&CODECAPI_AVEncMPVDefaultBPictureCount, VARIANT::from(0u32));
+            // Apagarlo no cambia nada en NVIDIA (mismo archivo, misma memoria); en AMD e Intel no se midió.
             set(&CODECAPI_AVLowLatencyMode, VARIANT::from(true));
+            // En la placa, el preset que elige el driver: en una RTX 2060, de 66 para arriba a 4K60 codifica la
+            // mitad de los cuadros, y 50 no mejora la imagen. En el procesador, lo más rápido: también lo usa el juego.
             if cpu {
-                // Lo más rápido: el procesador también lo usa el juego.
                 set(&CODECAPI_AVEncCommonQualityVsSpeed, VARIANT::from(0u32));
             }
         }
@@ -156,6 +163,7 @@ impl Encoder {
         Ok(Self {
             mft,
             api,
+            key_every,
             next_key: 0,
             last_key: 0,
             warned_keys: false,
@@ -253,7 +261,8 @@ impl Encoder {
             let key = if is_annex_b(&data) { is_keyframe(&data) } else { clean };
             if key {
                 self.last_key = pts;
-            } else if pts - self.last_key > KEY_LATE && !self.warned_keys {
+            } else if pts - self.last_key > 5 * self.key_every && !self.warned_keys {
+                // Sin fotogramas clave el buffer no se puede recortar ni el clip empezar bien.
                 self.warned_keys = true;
                 log(&format!("el encoder {} no genera fotogramas clave: los clips pueden salir negros o verdes", self.name));
             }
@@ -277,8 +286,8 @@ impl Encoder {
     pub fn feed(&mut self, tex: &ID3D11Texture2D, pts: i64, dur: i64) -> Result<()> {
         unsafe {
             // Solo si el encoder no generó uno solo (con margen: los paquetes salen unos cuadros después).
-            if pts >= self.next_key && pts - self.last_key > KEY_EVERY * 3 / 2 {
-                self.next_key = pts + KEY_EVERY;
+            if pts >= self.next_key && pts - self.last_key > self.key_every * 3 / 2 {
+                self.next_key = pts + self.key_every;
                 if let Some(api) = &self.api {
                     let _ = api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &VARIANT::from(1u32));
                 }

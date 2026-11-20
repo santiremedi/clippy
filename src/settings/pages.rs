@@ -12,7 +12,7 @@ use crate::config::{CaptureMode, GlobalAction, MAX_MBPS, MAX_SECONDS, MIN_MBPS, 
 use crate::i18n::{tr, trf, Lang, Language};
 
 /// Calidades de video de un toque (Mbps): baja, media y alta.
-const QUALITY: [u32; 3] = [15, 30, 60];
+const QUALITY: [u32; 3] = [15, 25, 60];
 use crate::log::app_dir;
 use crate::record::{audio, Device, CPU_MAX_FPS, CPU_MAX_SHORT};
 use crate::ui_kit::sound;
