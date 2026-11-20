@@ -117,9 +117,9 @@ impl Detector {
         }
     }
 
-    /// Monitor del juego si está adelante en pantalla completa ahora mismo (ahí manda imágenes todo el tiempo).
-    pub fn front_monitor(&self) -> Option<HMONITOR> {
-        self.monitor().filter(|_| self.in_front)
+    /// El juego está adelante en pantalla completa ahora mismo (ahí manda imágenes todo el tiempo).
+    pub fn in_front(&self) -> bool {
+        self.in_front
     }
 
     /// El juego se ve en su monitor: está adelante, o la ventana activa está en otro monitor

@@ -362,29 +362,29 @@ fn session(
                     Aim::Same | Aim::Switched => {}
                 }
             }
+            // Un juego adelante manda imágenes todo el tiempo. Si no llega ninguna, la captura quedó trabada (puede
+            // pasar al volver de un Alt+Tab con resolución estirada): reabrirla con el mismo dispositivo no alcanza y
+            // el video repetiría la última imagen para siempre. Se empieza de nuevo, como al cambiar un ajuste de video.
+            if au.game.in_front() && gm == Some(cap.monitor()) {
+                let since = *front_since.get_or_insert(now);
+                if let Some(lost) = cap.stalled(now, since) {
+                    if cap.worked() {
+                        log(&format!(
+                            "el juego está adelante y no llegan imágenes nuevas de {} (se perdió {lost} veces): se reinicia la captura",
+                            cap.describe()
+                        ));
+                        return Ok(End::Restart(cap.monitor()));
+                    }
+                    // Nunca llegó a capturar: reiniciar una y otra vez no lo arreglaría. Queda en el log.
+                    if !std::mem::replace(&mut stall_told, true) {
+                        log(&format!("el juego está adelante y no llegan imágenes nuevas de {} (se perdió {lost} veces)", cap.describe()));
+                    }
+                }
+            } else {
+                front_since = None;
+            }
         }
         cap.poll(now)?;
-        // Un juego adelante manda imágenes todo el tiempo. Si no llega ninguna, la captura quedó trabada (puede pasar
-        // al volver de un Alt+Tab con resolución estirada): reabrirla con el mismo dispositivo no alcanza y el video
-        // repetiría la última imagen para siempre. Se empieza de nuevo, como al cambiar un ajuste de video.
-        if au.game.front_monitor() == Some(cap.monitor()) {
-            let since = *front_since.get_or_insert(now);
-            if let Some(lost) = cap.stalled(now, since) {
-                if cap.worked() {
-                    log(&format!(
-                        "el juego está adelante y no llegan imágenes nuevas de {} (se perdió {lost} veces): se reinicia la captura",
-                        cap.describe()
-                    ));
-                    return Ok(End::Restart(cap.monitor()));
-                }
-                // Nunca llegó a capturar: reiniciar una y otra vez no lo arreglaría. Queda en el log.
-                if !std::mem::replace(&mut stall_told, true) {
-                    log(&format!("el juego está adelante y no llegan imágenes nuevas de {} (se perdió {lost} veces)", cap.describe()));
-                }
-            }
-        } else {
-            front_since = None;
-        }
         if let Some(f) = &cap.latest {
             if !conv.as_ref().is_some_and(|c| c.is_for(f)) {
                 conv = Some(cap.check(Converter::new(&cap.device, &cap.context, f, w, h, fps, 8))?);
