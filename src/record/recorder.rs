@@ -274,6 +274,7 @@ fn session(
     game.poll(0);
     // Qué monitor grabar: el del juego; si no hay juego, el de la ventana activa; si no, el principal.
     let mut cap = Capture::new(target.monitor.or_else(|| game.monitor()).or_else(game::active_monitor), &target.lost_on)?;
+    cap.set_cursor(cfg.cursor_on());
     let mut size = cfg.video_size((cap.width, cap.height));
     if align {
         size = align16(size);
@@ -336,6 +337,7 @@ fn session(
                 }
                 Ok(Cmd::Update(c)) => {
                     *cfg = c;
+                    cap.set_cursor(cfg.cursor_on());
                     au.sync(cfg, now_100ns() - t0);
                 }
                 Err(TryRecvError::Empty) => break,
@@ -408,7 +410,13 @@ fn session(
             if let Some(c) = conv.as_mut() {
                 // Solo convertir si el encoder pidió otra imagen; si está ocupado se salta un cuadro.
                 if enc.pending_input > 0 {
-                    let tex = if visible { cap.check(c.convert())? } else { c.black() };
+                    let tex = if visible {
+                        // Con un juego, nunca: muchos dibujan su propio cursor y el de Windows queda quieto en el medio.
+                        cap.draw_cursor(au.game.pid().is_none());
+                        cap.check(c.convert())?
+                    } else {
+                        c.black()
+                    };
                     if visible && probe_at.is_some_and(|t| now >= t) {
                         probe_at = None;
                         log(&c.probe(&tex));

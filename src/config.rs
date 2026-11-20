@@ -78,6 +78,8 @@ pub struct Config {
     pub mic_volume: u32,
     pub mic_device: String,
     pub capture_mode: CaptureMode,
+    /// Dibujar el cursor del mouse en el video (apagado por defecto; ver `cursor_on`).
+    pub cursor: bool,
     pub sound_on_save: bool,
     /// Atajo global para pausar/reanudar la grabación (vk 0 = sin asignar).
     pub toggle_vk: u32,
@@ -143,6 +145,7 @@ impl Default for Config {
             mic_volume: 100,
             mic_device: String::new(),
             capture_mode: CaptureMode::Screen,
+            cursor: false,
             sound_on_save: true,
             toggle_vk: 0,
             toggle_mods: 0,
@@ -177,6 +180,12 @@ impl Config {
             0 => full,
             r => fit_short(full, r),
         }
+    }
+
+    /// El cursor va solo con "Toda la pantalla" ("Solo juegos" graba el juego); con un juego detectado, tampoco
+    /// (lo decide la grabadora).
+    pub fn cursor_on(&self) -> bool {
+        self.cursor && self.capture_mode == CaptureMode::Screen
     }
 
     pub fn audio_on(&self) -> bool {

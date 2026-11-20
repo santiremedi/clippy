@@ -407,6 +407,19 @@ impl SettingsApp {
                     )
                 },
             );
+            // "Solo juegos" graba el juego, y en un juego el cursor no va: ahí no aplica.
+            if self.cfg.capture_mode == CaptureMode::Screen {
+                row(ui, tr!("Grabar el cursor", "Record the cursor", "Gravar o cursor"), LABEL_W, |ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        toggle(ui, &mut self.cfg.cursor);
+                    });
+                });
+                hint(
+                    ui,
+                    LABEL_W + 8.0,
+                    tr!("Solo cuando no hay un juego en pantalla.", "Only when there's no game on screen.", "Só quando não há um jogo na tela."),
+                );
+            }
             divider(ui);
             row(ui, tr!("Memoria", "Memory", "Memória"), LABEL_W, |ui| {
                 let ram = fmt_bytes(self.cfg.typical_ram_mb() as f64 * 1e6);

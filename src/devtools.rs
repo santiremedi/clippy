@@ -1,6 +1,6 @@
 //! Modos de prueba sin ventana (solo con `--features devtools`; no van en el exe publicado).
 //!
-//! - `--test <segundos> <carpeta> [game|desktop|mic|juegos|resolución]`: graba, guarda un clip y sale. Con
+//! - `--test <segundos> <carpeta> [game|desktop|mic|juegos|cursor|resolución]`: graba, guarda un clip y sale. Con
 //!   `CLIPPY_TEST_ALIGN16=1`, el encoder falla con tamaños que no son múltiplo de 16 (`--test 8 <carpeta> 766`).
 //!   Con `CLIPPY_TEST_LOST=<segundos>`, a esos segundos se pierde la placa una vez, como en un reinicio del driver.
 //!   Con `CLIPPY_TEST_STALL=<segundos>`, pasado ese tiempo la captura se traba (la duplicación se pierde apenas se abre).
@@ -69,7 +69,7 @@ fn test_mic() -> i32 {
     0
 }
 
-/// `clippy --test <segundos_a_esperar> <carpeta> [game|desktop|mic|juegos|720|1080|1440]`: graba, guarda un clip y sale (para pruebas).
+/// `clippy --test <segundos_a_esperar> <carpeta> [game|desktop|mic|juegos|cursor|720|1080|1440]`: graba, guarda un clip y sale (para pruebas).
 /// Cambia el modo de video del monitor principal solo mientras dura la prueba (None = el de siempre).
 fn set_mode(size: Option<(u32, u32)>) -> windows::Win32::Graphics::Gdi::DISP_CHANGE {
     use windows::Win32::Graphics::Gdi::*;
@@ -94,6 +94,7 @@ fn test_mode(args: &[String]) -> i32 {
         Some("desktop") => (cfg.game_audio, cfg.desktop_audio) = (false, true),
         Some("mic") => (cfg.game_audio, cfg.desktop_audio, cfg.mic_audio) = (false, false, true),
         Some("juegos") => cfg.capture_mode = crate::config::CaptureMode::GamesOnly,
+        Some("cursor") => cfg.cursor = true,
         // Un número: la resolución del clip (lado corto en px).
         Some(r) if r.parse::<u32>().is_ok() => cfg.resolution = r.parse().unwrap(),
         _ => {}

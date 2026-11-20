@@ -12,6 +12,7 @@ use windows::Win32::Graphics::Dxgi::Common::{DXGI_MODE_ROTATION, DXGI_MODE_ROTAT
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Gdi::{MonitorFromPoint, HMONITOR, MONITOR_DEFAULTTOPRIMARY};
 
+use super::cursor::Cursor;
 use super::screen::{self, wide};
 use crate::i18n::tr;
 use crate::log::log;
@@ -101,6 +102,9 @@ pub struct Capture {
     new_frames: u32,
     last_new: i64,
     dup_lost: u32,
+    /// Se pidió el cursor (`set_cursor`) y con qué se dibuja (None si apagado o si no se pudo preparar).
+    cursor_on: bool,
+    cursor: Option<Cursor>,
 }
 
 impl Capture {
@@ -176,6 +180,8 @@ impl Capture {
                 new_frames: 0,
                 last_new: 0,
                 dup_lost: 0,
+                cursor_on: false,
+                cursor: None,
             };
             cap.open()?;
             Ok(cap)
@@ -236,6 +242,9 @@ impl Capture {
         let dup = unsafe { self.out.output.DuplicateOutput(&self.device)? };
         self.rotation = unsafe { dup.GetDesc() }.Rotation;
         self.dup = Some(dup);
+        if let Some(c) = &mut self.cursor {
+            c.reset();
+        }
         // Se vuelve a abrir cada vez que un juego cambia el modo de video: ahí se ve si se estira.
         self.stretch = screen::all().into_iter().find(|s| s.name == self.out.name && !s.keeps_shape).map(|s| s.panel);
         Ok(())
@@ -284,6 +293,38 @@ impl Capture {
                 }
                 self.skip(monitor, native, &format!("no se pudo capturar con esta GPU ({e})"))
             }
+        }
+    }
+
+    /// Prende o apaga el seguimiento del cursor. Apagado no se pide ni su forma. Al prenderlo se vuelve a abrir la
+    /// duplicación: Desktop Duplication manda la forma solo cuando cambia, y al abrirse manda la de ahora.
+    pub fn set_cursor(&mut self, on: bool) {
+        if on == std::mem::replace(&mut self.cursor_on, on) {
+            return;
+        }
+        if !on {
+            self.draw_cursor(false);
+            self.cursor = None;
+            log("cursor del mouse: apagado");
+            return;
+        }
+        match Cursor::new(&self.device) {
+            Ok(c) => {
+                self.cursor = Some(c);
+                (self.dup, self.retry_at) = (None, 0);
+                log("cursor del mouse: se dibuja mientras no haya un juego");
+            }
+            Err(e) => log(&format!("cursor del mouse: no se puede dibujar ({e})")),
+        }
+    }
+
+    /// Deja la imagen con el cursor si `show` (y se pidió con `set_cursor`), o sin él. Si no se puede dibujar, se
+    /// sigue grabando sin cursor.
+    pub fn draw_cursor(&mut self, show: bool) {
+        let (Some(c), Some(f)) = (&mut self.cursor, &self.latest) else { return };
+        if let Err(e) = c.draw(&self.context, f, show) {
+            log(&format!("cursor del mouse: no se puede dibujar ({e})"));
+            self.cursor = None;
         }
     }
 
@@ -337,6 +378,9 @@ impl Capture {
         let got = test_stall(now, got, &dup);
         match got {
             Ok(()) => {
+                if let Some(c) = &mut self.cursor {
+                    c.update(&dup, &info);
+                }
                 let r = if info.LastPresentTime != 0 {
                     match res {
                         Some(res) => res.cast::<ID3D11Texture2D>().map_err(Into::into).and_then(|t| self.copy(&t)),
@@ -402,6 +446,9 @@ impl Capture {
             }
             if let Some(f) = &self.latest {
                 self.context.CopyResource(&f.tex, frame);
+                if let Some(c) = &mut self.cursor {
+                    c.forget();
+                }
             }
         }
         Ok(())
