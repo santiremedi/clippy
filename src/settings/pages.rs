@@ -409,16 +409,16 @@ impl SettingsApp {
             );
             // "Solo juegos" graba el juego, y en un juego el cursor no va: ahí no aplica.
             if self.cfg.capture_mode == CaptureMode::Screen {
+                // Al principio de la columna de controles, como los interruptores de audio de esta página, con la
+                // aclaración al lado.
                 row(ui, tr!("Grabar el cursor", "Record the cursor", "Gravar o cursor"), LABEL_W, |ui| {
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        toggle(ui, &mut self.cfg.cursor);
-                    });
+                    toggle(ui, &mut self.cfg.cursor);
+                    ui.add_space(10.0);
+                    hint_label(
+                        ui,
+                        tr!("Solo cuando no hay un juego en pantalla.", "Only when there's no game on screen.", "Só quando não há um jogo na tela."),
+                    );
                 });
-                hint(
-                    ui,
-                    LABEL_W + 8.0,
-                    tr!("Solo cuando no hay un juego en pantalla.", "Only when there's no game on screen.", "Só quando não há um jogo na tela."),
-                );
             }
             divider(ui);
             row(ui, tr!("Memoria", "Memory", "Memória"), LABEL_W, |ui| {

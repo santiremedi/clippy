@@ -556,8 +556,13 @@ pub fn row(ui: &mut egui::Ui, label: &str, label_w: f32, add: impl FnOnce(&mut e
 pub fn hint(ui: &mut egui::Ui, indent: f32, text: impl Into<String>) {
     ui.horizontal(|ui| {
         ui.add_space(indent);
-        ui.add(egui::Label::new(RichText::new(text.into()).size(12.5).color(MUTED)).wrap());
+        hint_label(ui, text);
     });
+}
+
+/// Texto secundario donde va (por ejemplo, al lado de un interruptor).
+pub fn hint_label(ui: &mut egui::Ui, text: impl Into<String>) {
+    ui.add(egui::Label::new(RichText::new(text.into()).size(12.5).color(MUTED)).wrap());
 }
 
 pub fn toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
