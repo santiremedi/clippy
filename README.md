@@ -38,7 +38,8 @@ Solo con `--features devtools`:
 
 | Argumentos | Qué hace |
 | --- | --- |
-| `--test <seg> <carpeta> [game\|desktop\|mic\|juegos\|720\|1080\|1440]` | Graba, guarda un clip y sale (imprime el encoder y el juego detectado; un número elige la resolución del clip). Con la variable `CLIPPY_CPU_ENCODER=1`, codifica con el procesador como en una placa sin encoder; con `CLIPPY_TEST_LOST=<seg>`, a esos segundos se pierde la placa una vez, como en un reinicio del driver. |
+| `--test <seg> <carpeta> [game\|desktop\|mic\|juegos\|720\|1080\|1440]` | Graba, guarda un clip y sale (imprime el encoder y el juego detectado; un número elige la resolución del clip). Con la variable `CLIPPY_CPU_ENCODER=1`, codifica con el procesador como en una placa sin encoder; con `CLIPPY_TEST_LOST=<seg>`, a esos segundos se pierde la placa una vez, como en un reinicio del driver; con `CLIPPY_TEST_STALL=<seg>`, la captura se traba pasado ese tiempo. |
+| `--test-fullscreen <ancho>x<alto> <seg> [alttab]` | Un juego de mentira en pantalla completa exclusiva (cambia el modo de video, como una resolución estirada); con `alttab`, sale y vuelve cada 6 s. Corré una copia del exe con otro nombre para que cuente como juego. |
 | `--test-mic` | Cuánto audio entrega cada micrófono en 3 s. |
 | `--test-download` | Descarga la versión publicada como el botón "Actualizar". |
 | `--test-export`, `--test-frame`, `--test-strip` | Pruebas del editor (ver `src/editor/devtools.rs`). |

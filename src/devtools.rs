@@ -3,9 +3,13 @@
 //! - `--test <segundos> <carpeta> [game|desktop|mic|juegos|resolución]`: graba, guarda un clip y sale. Con
 //!   `CLIPPY_TEST_ALIGN16=1`, el encoder falla con tamaños que no son múltiplo de 16 (`--test 8 <carpeta> 766`).
 //!   Con `CLIPPY_TEST_LOST=<segundos>`, a esos segundos se pierde la placa una vez, como en un reinicio del driver.
+//!   Con `CLIPPY_TEST_STALL=<segundos>`, pasado ese tiempo la captura se traba (la duplicación se pierde apenas se abre).
 //! - `--test-mic`: cuánto audio entrega cada micrófono en 3 s.
 //! - `--test-download`: descarga la versión publicada como el botón "Actualizar".
 //! - `--test-export`, `--test-frame`, `--test-strip`, `--test-covers`: ver `editor::devtools`.
+//! - `--test-fullscreen <ancho>x<alto> <segundos> [alttab]`: un juego de mentira en pantalla completa exclusiva (D3D11,
+//!   cambia el modo de video como una resolución estirada) que cambia de color en cada cuadro; con `alttab`, cada 6 s
+//!   sale 2 s y vuelve. Para que cuente como juego, corré una copia del exe con otro nombre ("clippy" no es juego).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,6 +21,9 @@ pub fn run(args: &[String]) -> Option<i32> {
     let at = |flag: &str| args.iter().position(|a| a == flag);
     if at("--test-download").is_some() {
         return Some(test_download());
+    }
+    if let Some(i) = at("--test-fullscreen") {
+        return Some(test_fullscreen(&args[i + 1..]));
     }
     if at("--test-mic").is_some() {
         return Some(test_mic());
@@ -126,4 +133,105 @@ fn test_mode(args: &[String]) -> i32 {
     }
     println!("ERROR timeout");
     2
+}
+
+fn test_fullscreen(args: &[String]) -> i32 {
+    use windows::core::w;
+    use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+    use windows::Win32::Graphics::Direct3D11::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    use windows::Win32::Graphics::Dxgi::*;
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::*;
+
+    extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+        unsafe { DefWindowProcW(h, m, wp, lp) }
+    }
+    let size = args.first().and_then(|s| s.split_once('x')).and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)));
+    let (w, h): (u32, u32) = size.unwrap_or((1920, 1080));
+    let secs: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10);
+    unsafe {
+        let inst = GetModuleHandleW(None).unwrap();
+        let class = w!("ClippyPruebaPantallaCompleta");
+        RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(proc), hInstance: inst.into(), lpszClassName: class, ..Default::default() });
+        let hwnd = CreateWindowExW(WINDOW_EX_STYLE(0), class, class, WS_POPUP | WS_VISIBLE, 0, 0, w as i32, h as i32, None, None, inst, None).unwrap();
+        let _ = SetForegroundWindow(hwnd);
+        let mode = DXGI_MODE_DESC {
+            Width: w,
+            Height: h,
+            RefreshRate: DXGI_RATIONAL { Numerator: 60, Denominator: 1 },
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            ..Default::default()
+        };
+        let desc = DXGI_SWAP_CHAIN_DESC {
+            BufferDesc: mode,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+            BufferCount: 2,
+            OutputWindow: hwnd,
+            Windowed: true.into(),
+            SwapEffect: DXGI_SWAP_EFFECT_DISCARD,
+            Flags: DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH.0 as u32,
+        };
+        let (mut sc, mut dev, mut ctx) = (None, None, None);
+        D3D11CreateDeviceAndSwapChain(
+            None,
+            D3D_DRIVER_TYPE_HARDWARE,
+            HMODULE::default(),
+            D3D11_CREATE_DEVICE_FLAG(0),
+            None,
+            D3D11_SDK_VERSION,
+            Some(&desc),
+            Some(&mut sc),
+            Some(&mut dev),
+            None,
+            Some(&mut ctx),
+        )
+        .unwrap();
+        let (sc, dev, ctx): (IDXGISwapChain, ID3D11Device, ID3D11DeviceContext) = (sc.unwrap(), dev.unwrap(), ctx.unwrap());
+        println!("pantalla completa: {:?}", sc.SetFullscreenState(true, None));
+        println!("modo {w}x{h}: {:?}", sc.ResizeTarget(&mode));
+        // Con "alttab", cada 6 s sale 2 s de la pantalla completa (minimizado), como un Alt+Tab, y vuelve.
+        let alttab = args.get(2).is_some_and(|a| a == "alttab");
+        let mut out = false;
+        let start = std::time::Instant::now();
+        let mut frame = 0u64;
+        while start.elapsed() < Duration::from_secs(secs) {
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            let secs_in = start.elapsed().as_secs_f32();
+            let want_out = alttab && secs_in > 3.0 && secs_in % 6.0 >= 4.0;
+            if want_out != out {
+                out = want_out;
+                if out {
+                    let _ = sc.SetFullscreenState(false, None);
+                    let _ = ShowWindow(hwnd, SW_MINIMIZE);
+                } else {
+                    let _ = ShowWindow(hwnd, SW_RESTORE);
+                    let _ = SetForegroundWindow(hwnd);
+                    let _ = sc.SetFullscreenState(true, None);
+                    let _ = sc.ResizeTarget(&mode);
+                }
+                println!("{:.1} s: {}", secs_in, if out { "Alt+Tab afuera" } else { "vuelve al juego" });
+            }
+            let d = sc.GetDesc().unwrap_or_default();
+            if (d.BufferDesc.Width, d.BufferDesc.Height) != (w, h) {
+                let _ = sc.ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH);
+            }
+            let back: ID3D11Texture2D = sc.GetBuffer(0).unwrap();
+            let mut rtv = None;
+            dev.CreateRenderTargetView(&back, None, Some(&mut rtv)).unwrap();
+            let t = start.elapsed().as_secs_f32();
+            ctx.ClearRenderTargetView(&rtv.unwrap(), &[(t * 0.7).fract(), 0.2, (t * 0.3).fract(), 1.0]);
+            let _ = sc.Present(1, DXGI_PRESENT(0));
+            frame += 1;
+        }
+        let _ = sc.SetFullscreenState(false, None);
+        println!("{frame} cuadros en {secs} s");
+    }
+    0
 }

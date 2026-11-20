@@ -22,6 +22,11 @@ const QUICK_RETRY: i64 = 2_500_000;
 const QUICK_FOR: i64 = 30_000_000;
 const RETRY: i64 = 50_000_000;
 
+/// Un juego adelante manda imágenes todo el tiempo: si pasa esto sin ninguna nueva, la captura quedó trabada (100 ns).
+const STALL: i64 = 50_000_000;
+/// Imágenes nuevas que tiene que haber recibido una sesión para darla por andando (2 s a 60 fps).
+const WORKED: u32 = 120;
+
 /// Qué hizo `Capture::aim`.
 pub enum Aim {
     /// Sigue igual (ya era ese monitor, o no se puede cambiar sin reiniciar y no hacía falta).
@@ -91,12 +96,19 @@ pub struct Capture {
     skipped: Option<HMONITOR>,
     /// Monitores que hicieron perder la placa al pasar a ellos: no se vuelven a probar.
     lost_on: Vec<HMONITOR>,
+    /// Imágenes nuevas recibidas en la sesión (hasta `WORKED`), cuándo llegó la última y cuántas veces se perdió
+    /// la duplicación desde entonces.
+    new_frames: u32,
+    last_new: i64,
+    dup_lost: u32,
 }
 
 impl Capture {
     /// Captura `monitor` (si no hay, ya no existe o está en `lost_on`, el principal u otro). Prueba cada GPU que lo ve:
     /// en notebooks con dos GPUs la que lo enumera primero no siempre puede duplicarlo.
     pub fn new(monitor: Option<HMONITOR>, lost_on: &[HMONITOR]) -> Result<Self> {
+        #[cfg(feature = "devtools")]
+        SESSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
         let mut all = Vec::new();
         let mut i = 0;
@@ -161,10 +173,29 @@ impl Capture {
                 failing: false,
                 skipped: None,
                 lost_on: lost_on.to_vec(),
+                new_frames: 0,
+                last_new: 0,
+                dup_lost: 0,
             };
             cap.open()?;
             Ok(cap)
         }
+    }
+
+    /// El monitor que se graba.
+    pub fn monitor(&self) -> HMONITOR {
+        self.out.monitor
+    }
+
+    /// Si desde `since` (o desde la última imagen nueva, si es después) pasaron `STALL` sin ninguna imagen nueva,
+    /// cuántas veces se perdió la duplicación en ese tiempo.
+    pub fn stalled(&self, now: i64, since: i64) -> Option<u32> {
+        (now - self.last_new.max(since) > STALL).then_some(self.dup_lost)
+    }
+
+    /// La sesión llegó a capturar (si después se traba, es que algo la trabó, no que nunca anduvo).
+    pub fn worked(&self) -> bool {
+        self.new_frames >= WORKED
     }
 
     /// "\\.\DISPLAY2 (NVIDIA GeForce RTX 2060)", para el log.
@@ -301,7 +332,10 @@ impl Capture {
         let dup = self.dup.clone().unwrap();
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut res: Option<IDXGIResource> = None;
-        match unsafe { dup.AcquireNextFrame(0, &mut info, &mut res) } {
+        let got = unsafe { dup.AcquireNextFrame(0, &mut info, &mut res) };
+        #[cfg(feature = "devtools")]
+        let got = test_stall(now, got, &dup);
+        match got {
             Ok(()) => {
                 let r = if info.LastPresentTime != 0 {
                     match res {
@@ -315,13 +349,21 @@ impl Capture {
                     let _ = dup.ReleaseFrame();
                 }
                 self.check(r)?;
+                if info.LastPresentTime != 0 {
+                    self.new_frames = (self.new_frames + 1).min(WORKED);
+                    (self.last_new, self.dup_lost) = (now, 0);
+                }
             }
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {}
             Err(e) => {
                 if let Some(why) = self.removed() {
                     return Err(self.lost(&why, &e));
                 }
-                if e.code() != DXGI_ERROR_ACCESS_LOST {
+                // Se pierde en cada cambio de modo o Alt+Tab y se reabre en el cuadro siguiente. Si queda trabada,
+                // lo nota `stalled`.
+                if e.code() == DXGI_ERROR_ACCESS_LOST {
+                    self.dup_lost += 1;
+                } else {
                     log(&format!("duplicación de {}: {e}", self.out.name));
                 }
                 self.dup = None;
@@ -374,6 +416,27 @@ fn test_lost(now: i64) -> bool {
     static DONE: AtomicBool = AtomicBool::new(false);
     let at = std::env::var("CLIPPY_TEST_LOST").ok().and_then(|s| s.parse::<i64>().ok());
     at.is_some_and(|s| now >= s * 10_000_000) && !DONE.swap(true, Ordering::Relaxed)
+}
+
+/// Prueba: cuántas veces se creó la captura (la primera sesión es la que se traba con `CLIPPY_TEST_STALL`).
+#[cfg(feature = "devtools")]
+static SESSIONS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Prueba (CLIPPY_TEST_STALL=<segundos>): pasado ese tiempo de la primera sesión, la duplicación se pierde apenas se
+/// abre, como con algunos juegos en pantalla completa exclusiva en Windows 11 24H2.
+#[cfg(feature = "devtools")]
+fn test_stall(now: i64, got: windows::core::Result<()>, dup: &IDXGIOutputDuplication) -> windows::core::Result<()> {
+    let after = std::env::var("CLIPPY_TEST_STALL").ok().and_then(|s| s.parse::<i64>().ok());
+    let first = SESSIONS.load(std::sync::atomic::Ordering::Relaxed) == 1;
+    if !after.is_some_and(|s| first && now >= s * 10_000_000) {
+        return got;
+    }
+    if got.is_ok() {
+        unsafe {
+            let _ = dup.ReleaseFrame();
+        }
+    }
+    Err(DXGI_ERROR_ACCESS_LOST.into())
 }
 
 /// Monitores conectados al escritorio que ve esta GPU.
