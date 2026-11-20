@@ -29,7 +29,22 @@ pub enum Aim {
     Switched,
     /// Hay que reiniciar la captura: el monitor está en otra GPU o el video tiene que tomar su resolución.
     Restart,
+    /// Se perdió la placa al abrir ese monitor: hay que volver a empezar grabando este (el de antes).
+    Lost(HMONITOR),
 }
+
+/// Se perdió la placa de video (reinicio del driver, cuelgue, placa desconectada): ese dispositivo no vuelve y la
+/// sesión empieza de nuevo con otro. El motivo ya quedó en el log; no llega a la pantalla.
+#[derive(Debug)]
+pub struct DeviceLost;
+
+impl std::fmt::Display for DeviceLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("se perdió la placa de video")
+    }
+}
+
+impl std::error::Error for DeviceLost {}
 
 /// Última imagen del monitor (BGRA, sin rotar), en la GPU.
 pub struct Frame {
@@ -74,12 +89,14 @@ pub struct Capture {
     failing: bool,
     /// Último monitor que no se pudo seguir sin reiniciar (para avisarlo una sola vez).
     skipped: Option<HMONITOR>,
+    /// Monitores que hicieron perder la placa al pasar a ellos: no se vuelven a probar.
+    lost_on: Vec<HMONITOR>,
 }
 
 impl Capture {
-    /// Captura `monitor` (o el principal si no hay o ya no existe). Prueba cada GPU que lo ve:
+    /// Captura `monitor` (si no hay, ya no existe o está en `lost_on`, el principal u otro). Prueba cada GPU que lo ve:
     /// en notebooks con dos GPUs la que lo enumera primero no siempre puede duplicarlo.
-    pub fn new(monitor: Option<HMONITOR>) -> Result<Self> {
+    pub fn new(monitor: Option<HMONITOR>, lost_on: &[HMONITOR]) -> Result<Self> {
         let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
         let mut all = Vec::new();
         let mut i = 0;
@@ -88,11 +105,12 @@ impl Capture {
             all.extend(outputs(&adapter).into_iter().map(|o| (adapter.clone(), o)));
         }
         let primary = unsafe { MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY) };
-        let want = monitor.filter(|m| all.iter().any(|(_, o)| o.monitor == *m)).unwrap_or(primary);
+        let usable = |m: &HMONITOR| !lost_on.contains(m) && all.iter().any(|(_, o)| o.monitor == *m);
+        let want = monitor.into_iter().chain([primary]).chain(all.iter().map(|(_, o)| o.monitor)).find(usable).unwrap_or(primary);
         let mut last = anyhow!(tr!("no se encontró ningún monitor para grabar", "no monitor found to record", "nenhum monitor encontrado para gravar"));
         for (adapter, out) in all.into_iter().filter(|(_, o)| o.monitor == want) {
             let name = out.name.clone();
-            match Self::open_on(adapter, out) {
+            match Self::open_on(adapter, out, lost_on) {
                 Ok(c) => return Ok(c),
                 Err(e) => {
                     log(&format!("no se pudo capturar {name}: {e}"));
@@ -103,7 +121,7 @@ impl Capture {
         Err(last)
     }
 
-    fn open_on(adapter: IDXGIAdapter1, out: Output) -> Result<Self> {
+    fn open_on(adapter: IDXGIAdapter1, out: Output, lost_on: &[HMONITOR]) -> Result<Self> {
         unsafe {
             let adesc = adapter.GetDesc1()?;
             let mut device = None;
@@ -142,6 +160,7 @@ impl Capture {
                 failing_since: None,
                 failing: false,
                 skipped: None,
+                lost_on: lost_on.to_vec(),
             };
             cap.open()?;
             Ok(cap)
@@ -151,6 +170,34 @@ impl Capture {
     /// "\\.\DISPLAY2 (NVIDIA GeForce RTX 2060)", para el log.
     pub fn describe(&self) -> String {
         format!("{} ({})", self.out.name, self.gpu)
+    }
+
+    /// Si se perdió la placa, por qué (`GetDeviceRemovedReason`), para el log.
+    fn removed(&self) -> Option<String> {
+        let code = unsafe { self.device.GetDeviceRemovedReason() }.err()?.code();
+        let why = match code {
+            DXGI_ERROR_DEVICE_HUNG => "se colgó con comandos de Clippy",
+            DXGI_ERROR_DEVICE_REMOVED => "se desconectó la placa o se actualizó el driver",
+            // Lo que reciben las apps que no la colgaron cuando Windows reinicia la placa (TDR).
+            DXGI_ERROR_DEVICE_RESET => "se reinició la placa por un cuelgue o un reinicio del driver",
+            DXGI_ERROR_DRIVER_INTERNAL_ERROR => "error interno del driver",
+            _ => "motivo desconocido",
+        };
+        Some(format!("{why}, {code}"))
+    }
+
+    /// Anota que se perdió la placa (`why`, y `after`: el error que lo mostró) y devuelve `DeviceLost`.
+    fn lost(&self, why: &str, after: &dyn std::fmt::Display) -> anyhow::Error {
+        log(&format!("se perdió la placa de video grabando {} ({why}; {after}): se vuelve a empezar con otro dispositivo", self.describe()));
+        DeviceLost.into()
+    }
+
+    /// Si `r` falló porque se perdió la placa, devuelve `DeviceLost` (la conversión y el encoder usan este dispositivo).
+    pub fn check<T>(&self, r: Result<T>) -> Result<T> {
+        r.map_err(|e| match self.removed() {
+            Some(why) => self.lost(&why, &e),
+            None => e,
+        })
     }
 
     fn open(&mut self) -> Result<()> {
@@ -171,15 +218,21 @@ impl Capture {
         if monitor == self.out.monitor && (!native || same_size(&self.out)) {
             return Aim::Same;
         }
+        if self.lost_on.contains(&monitor) {
+            // Ni por el juego: se volvería a perder la placa.
+            return self.skip(monitor, false, "hizo perder la placa de video");
+        }
         let Some(out) = outputs(&self.adapter).into_iter().find(|o| o.monitor == monitor) else {
             return self.skip(monitor, native, "está en otra GPU");
         };
-        if native && !same_size(&out) {
-            log(&format!("{} tiene otra resolución ({}x{}): reiniciando la captura", out.name, out.width, out.height));
-            return Aim::Restart;
-        }
+        let restart = native && !same_size(&out);
         let prev = std::mem::replace(&mut self.out, out);
+        // Se abre aunque haya que reiniciar: así se sabe antes si ese monitor hace perder la placa.
         match self.open() {
+            Ok(()) if restart => {
+                log(&format!("{} tiene otra resolución ({}x{}): reiniciando la captura", self.out.name, self.out.width, self.out.height));
+                Aim::Restart
+            }
             Ok(()) => {
                 log(&format!("grabando {}", self.describe()));
                 (self.failing, self.failing_since) = (false, None);
@@ -188,9 +241,16 @@ impl Capture {
             }
             Err(e) => {
                 // Se vuelve al monitor de antes; `poll` reabre su duplicación.
-                self.out = prev;
+                let failed = std::mem::replace(&mut self.out, prev);
                 self.dup = None;
                 self.retry_at = 0;
+                if let Some(why) = self.removed() {
+                    log(&format!(
+                        "se perdió la placa de video al abrir {} ({why}; {e}): se vuelve a empezar grabando {} y no se prueba más ese monitor",
+                        failed.name, self.out.name
+                    ));
+                    return Aim::Lost(self.out.monitor);
+                }
                 self.skip(monitor, native, &format!("no se pudo capturar con esta GPU ({e})"))
             }
         }
@@ -208,14 +268,22 @@ impl Capture {
         Aim::Same
     }
 
-    /// Toma la imagen más reciente si hubo cambios (no bloquea).
+    /// Toma la imagen más reciente si hubo cambios (no bloquea). Devuelve `DeviceLost` si se perdió la placa.
     pub fn poll(&mut self, now: i64) -> Result<()> {
+        #[cfg(feature = "devtools")]
+        if test_lost(now) {
+            return Err(self.lost("prueba CLIPPY_TEST_LOST", &"sin error"));
+        }
         if self.dup.is_none() {
             if now < self.retry_at {
                 return Ok(());
             }
-            // Escritorio seguro (UAC, bloqueo), cambio de modo u otra app que ocupa la duplicación.
+            // Escritorio seguro (UAC, bloqueo), cambio de modo u otra app que ocupa la duplicación. Si se perdió la
+            // placa, reintentar con este dispositivo no sirve.
             if let Err(e) = self.open() {
+                if let Some(why) = self.removed() {
+                    return Err(self.lost(&why, &e));
+                }
                 let since = *self.failing_since.get_or_insert(now);
                 let quick = now - since < QUICK_FOR;
                 self.retry_at = now + if quick { QUICK_RETRY } else { RETRY };
@@ -246,10 +314,13 @@ impl Capture {
                 unsafe {
                     let _ = dup.ReleaseFrame();
                 }
-                r?;
+                self.check(r)?;
             }
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {}
             Err(e) => {
+                if let Some(why) = self.removed() {
+                    return Err(self.lost(&why, &e));
+                }
                 if e.code() != DXGI_ERROR_ACCESS_LOST {
                     log(&format!("duplicación de {}: {e}", self.out.name));
                 }
@@ -293,6 +364,16 @@ impl Capture {
         }
         Ok(())
     }
+}
+
+/// Prueba (CLIPPY_TEST_LOST=<segundos>): a esos segundos de grabar se pierde la placa, una sola vez, como en un
+/// reinicio del driver.
+#[cfg(feature = "devtools")]
+fn test_lost(now: i64) -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    let at = std::env::var("CLIPPY_TEST_LOST").ok().and_then(|s| s.parse::<i64>().ok());
+    at.is_some_and(|s| now >= s * 10_000_000) && !DONE.swap(true, Ordering::Relaxed)
 }
 
 /// Monitores conectados al escritorio que ve esta GPU.

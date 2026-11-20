@@ -2,6 +2,7 @@
 //!
 //! - `--test <segundos> <carpeta> [game|desktop|mic|juegos|resolución]`: graba, guarda un clip y sale. Con
 //!   `CLIPPY_TEST_ALIGN16=1`, el encoder falla con tamaños que no son múltiplo de 16 (`--test 8 <carpeta> 766`).
+//!   Con `CLIPPY_TEST_LOST=<segundos>`, a esos segundos se pierde la placa una vez, como en un reinicio del driver.
 //! - `--test-mic`: cuánto audio entrega cada micrófono en 3 s.
 //! - `--test-download`: descarga la versión publicada como el botón "Actualizar".
 //! - `--test-export`, `--test-frame`, `--test-strip`, `--test-covers`: ver `editor::devtools`.

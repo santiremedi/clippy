@@ -11,7 +11,7 @@ use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
 
 use super::audio::{self, Audio, AudioBuf, Source};
-use super::capture::{Aim, Capture};
+use super::capture::{Aim, Capture, DeviceLost};
 use super::clock::{now_100ns, Timer};
 use super::convert::Converter;
 use super::encoder::{Device, Encoder, Packet};
@@ -81,6 +81,18 @@ enum End {
     Stop,
     /// Volver a empezar grabando este monitor (el del juego).
     Restart(HMONITOR),
+    /// Se perdió la placa al pasar a `on`: volver a empezar grabando `back` (el de antes) y no probar más `on`.
+    Lost { on: HMONITOR, back: HMONITOR },
+}
+
+/// Qué monitor graba cada sesión al empezar.
+#[derive(Default)]
+struct Target {
+    /// El del juego que pidió reiniciar (ya se graba a su resolución: no se vuelve a pedir) o el de antes de perder
+    /// la placa. Si no hay, el del juego o el de la ventana activa.
+    monitor: Option<HMONITOR>,
+    /// Los que hicieron perder la placa al pasar a ellos: no se vuelven a probar.
+    lost_on: Vec<HMONITOR>,
 }
 
 /// Cada cuánto se vuelve a intentar grabar después de un error.
@@ -91,30 +103,35 @@ fn thread_main(mut cfg: Config, rx: Receiver<Cmd>, notify: Notify) {
     unsafe {
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     }
-    let mut target = None;
+    let mut target = Target::default();
     // El último error avisado: mientras se repita en cada reintento, no se vuelve a anotar ni avisar.
     let mut failing = None;
     // Una vez que el encoder rechazó un tamaño que no es múltiplo de 16, se graba siempre alineado.
     let mut align = false;
     loop {
-        let monitor = target.take();
         let mut untested = None;
-        match session(&mut cfg, &rx, &notify, monitor, &mut failing, align, &mut untested) {
+        match session(&mut cfg, &rx, &notify, &target, &mut failing, align, &mut untested) {
             Ok(End::Stop) => break,
-            Ok(End::Restart(m)) => target = Some(m),
+            Ok(End::Restart(m)) => target.monitor = Some(m),
+            Ok(End::Lost { on, back }) => {
+                target.lost_on.push(on);
+                target.monitor = Some(back);
+            }
             // Quick Sync acepta el tamaño al configurarse y falla con el primer cuadro si no está alineado: Intel pide
             // ancho múltiplo de 16 y algunos drivers de 2022 (HD 620) ancho y alto múltiplos de 4. 1366x768 no cumple
-            // ninguno de los dos: se reintenta al toque, alineado a 16.
-            Err(e) if untested.is_some_and(|s| align16(s) != s) => {
+            // ninguno de los dos: se reintenta al toque, alineado a 16 (con el mismo monitor).
+            Err(e) if !e.is::<DeviceLost>() && untested.is_some_and(|s| align16(s) != s) => {
                 let (w, h) = untested.unwrap();
                 let (aw, ah) = align16((w, h));
                 log(&format!("el encoder no acepta {w}x{h} ({e:?}): se graba a {aw}x{ah}"));
                 align = true;
-                target = monitor;
             }
             Err(e) => {
+                target.monitor = None;
                 let msg = e.to_string();
-                if failing.as_ref() != Some(&msg) {
+                // Si se perdió la placa ya se anotó por qué: se vuelve a grabar con otro dispositivo sin avisar (si no
+                // arranca, eso sí se avisa).
+                if !e.is::<DeviceLost>() && failing.as_ref() != Some(&msg) {
                     log(&format!("error de captura: {e:?} (se reintenta cada {} s)", RETRY.as_secs()));
                     notify(Event::Error(msg.clone()));
                     failing = Some(msg);
@@ -241,7 +258,6 @@ fn align16((w, h): (u32, u32)) -> (u32, u32) {
     ((w & !15).max(16), (h & !15).max(16))
 }
 
-/// `restarted`: el monitor del juego que pidió reiniciar (ya se grabó a su resolución; no se vuelve a pedir).
 /// `failing`: el error que se avisó; se olvida al volver a grabar.
 /// `align`: grabar a un tamaño múltiplo de 16. `untested`: el tamaño del video mientras el encoder todavía no
 /// entregó ningún cuadro (None hasta que se configura y otra vez cuando codifica).
@@ -249,7 +265,7 @@ fn session(
     cfg: &mut Config,
     rx: &Receiver<Cmd>,
     notify: &Notify,
-    restarted: Option<HMONITOR>,
+    target: &Target,
     failing: &mut Option<String>,
     align: bool,
     untested: &mut Option<(u32, u32)>,
@@ -257,7 +273,7 @@ fn session(
     let mut game = game::Detector::default();
     game.poll(0);
     // Qué monitor grabar: el del juego; si no hay juego, el de la ventana activa; si no, el principal.
-    let mut cap = Capture::new(restarted.or_else(|| game.monitor()).or_else(game::active_monitor))?;
+    let mut cap = Capture::new(target.monitor.or_else(|| game.monitor()).or_else(game::active_monitor), &target.lost_on)?;
     let mut size = cfg.video_size((cap.width, cap.height));
     if align {
         size = align16(size);
@@ -295,7 +311,7 @@ fn session(
         masks: Vec::new(),
     };
     notify(Event::Game(au.game.name()));
-    let mut game_monitor = restarted;
+    let mut game_monitor = target.monitor;
     let mut next_aim = 0i64;
     // Cuándo controlar la imagen del monitor actual (una vez por cada `Converter`).
     let mut probe_at: Option<i64> = None;
@@ -337,15 +353,17 @@ fn session(
             let native = gm.is_some() && gm != game_monitor;
             game_monitor = gm;
             if let Some(m) = gm.or_else(game::active_monitor) {
-                if let Aim::Restart = cap.aim(m, native) {
-                    return Ok(End::Restart(m));
+                match cap.aim(m, native) {
+                    Aim::Restart => return Ok(End::Restart(m)),
+                    Aim::Lost(back) => return Ok(End::Lost { on: m, back }),
+                    Aim::Same | Aim::Switched => {}
                 }
             }
         }
         cap.poll(now)?;
         if let Some(f) = &cap.latest {
             if !conv.as_ref().is_some_and(|c| c.is_for(f)) {
-                conv = Some(Converter::new(&cap.device, &cap.context, f, w, h, fps, 8)?);
+                conv = Some(cap.check(Converter::new(&cap.device, &cap.context, f, w, h, fps, 8))?);
                 probe_at = Some(now + PROBE_AFTER);
             }
         }
@@ -354,7 +372,7 @@ fn session(
         au.desktop.poll(t0);
         au.mic.poll(t0);
 
-        enc.poll(&mut out)?;
+        cap.check(enc.poll(&mut out))?;
         packets.extend(out.drain(..));
         if !packets.is_empty() {
             *untested = None;
@@ -366,7 +384,7 @@ fn session(
             if let Some(c) = conv.as_mut() {
                 // Solo convertir si el encoder pidió otra imagen; si está ocupado se salta un cuadro.
                 if enc.pending_input > 0 {
-                    let tex = if visible { c.convert()? } else { c.black() };
+                    let tex = if visible { cap.check(c.convert())? } else { c.black() };
                     if visible && probe_at.is_some_and(|t| now >= t) {
                         probe_at = None;
                         log(&c.probe(&tex));
@@ -375,7 +393,7 @@ fn session(
                     if reject {
                         anyhow::bail!("encoder de prueba: {w}x{h} no es múltiplo de 16 (0x80004005)");
                     }
-                    enc.feed(&tex, pts, frame_dur)?;
+                    cap.check(enc.feed(&tex, pts, frame_dur))?;
                 }
             }
             next_frame = pts + frame_dur;
