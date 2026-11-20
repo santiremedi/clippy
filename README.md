@@ -43,6 +43,7 @@ Solo con `--features devtools`:
 | `--test-mic` | Cuánto audio entrega cada micrófono en 3 s. |
 | `--test-download` | Descarga la versión publicada como el botón "Actualizar". |
 | `--test-export`, `--test-frame`, `--test-strip` | Pruebas del editor (ver `src/editor/devtools.rs`). |
+| `--settings` o `--editor` con `CLIPPY_TEST_WINDOW=<ancho>x<alto>` | La ventana se abre de ese tamaño y sin maximizar, para ver cómo queda angosta (`760x560` es la de ajustes más chica). |
 
 ## Mapa del código
 

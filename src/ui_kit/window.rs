@@ -34,6 +34,10 @@ pub fn maximize_once(ctx: &egui::Context, done: &mut bool, title: &str) {
         return;
     }
     *done = true;
+    #[cfg(feature = "devtools")]
+    if test_window().is_some() {
+        return;
+    }
     use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTOPRIMARY};
     use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
     use windows::Win32::UI::WindowsAndMessaging::*;
@@ -70,13 +74,25 @@ pub fn maximize_once(ctx: &egui::Context, done: &mut bool, title: &str) {
 /// Opciones comunes de ventana: título, tamaño mínimo y el ícono de la app.
 /// Se maximiza en el primer cuadro con `maximize_once`, antes de que se vea.
 pub fn window_options(title: &str, min: [f32; 2]) -> eframe::NativeOptions {
-    eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(title)
-            .with_min_inner_size(min)
-            .with_icon(std::sync::Arc::new(super::icon::window_icon())),
-        ..Default::default()
-    }
+    let viewport = egui::ViewportBuilder::default()
+        .with_title(title)
+        .with_min_inner_size(min)
+        .with_icon(std::sync::Arc::new(super::icon::window_icon()));
+    #[cfg(feature = "devtools")]
+    let viewport = match test_window() {
+        Some(size) => viewport.with_inner_size(size),
+        None => viewport,
+    };
+    eframe::NativeOptions { viewport, ..Default::default() }
+}
+
+/// Prueba (CLIPPY_TEST_WINDOW=<ancho>x<alto>): la ventana se abre de ese tamaño y sin maximizar (lo más chico es su
+/// tamaño mínimo), para ver cómo queda angosta.
+#[cfg(feature = "devtools")]
+fn test_window() -> Option<[f32; 2]> {
+    let s = std::env::var("CLIPPY_TEST_WINDOW").ok()?;
+    let (w, h) = s.split_once('x')?;
+    Some([w.parse().ok()?, h.parse().ok()?])
 }
 
 /// Ventana de nivel superior con ese título que pertenezca a un proceso clippy.exe

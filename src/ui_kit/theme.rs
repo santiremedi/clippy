@@ -161,7 +161,7 @@ pub fn setup_style(ctx: &egui::Context) {
     style.spacing.interact_size.y = 30.0;
     style.spacing.scroll.floating = true;
     style.text_styles.insert(TextStyle::Body, FontId::proportional(14.5));
-    style.text_styles.insert(TextStyle::Button, FontId::proportional(14.0));
+    style.text_styles.insert(TextStyle::Button, button_font());
     style.text_styles.insert(TextStyle::Small, FontId::proportional(12.0));
     ctx.set_style(style);
     // Ctrl+más/menos/0 son atajos del editor (zoom de la línea de tiempo): que egui no agrande toda la interfaz.
@@ -431,9 +431,19 @@ pub fn button_sized(ui: &mut egui::Ui, text: &str, kind: Kind, size: Vec2) -> eg
     button_impl(ui, None, text, kind, size)
 }
 
+/// Letra de los botones.
+fn button_font() -> FontId {
+    FontId::proportional(14.0)
+}
+
+/// Ancho del texto de un botón.
+fn text_width(ui: &egui::Ui, text: &str) -> f32 {
+    ui.painter().layout_no_wrap(text.to_owned(), button_font(), Color32::PLACEHOLDER).size().x
+}
+
 fn button_impl(ui: &mut egui::Ui, glyph: Option<Glyph>, text: &str, kind: Kind, size: Vec2) -> egui::Response {
     let enabled = ui.is_enabled();
-    let galley = ui.painter().layout_no_wrap(text.to_owned(), FontId::proportional(14.0), Color32::PLACEHOLDER);
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), button_font(), Color32::PLACEHOLDER);
     let icon_w = match glyph {
         Some(_) if text.is_empty() => GLYPH_W,
         Some(_) => GLYPH_W + GLYPH_GAP,
@@ -479,19 +489,48 @@ pub fn wide_button(ui: &mut egui::Ui, text: &str, kind: Kind, h: f32) -> egui::R
     button_sized(ui, text, kind, egui::vec2(w, h))
 }
 
-/// Grupo de opciones (una sola elegida), del mismo ancho cada una.
+/// Grupo de opciones (una sola elegida) que llena el ancho: del mismo ancho cada una si así entran los textos; si no,
+/// cada una mide su texto y lo que sobra se reparte. Si ni así entran en una línea, siguen en otra (cada línea llena el
+/// ancho) en vez de cortar el texto.
 pub fn seg<T: PartialEq + Copy>(ui: &mut egui::Ui, v: &mut T, opts: &[(T, &str)]) -> bool {
+    const GAP: f32 = 4.0;
+    // Aire mínimo a los costados del texto (sumando los dos lados).
+    const PAD: f32 = 20.0;
+    let width = ui.available_width();
+    let need: Vec<f32> = opts.iter().map(|(_, l)| text_width(ui, l) + PAD).collect();
+    // Cuántas opciones van en cada línea: las que entran, de izquierda a derecha.
+    let mut lines = vec![0usize];
+    let mut used = 0.0;
+    for &w in &need {
+        let n = lines.last_mut().unwrap();
+        if *n > 0 && used + GAP + w > width {
+            lines.push(0);
+            used = 0.0;
+        }
+        used += if used > 0.0 { GAP } else { 0.0 } + w;
+        *lines.last_mut().unwrap() += 1;
+    }
     let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        let n = opts.len() as f32;
-        let w = ((ui.available_width() - 4.0 * (n - 1.0)) / n).floor().max(48.0);
-        for (val, label) in opts {
-            let kind = if *v == *val { Kind::Selected } else { Kind::Secondary };
-            if button_sized(ui, label, kind, egui::vec2(w, 32.0)).clicked() && *v != *val {
-                *v = *val;
-                changed = true;
-            }
+    let mut first = 0;
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(GAP, GAP);
+        for n in lines {
+            let line = first..first + n;
+            first += n;
+            ui.horizontal(|ui| {
+                let free = width - GAP * (n as f32 - 1.0);
+                let equal = free / n as f32;
+                let spare = ((free - need[line.clone()].iter().sum::<f32>()) / n as f32).max(0.0);
+                let fits = need[line.clone()].iter().all(|&w| w <= equal);
+                for ((val, label), need) in opts[line.clone()].iter().zip(&need[line]) {
+                    let w = if fits { equal } else { need + spare }.floor();
+                    let kind = if *v == *val { Kind::Selected } else { Kind::Secondary };
+                    if button_sized(ui, label, kind, egui::vec2(w, 32.0)).clicked() && *v != *val {
+                        *v = *val;
+                        changed = true;
+                    }
+                }
+            });
         }
     });
     changed
