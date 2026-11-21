@@ -24,7 +24,7 @@ use crate::mf::{frames_at, Mf};
 use crate::ui_kit::sound;
 
 pub enum Cmd {
-    Save,
+    Save { seconds: u32 },
     /// Cambios que no necesitan reiniciar el video (duración, audio, sonido, carpeta).
     Update(Config),
     Stop,
@@ -59,8 +59,8 @@ impl Recorder {
         Self { tx, handle }
     }
 
-    pub fn save(&self) {
-        let _ = self.tx.send(Cmd::Save);
+    pub fn save(&self, seconds: u32) {
+        let _ = self.tx.send(Cmd::Save { seconds });
     }
 
     pub fn update(&self, cfg: Config) {
@@ -139,7 +139,7 @@ fn thread_main(mut cfg: Config, rx: Receiver<Cmd>, notify: Notify) {
                 match rx.recv_timeout(RETRY) {
                     Ok(Cmd::Stop) | Err(RecvTimeoutError::Disconnected) => break,
                     Ok(Cmd::Update(c)) => cfg = c,
-                    Ok(Cmd::Save) => notify(Event::SaveFailed(tr!("Clippy no está grabando en este momento", "Clippy isn't recording right now", "O Clippy não está gravando agora").into())),
+                    Ok(Cmd::Save { .. }) => notify(Event::SaveFailed(tr!("Clippy no está grabando en este momento", "Clippy isn't recording right now", "O Clippy não está gravando agora").into())),
                     Err(RecvTimeoutError::Timeout) => {}
                 }
             }
@@ -293,7 +293,7 @@ fn session(
         "grabando {} a {w}x{h} @ {fps} fps, H.264 {} Mbps, buffer {} s (máximo en esta PC: {} s), encoder: {}",
         cap.describe(),
         cfg.bitrate_mbps,
-        cfg.seconds,
+        cfg.buffer_seconds(),
         cfg.max_seconds(),
         enc.name
     ));
@@ -328,9 +328,10 @@ fn session(
         loop {
             match rx.try_recv() {
                 Ok(Cmd::Stop) | Err(TryRecvError::Disconnected) => return Ok(End::Stop),
-                Ok(Cmd::Save) => {
+                Ok(Cmd::Save { seconds }) => {
                     let now = now_100ns() - t0;
-                    if save_clip(cfg, &packets, &enc, &au, now, frame_dur, notify) && cfg.sound_on_save {
+                    let from = now - seconds as i64 * 10_000_000;
+                    if save_clip(cfg, &packets, &enc, &au, from, frame_dur, notify) && cfg.sound_on_save {
                         sound::play_saved();
                         au.masks.push((now, now + sound::SAVED_LEN + SOUND_LATENCY));
                     }
@@ -343,7 +344,7 @@ fn session(
                 Err(TryRecvError::Empty) => break,
             }
         }
-        let keep = cfg.seconds as i64 * 10_000_000;
+        let keep = cfg.buffer_seconds() as i64 * 10_000_000;
 
         let now = now_100ns() - t0;
         if au.game.poll(now) {
@@ -499,18 +500,17 @@ fn mixed_audio(cfg: &Config, au: &AudioState, from: i64, to: i64) -> Vec<i16> {
 }
 
 /// Arma el trabajo de guardado y lo lanza en otro hilo. Devuelve false si no había nada que guardar.
-fn save_clip(cfg: &Config, packets: &VecDeque<Packet>, enc: &Encoder, au: &AudioState, now: i64, frame_dur: i64, notify: &Notify) -> bool {
-    let keep = cfg.seconds as i64 * 10_000_000;
+/// `from` is the start of the requested window (100 ns since capture start).
+fn save_clip(cfg: &Config, packets: &VecDeque<Packet>, enc: &Encoder, au: &AudioState, from: i64, frame_dur: i64, notify: &Notify) -> bool {
     let no_video = || tr!("todavía no hay video en el buffer", "there's no video in the buffer yet", "ainda não há vídeo no buffer");
     let fail = |m: &str| {
         notify(Event::SaveFailed(m.into()));
         false
     };
     let Some(video_type) = enc.type_blob() else { return fail(no_video()) };
-    let min = now - keep;
     let start = packets
         .iter()
-        .rposition(|p| p.key && p.pts <= min)
+        .rposition(|p| p.key && p.pts <= from)
         .or_else(|| packets.iter().position(|p| p.key));
     let Some(start) = start else { return fail(no_video()) };
     let pk: Vec<Packet> = packets.iter().skip(start).cloned().collect();

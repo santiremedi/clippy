@@ -19,7 +19,7 @@ use super::keys::hotkey_name;
 use super::status::{self, Status};
 use super::mode::{Mode, Window, TRAY_CLASS, TRAY_MUTEX, WM_HOTKEY_SUSPEND, WM_REC_EVENT, WM_RELOAD, WM_TRAY, WM_UPDATE};
 use super::update;
-use crate::config::{self, Config, GlobalAction};
+use crate::config::{self, Config, GlobalAction, HotkeySlot, MAX_CLIP_KEYS};
 use crate::i18n::{tr, trf};
 use crate::log::log;
 use crate::record::recorder::{Event, Notify, Recorder};
@@ -163,7 +163,7 @@ fn notifier(hwnd: HWND) -> Notify {
 impl App {
     fn apply(&mut self, new: Config, startup: bool) {
         let restart = new.video_params() != self.cfg.video_params();
-        let keys = |c: &Config| (GlobalAction::ALL.map(|a| c.hotkey(a)), c.enabled);
+        let keys = |c: &Config| (c.hotkey_slots(), c.enabled);
         let hotkey_changed = keys(&new) != keys(&self.cfg);
         self.cfg = new;
         if restart || (self.cfg.enabled && self.rec.is_none()) {
@@ -200,6 +200,10 @@ impl App {
             for a in GlobalAction::ALL {
                 let _ = UnregisterHotKey(self.hwnd, a.id());
             }
+            // Rows removed from the config are not listed anymore: clear the whole extra range.
+            for i in 0..MAX_CLIP_KEYS {
+                let _ = UnregisterHotKey(self.hwnd, config::slot_id(HotkeySlot::Clip(i)));
+            }
         }
     }
 
@@ -207,13 +211,13 @@ impl App {
     fn register_hotkeys(&mut self) -> Vec<String> {
         self.unregister_all();
         let mut failed = Vec::new();
-        for a in GlobalAction::ALL {
-            let (vk, mods) = self.cfg.hotkey(a);
-            // Guardar clip solo mientras graba; los demás, siempre.
-            if vk == 0 || (a == GlobalAction::SaveClip && !self.cfg.enabled) {
+        for (slot, vk, mods) in self.cfg.hotkey_slots() {
+            // A clip needs the recorder running; the other actions work always.
+            let saving = matches!(slot, HotkeySlot::Clip(_)) || slot == HotkeySlot::Global(GlobalAction::SaveClip);
+            if vk == 0 || (saving && !self.cfg.enabled) {
                 continue;
             }
-            let ok = unsafe { RegisterHotKey(self.hwnd, a.id(), HOT_KEY_MODIFIERS(mods | MOD_NOREPEAT.0), vk).is_ok() };
+            let ok = unsafe { RegisterHotKey(self.hwnd, config::slot_id(slot), HOT_KEY_MODIFIERS(mods | MOD_NOREPEAT.0), vk).is_ok() };
             if !ok {
                 failed.push(hotkey_name(vk, mods));
             }
@@ -268,9 +272,9 @@ impl App {
         }
     }
 
-    fn save_clip(&self) {
+    fn save_clip(&self, seconds: u32) {
         if let Some(r) = &self.rec {
-            r.save();
+            r.save(seconds);
         }
     }
 
@@ -383,7 +387,7 @@ fn run_command(id: usize) {
             with_app(|a| a.toggle());
         }
         ID_SAVE => {
-            with_app(|a| a.save_clip());
+            with_app(|a| a.save_clip(a.cfg.seconds));
         }
         ID_SETTINGS => open_settings(),
         ID_EDITOR => open_editor(),
@@ -420,11 +424,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_HOTKEY => {
-            match GlobalAction::from_id(wp.0 as i32) {
-                Some(GlobalAction::SaveClip) => {
-                    with_app(|a| a.save_clip());
+            match config::slot_from_id(wp.0 as i32) {
+                Some(HotkeySlot::Global(GlobalAction::SaveClip)) => {
+                    with_app(|a| a.save_clip(a.cfg.seconds));
                 }
-                Some(GlobalAction::ToggleRecording) => {
+                Some(HotkeySlot::Global(GlobalAction::ToggleRecording)) => {
                     // Desde el juego no se ve la bandeja: avisar con un sonido.
                     with_app(|a| {
                         a.toggle();
@@ -435,8 +439,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         }
                     });
                 }
-                Some(GlobalAction::OpenEditor) => open_editor(),
-                Some(GlobalAction::OpenFolder) => open_clips_folder(),
+                Some(HotkeySlot::Global(GlobalAction::OpenEditor)) => open_editor(),
+                Some(HotkeySlot::Global(GlobalAction::OpenFolder)) => open_clips_folder(),
+                Some(HotkeySlot::Clip(i)) => {
+                    with_app(|a| {
+                        if let Some(k) = a.cfg.clip_keys.get(i) {
+                            a.save_clip(k.seconds);
+                        }
+                    });
+                }
                 None => {}
             }
             LRESULT(0)

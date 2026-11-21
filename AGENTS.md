@@ -53,7 +53,10 @@ Con `gh`, armá el cuerpo con las mismas secciones que la plantilla.
 
 - Modos del exe, argumentos, candados, títulos de ventana y mensajes a la bandeja: solo en
   `src/app/mode.rs` (`Mode`, `Window`). No escribas `"--settings"` ni `"Local\\Clippy..."` en otro lado.
-- Atajos globales: `config::GlobalAction` (ids, etiqueta, tecla). Atajos del editor: `editor/shortcuts.rs`.
+- Atajos globales: `config::HotkeySlot` (ids, etiqueta, tecla; `GlobalAction` son las acciones fijas y
+  `HotkeySlot::Clip` las otras duraciones de `clip_keys`). Atajos del editor: `editor/shortcuts.rs`.
+- Buffer de la grabadora: `config::buffer_seconds()` (la duración más larga entre `seconds` y
+  `clip_keys` con tecla). Guardar nunca pide más que eso, así que una duración corta usa el mismo buffer.
 - Qué cuenta como juego: solo `src/record/game.rs` (lo usan el modo "Solo juegos" y el canal de audio).
 - `config.json` lo escriben la ventana de ajustes y la bandeja; `editor.json` solo el editor;
   `recorder.json` (con qué graba y por qué no puede, `app/status.rs`) solo la bandeja.

@@ -11,7 +11,7 @@ use crate::app::keys::{self, hotkey_name};
 use crate::app::mode::{close_tray, find_tray, post_tray, Window, WM_HOTKEY_SUSPEND, WM_RELOAD};
 use crate::app::status::{self, Status};
 use crate::app::update;
-use crate::config::{self, Config, GlobalAction};
+use crate::config::{self, Config, GlobalAction, HotkeySlot};
 use crate::i18n::{self, tr, trf};
 use crate::record::audio;
 use crate::ui_kit::theme::*;
@@ -54,7 +54,7 @@ struct SettingsApp {
     prev: Config,
     last_edit: Option<Instant>,
     /// Atajo global que se está eligiendo.
-    capturing: Option<GlobalAction>,
+    capturing: Option<HotkeySlot>,
     global_note: Option<String>,
     ignore_clicks_until: Instant,
     autostart: bool,
@@ -194,11 +194,11 @@ impl SettingsApp {
     }
 
     /// Empieza a esperar la tecla nueva para ese atajo (la bandeja suelta sus atajos mientras tanto).
-    fn start_capture(&mut self, a: GlobalAction) {
+    fn start_capture(&mut self, slot: HotkeySlot) {
         if self.capturing.is_some() || Instant::now() <= self.ignore_clicks_until {
             return;
         }
-        self.capturing = Some(a);
+        self.capturing = Some(slot);
         self.global_note = None;
         post_tray(WM_HOTKEY_SUSPEND, 1);
     }
@@ -269,24 +269,46 @@ impl SettingsApp {
         let Some(slot) = self.capturing else { return };
         if let Some((vk, mods)) = keys::pressed_key() {
             if vk != 0x1B {
-                // Si otro atajo global usaba la misma tecla, queda libre.
                 self.global_note = None;
-                for other in GlobalAction::ALL {
-                    if other != slot && self.cfg.hotkey(other) == (vk, mods) {
-                        let (v, m) = self.cfg.hotkey_mut(other);
+                let main = HotkeySlot::Global(GlobalAction::SaveClip);
+                if slot != main && self.cfg.hotkey_slot(main) == (vk, mods) {
+                    // The main save key always keeps its key: block instead of taking it away.
+                    self.global_note = Some(tr!(
+                        "Esa tecla ya guarda clips. Elegí otra.",
+                        "That key already saves clips. Pick another one.",
+                        "Essa tecla já salva clipes. Escolha outra."
+                    ).into());
+                } else {
+                    // Si otro atajo usaba la misma tecla, queda libre.
+                    let clashing: Vec<HotkeySlot> = self
+                        .cfg
+                        .hotkey_slots()
+                        .into_iter()
+                        .filter(|&(s, v, m)| s != slot && v == vk && m == mods)
+                        .map(|(s, _, _)| s)
+                        .collect();
+                    for other in clashing {
+                        let label = match other {
+                            HotkeySlot::Global(a) => a.label().to_string(),
+                            HotkeySlot::Clip(i) => {
+                                let seconds = fmt_secs(self.cfg.clip_keys[i].seconds);
+                                trf!("Guardar los últimos {seconds}", "Save the last {seconds}", "Salvar os últimos {seconds}")
+                            }
+                        };
+                        let (v, m) = self.cfg.hotkey_slot_mut(other);
                         *v = 0;
                         *m = 0;
-                        let (label, key) = (other.label(), hotkey_name(vk, mods));
+                        let key = hotkey_name(vk, mods);
                         self.global_note = Some(trf!(
                             "«{label}» quedó sin tecla porque usaba {key}.",
                             "“{label}” no longer has a key because it used {key}.",
                             "“{label}” ficou sem tecla porque usava {key}."
                         ));
                     }
+                    let (v, m) = self.cfg.hotkey_slot_mut(slot);
+                    *v = vk;
+                    *m = mods;
                 }
-                let (v, m) = self.cfg.hotkey_mut(slot);
-                *v = vk;
-                *m = mods;
             }
             self.end_capture();
         }
@@ -336,6 +358,7 @@ impl eframe::App for SettingsApp {
                                     ),
                                 );
                                 self.global_keys_section(ui);
+                                self.duration_keys_section(ui);
                             }
                             Page::General => {
                                 page_title(

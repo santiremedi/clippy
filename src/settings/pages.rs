@@ -8,7 +8,7 @@ use crate::app::autostart;
 use crate::app::keys::hotkey_name;
 use crate::app::mode::Mode;
 use crate::app::update;
-use crate::config::{CaptureMode, GlobalAction, MAX_MBPS, MAX_SECONDS, MIN_MBPS, MIN_SECONDS, RESOLUTIONS};
+use crate::config::{CaptureMode, ClipKey, GlobalAction, HotkeySlot, MAX_CLIP_KEYS, MAX_MBPS, MAX_SECONDS, MIN_MBPS, MIN_SECONDS, RESOLUTIONS};
 use crate::i18n::{tr, trf, Lang, Language};
 
 /// Calidades de video de un toque (Mbps): baja, media y alta.
@@ -152,14 +152,26 @@ impl SettingsApp {
     fn clip_key_hero(&mut self, ui: &mut egui::Ui) {
         let a = GlobalAction::SaveClip;
         let (vk, mods) = self.cfg.hotkey(a);
-        let waiting = self.capturing == Some(a);
+        let waiting = self.capturing == Some(HotkeySlot::Global(a));
+        // Extra durations, so the main card shows everything that saves a clip.
+        let extras: Vec<String> = self
+            .cfg
+            .clip_keys
+            .iter()
+            .filter(|k| k.vk != 0)
+            .map(|k| {
+                let key = hotkey_name(k.vk, k.mods);
+                let secs = fmt_secs(k.seconds);
+                trf!("{key} guarda los últimos {secs}", "{key} saves the last {secs}", "{key} salva os últimos {secs}")
+            })
+            .collect();
         hero_card(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 22.0;
                     let text = if waiting { tr!("Apretá…", "Press…", "Aperte…").to_string() } else { hotkey_name(vk, mods) };
                     let tip = tr!("Tocá para cambiar la tecla", "Click to change the key", "Clique para mudar a tecla");
                     if keycap(ui, &text, waiting).on_hover_text(tip).clicked() {
-                        self.start_capture(a);
+                        self.start_capture(HotkeySlot::Global(a));
                     }
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 4.0;
@@ -178,6 +190,9 @@ impl SettingsApp {
                             )
                         };
                         ui.add(egui::Label::new(RichText::new(sub).color(MUTED)).wrap());
+                        if !extras.is_empty() {
+                            ui.add(egui::Label::new(RichText::new(extras.join(" · ")).size(12.5).color(MUTED)).wrap());
+                        }
                         let note = match &self.global_note {
                             Some(n) if !waiting => n.clone(),
                             _ => tr!("Tocá la tecla para cambiarla.", "Click the key to change it.", "Clique na tecla para mudá-la.").to_string(),
@@ -306,11 +321,21 @@ impl SettingsApp {
                 );
             });
             let secs = fmt_secs(self.cfg.seconds);
-            let mut why = trf!(
-                "Guarda los últimos {secs} antes de apretar la tecla.",
-                "Saves the last {secs} before you press the key.",
-                "Salva os últimos {secs} antes de você apertar a tecla."
-            );
+            let buffer = self.cfg.buffer_seconds();
+            let mut why = if buffer > self.cfg.seconds {
+                let b = fmt_secs(buffer);
+                trf!(
+                    "Guarda los últimos {secs}. Con las otras duraciones el buffer llega a {b} y usa más RAM.",
+                    "Saves the last {secs}. With the other durations the buffer reaches {b} and uses more RAM.",
+                    "Salva os últimos {secs}. Com as outras durações o buffer chega a {b} e usa mais RAM."
+                )
+            } else {
+                trf!(
+                    "Guarda los últimos {secs} antes de apretar la tecla.",
+                    "Saves the last {secs} before you press the key.",
+                    "Salva os últimos {secs} antes de você apertar a tecla."
+                )
+            };
             if max < MAX_SECONDS {
                 let max = fmt_secs(max);
                 why += &trf!(
@@ -466,7 +491,7 @@ impl SettingsApp {
                 }
                 row(ui, a.label(), LABEL_W + 40.0, |ui| {
                     let (vk, mods) = self.cfg.hotkey(a);
-                    let capturing = self.capturing == Some(a);
+                    let capturing = self.capturing == Some(HotkeySlot::Global(a));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if optional && vk != 0 && !capturing && button(ui, tr!("Quitar", "Remove", "Remover"), Kind::Ghost).clicked() {
                             let (v, m) = self.cfg.hotkey_mut(a);
@@ -483,7 +508,7 @@ impl SettingsApp {
                         let kind = if capturing { Kind::Selected } else { Kind::Secondary };
                         let w = ui.available_width();
                         if button_sized(ui, &text, kind, egui::vec2(w, 34.0)).clicked() {
-                            self.start_capture(a);
+                            self.start_capture(HotkeySlot::Global(a));
                         }
                     });
                 });
@@ -499,6 +524,85 @@ impl SettingsApp {
                     "Os atalhos do editor são alterados no próprio editor, em “Configurações do editor” (a engrenagem)."
                 )
                 .to_string()
+            };
+            ui.label(RichText::new(note).size(12.5).color(MUTED));
+        });
+    }
+
+    /// Extra shortcuts: each key saves its own duration (same buffer, different window).
+    pub(super) fn duration_keys_section(&mut self, ui: &mut egui::Ui) {
+        let max = self.cfg.max_seconds();
+        section(ui, tr!("Otras duraciones", "Other durations", "Outras durações"), |ui| {
+            let mut remove = None;
+            for i in 0..self.cfg.clip_keys.len() {
+                if i > 0 {
+                    divider(ui);
+                }
+                let slot = HotkeySlot::Clip(i);
+                let (vk, mods) = self.cfg.hotkey_slot(slot);
+                let capturing = self.capturing == Some(slot);
+                row(ui, tr!("Duración", "Duration", "Duração"), LABEL_W, |ui| {
+                    // Leave room for the slider value, "Quitar" and the key button.
+                    ui.spacing_mut().slider_width = (ui.available_width() - 320.0).max(80.0);
+                    ui.add(
+                        egui::Slider::new(&mut self.cfg.clip_keys[i].seconds, MIN_SECONDS..=max)
+                            .step_by(5.0)
+                            .custom_formatter(|v, _| fmt_secs(v as u32)),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if button(ui, tr!("Quitar", "Remove", "Remover"), Kind::Ghost).clicked() {
+                            remove = Some(i);
+                        }
+                        let text = if capturing {
+                            tr!("Apretá una tecla…", "Press a key…", "Aperte uma tecla…").to_string()
+                        } else if vk == 0 {
+                            tr!("Sin asignar", "Not set", "Não definido").to_string()
+                        } else {
+                            hotkey_name(vk, mods)
+                        };
+                        let kind = if capturing { Kind::Selected } else { Kind::Secondary };
+                        let w = ui.available_width();
+                        if button_sized(ui, &text, kind, egui::vec2(w, 34.0)).clicked() {
+                            self.start_capture(slot);
+                        }
+                    });
+                });
+            }
+            divider(ui);
+            row(ui, "", LABEL_W, |ui| {
+                let full = self.cfg.clip_keys.len() >= MAX_CLIP_KEYS;
+                let tip = trf!(
+                    "Máximo {MAX_CLIP_KEYS} duraciones.",
+                    "Maximum {MAX_CLIP_KEYS} durations.",
+                    "Máximo {MAX_CLIP_KEYS} durações."
+                );
+                let add = ui.add_enabled_ui(!full, |ui| button(ui, tr!("Agregar otra duración", "Add another duration", "Adicionar outra duração"), Kind::Secondary)).inner;
+                if add.on_disabled_hover_text(tip).clicked() {
+                    // Start on a duration nobody uses yet, so two keys don't do the same thing.
+                    let mut used = vec![self.cfg.seconds];
+                    used.extend(self.cfg.clip_keys.iter().map(|k| k.seconds));
+                    let seconds = free_seconds(self.cfg.seconds * 2, &used, max);
+                    self.cfg.clip_keys.push(ClipKey { seconds, vk: 0, mods: 0 });
+                    self.start_capture(HotkeySlot::Clip(self.cfg.clip_keys.len() - 1));
+                }
+            });
+            if let Some(i) = remove {
+                self.cfg.clip_keys.remove(i);
+                // Removing a row shifts the ones after it, so follow the slot being captured.
+                match self.capturing {
+                    Some(HotkeySlot::Clip(j)) if j == i => self.end_capture(),
+                    Some(HotkeySlot::Clip(j)) if j > i => self.capturing = Some(HotkeySlot::Clip(j - 1)),
+                    _ => {}
+                }
+            }
+            let note = if self.capturing.is_some() {
+                capture_hint().to_string()
+            } else {
+                tr!(
+                    "Cada tecla guarda su propia duración. La grabadora guarda en memoria la más larga de las que tienen tecla.",
+                    "Each key saves its own duration. The recorder keeps the longest one with a key in memory.",
+                    "Cada tecla salva sua própria duração. O gravador mantém na memória a mais longa que tem tecla."
+                ).to_string()
             };
             ui.label(RichText::new(note).size(12.5).color(MUTED));
         });
@@ -643,6 +747,18 @@ fn volume_row(ui: &mut egui::Ui, label: &str, on: &mut bool, vol: &mut u32) {
             ui.add(egui::Slider::new(vol, 0..=100).suffix(" %"));
         });
     });
+}
+
+/// First 5-second duration from `start` (wrapping) that no other shortcut uses.
+fn free_seconds(start: u32, used: &[u32], max: u32) -> u32 {
+    let mut s = (start.clamp(MIN_SECONDS, max) / 5 * 5).max(MIN_SECONDS);
+    for _ in 0..max / 5 {
+        if !used.contains(&s) {
+            return s;
+        }
+        s = if s + 5 > max { MIN_SECONDS } else { s + 5 };
+    }
+    s
 }
 
 fn ago(t: SystemTime) -> String {

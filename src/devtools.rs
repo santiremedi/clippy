@@ -103,6 +103,7 @@ fn test_mode(args: &[String]) -> i32 {
     let notify: crate::record::recorder::Notify = Arc::new(move |e| {
         let _ = tx.send(e);
     });
+    let seconds = cfg.seconds;
     let rec = crate::record::recorder::Recorder::start(cfg, notify);
     // Con CLIPPY_TEST_MODE="1280x960", a los 2 s el monitor principal pasa a ese modo como lo haría un juego en
     // pantalla completa (resolución estirada); Windows lo devuelve al guardar el clip o al salir.
@@ -112,7 +113,7 @@ fn test_mode(args: &[String]) -> i32 {
         println!("modo {}x{}: {:?}", m.0, m.1, set_mode(Some(m)));
     }
     std::thread::sleep(Duration::from_secs(wait));
-    rec.save();
+    rec.save(seconds);
     if mode.is_some() {
         set_mode(None);
     }
