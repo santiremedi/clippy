@@ -10,11 +10,11 @@ use windows::Win32::Foundation::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
-use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT};
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::autostart;
+use super::hotkeys::Hotkeys;
 use super::keys::hotkey_name;
 use super::status::{self, Status};
 use super::mode::{Mode, Window, TRAY_CLASS, TRAY_MUTEX, WM_HOTKEY_SUSPEND, WM_REC_EVENT, WM_RELOAD, WM_TRAY, WM_UPDATE};
@@ -48,6 +48,7 @@ struct App {
     rec: Option<Recorder>,
     icon_on: HICON,
     icon_off: HICON,
+    hotkeys: Hotkeys,
     /// Con qué graba y por qué no puede (lo muestra también la ventana principal).
     status: Status,
     /// Juego detectado por la grabadora (para el tooltip).
@@ -102,6 +103,7 @@ pub fn run(background: bool) {
             rec: None,
             icon_on: icon::hicon(size, true),
             icon_off: icon::hicon(size, false),
+            hotkeys: Hotkeys::new(hwnd),
             status: Status::default(),
             game: None,
         };
@@ -195,30 +197,16 @@ impl App {
         self.tray(NIM_MODIFY);
     }
 
-    fn unregister_all(&self) {
-        unsafe {
-            for a in GlobalAction::ALL {
-                let _ = UnregisterHotKey(self.hwnd, a.id());
-            }
-        }
-    }
-
     /// Registra los atajos globales. Devuelve los nombres de los que no se pudieron usar.
     fn register_hotkeys(&mut self) -> Vec<String> {
-        self.unregister_all();
-        let mut failed = Vec::new();
-        for a in GlobalAction::ALL {
-            let (vk, mods) = self.cfg.hotkey(a);
-            // Guardar clip solo mientras graba; los demás, siempre.
-            if vk == 0 || (a == GlobalAction::SaveClip && !self.cfg.enabled) {
-                continue;
-            }
-            let ok = unsafe { RegisterHotKey(self.hwnd, a.id(), HOT_KEY_MODIFIERS(mods | MOD_NOREPEAT.0), vk).is_ok() };
-            if !ok {
-                failed.push(hotkey_name(vk, mods));
-            }
-        }
-        failed
+        let cfg = &self.cfg;
+        let keys = GlobalAction::ALL.map(|a| {
+            let (vk, mods) = cfg.hotkey(a);
+            (a, vk, mods)
+        });
+        // Guardar clip solo mientras graba; los demás, siempre.
+        let keys = keys.into_iter().filter(|&(a, vk, _)| vk != 0 && (a != GlobalAction::SaveClip || cfg.enabled));
+        self.hotkeys.register(keys)
     }
 
     fn tip(&self) -> String {
@@ -322,8 +310,8 @@ impl App {
         Window::Editor.close();
         Window::Settings.close();
         self.rec = None;
+        self.hotkeys.unregister();
         unsafe {
-            self.unregister_all();
             let _ = Shell_NotifyIconW(NIM_DELETE, &self.nid());
             let _ = DestroyWindow(self.hwnd);
         }
@@ -403,6 +391,27 @@ fn run_command(id: usize) {
     }
 }
 
+fn run_action(action: GlobalAction) {
+    match action {
+        GlobalAction::SaveClip => {
+            with_app(|a| a.save_clip());
+        }
+        GlobalAction::ToggleRecording => {
+            // Desde el juego no se ve la bandeja: avisar con un sonido.
+            with_app(|a| {
+                a.toggle();
+                if a.cfg.enabled {
+                    sound::play_resumed();
+                } else {
+                    sound::play_paused();
+                }
+            });
+        }
+        GlobalAction::OpenEditor => open_editor(),
+        GlobalAction::OpenFolder => open_clips_folder(),
+    }
+}
+
 fn open_clips_folder() {
     if let Some(d) = with_app(|a| a.cfg.output_dir.clone()) {
         open_folder(&d);
@@ -420,26 +429,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_HOTKEY => {
-            match GlobalAction::from_id(wp.0 as i32) {
-                Some(GlobalAction::SaveClip) => {
-                    with_app(|a| a.save_clip());
-                }
-                Some(GlobalAction::ToggleRecording) => {
-                    // Desde el juego no se ve la bandeja: avisar con un sonido.
-                    with_app(|a| {
-                        a.toggle();
-                        if a.cfg.enabled {
-                            sound::play_resumed();
-                        } else {
-                            sound::play_paused();
-                        }
-                    });
-                }
-                Some(GlobalAction::OpenEditor) => open_editor(),
-                Some(GlobalAction::OpenFolder) => open_clips_folder(),
-                None => {}
+            if let Some(action) = with_app(|a| a.hotkeys.on_hotkey(wp)).flatten() {
+                run_action(action);
             }
             LRESULT(0)
+        }
+        WM_INPUT => {
+            if let Some(action) = with_app(|a| a.hotkeys.on_input(lp)).flatten() {
+                run_action(action);
+            }
+            // Windows libera la tecla leída en DefWindowProc.
+            DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_UPDATE => {
             if let Some((v, _)) = update::available() {
@@ -465,7 +465,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_HOTKEY_SUSPEND => {
             with_app(|a| {
                 if wp.0 == 1 {
-                    a.unregister_all();
+                    a.hotkeys.unregister();
                 } else {
                     a.register_hotkeys();
                 }
