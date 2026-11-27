@@ -470,7 +470,7 @@ fn session(
 /// Le pasa al encoder, en orden, los cuadros que ya terminaron de convertirse, mientras pida más.
 fn feed(enc: &mut Encoder, conv: &mut Converter, cap: &Capture, frame_dur: i64) -> Result<()> {
     while enc.pending_input > 0 {
-        let Some((tex, pts)) = conv.take() else { break };
+        let Some((tex, pts)) = cap.check(conv.take())? else { break };
         cap.check(enc.feed(&tex, pts, frame_dur))?;
     }
     Ok(())

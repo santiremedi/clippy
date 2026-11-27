@@ -7,6 +7,7 @@
 
 use std::collections::VecDeque;
 use std::mem::ManuallyDrop;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use windows::core::Interface;
@@ -15,12 +16,17 @@ use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::capture::Frame;
+use crate::log::log;
 
 /// Cuadros que pueden estar esperando su conversión o al encoder (a 60 fps, 133 ms): con un juego lento que llena la
 /// placa, cada conversión espera detrás de los cuadros que el juego ya tiene en cola. Si tarda más, se saltea el cuadro.
 const QUEUED: usize = 8;
-/// Texturas NV12: las de los cuadros que esperan, más 4 que el encoder todavía puede estar leyendo.
-const POOL: usize = QUEUED + 4;
+/// Texturas NV12: las de los cuadros que esperan, más 8 para las que el encoder todavía puede estar leyendo. Con la
+/// cola llena, una textura se reescribe recién 7 imágenes después de pasársela, como antes de la cola.
+const POOL: usize = QUEUED + 8;
+/// Si la placa no avisa en este tiempo que terminó una conversión, el cuadro pasa igual al encoder: mejor uno dudoso
+/// que el video congelado.
+const GIVE_UP: Duration = Duration::from_millis(500);
 
 pub struct Converter {
     /// La imagen que convierte (si `Capture` cambia de textura, hace falta otro `Converter`).
@@ -35,6 +41,8 @@ pub struct Converter {
     /// Cuadros mandados a convertir (o en negro) que el encoder todavía no recibió, en orden.
     queue: VecDeque<Queued>,
     black: ID3D11Texture2D,
+    /// Ya se anotó en el log que la placa no avisa (para no repetirlo).
+    gave_up: bool,
 }
 
 /// Una textura NV12 del pool.
@@ -45,10 +53,11 @@ struct Slot {
     done: ID3D11Query,
 }
 
-/// Un cuadro (`pts`) que espera al encoder: su textura del pool, o None si es negro.
+/// Un cuadro (`pts`) que espera al encoder: su textura del pool, o None si es negro, y cuándo se mandó.
 struct Queued {
     pts: i64,
     slot: Option<usize>,
+    at: Instant,
 }
 
 impl Converter {
@@ -174,6 +183,7 @@ impl Converter {
                 next: 0,
                 queue: VecDeque::with_capacity(QUEUED),
                 black: black.unwrap(),
+                gave_up: false,
             })
         }
     }
@@ -190,7 +200,7 @@ impl Converter {
     /// Un cuadro negro para `pts` (el modo "solo juegos" cuando no hay juego en pantalla).
     pub fn black(&mut self, pts: i64) {
         if self.queue.len() < QUEUED {
-            self.queue.push_back(Queued { pts, slot: None });
+            self.queue.push_back(Queued { pts, slot: None, at: Instant::now() });
         }
     }
 
@@ -214,15 +224,16 @@ impl Converter {
             // Que la GPU la reciba ya, y no cuando se llene el buffer de comandos.
             self.context.Flush();
         }
-        self.queue.push_back(Queued { pts, slot: Some(self.next) });
+        self.queue.push_back(Queued { pts, slot: Some(self.next), at: Instant::now() });
         self.next = (self.next + 1) % POOL;
         Ok(Some(slot.tex.clone()))
     }
 
-    /// El cuadro más viejo de los que esperan (textura y `pts`), si ya está listo para el encoder: nunca uno a medio
-    /// convertir, porque hay encoders (sospecha con AMD) que lo leerían así y grabarían cuadros vacíos (verdes).
-    pub fn take(&mut self) -> Option<(ID3D11Texture2D, i64)> {
-        let q = self.queue.front()?;
+    /// El cuadro más viejo de los que esperan (textura y `pts`), si ya está listo para el encoder: no uno a medio
+    /// convertir, porque hay encoders (sospecha con AMD) que lo leerían así y grabarían cuadros vacíos (verdes), salvo
+    /// que la placa no avise en `GIVE_UP`. Error si se perdió la placa.
+    pub fn take(&mut self) -> Result<Option<(ID3D11Texture2D, i64)>> {
+        let Some(q) = self.queue.front() else { return Ok(None) };
         let tex = match q.slot {
             None => self.black.clone(),
             Some(i) => {
@@ -231,16 +242,21 @@ impl Converter {
                 let size = std::mem::size_of::<BOOL>() as u32;
                 // Sin DONOTFLUSH: si no terminó, manda a la GPU lo que quedó en el buffer de comandos. Con DONOTFLUSH, en
                 // una RTX 2060 las conversiones figuraban terminadas recién unos 50 ms después.
-                let asked = unsafe { self.context.GetData(&slot.done, Some(&mut done as *mut BOOL as *mut _), size, 0) };
-                if asked.is_err() || !done.as_bool() {
-                    return None;
+                unsafe { self.context.GetData(&slot.done, Some(&mut done as *mut BOOL as *mut _), size, 0)? };
+                if !done.as_bool() {
+                    if q.at.elapsed() < GIVE_UP {
+                        return Ok(None);
+                    }
+                    if !std::mem::replace(&mut self.gave_up, true) {
+                        log("la placa no avisa que terminó de convertir una imagen: pasa al encoder igual después de 500 ms");
+                    }
                 }
                 slot.tex.clone()
             }
         };
         let pts = q.pts;
         self.queue.pop_front();
-        Some((tex, pts))
+        Ok(Some((tex, pts)))
     }
 
     /// Brillo promedio de la imagen capturada y de la convertida, para el log: muestra en qué paso se

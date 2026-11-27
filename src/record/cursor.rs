@@ -51,46 +51,48 @@ type Compile = unsafe extern "system" fn(
     *mut *mut c_void,
 ) -> HRESULT;
 
-/// `SHADER` compilado.
-struct Code {
-    vs: Vec<u8>,
-    ps: Vec<u8>,
+/// Las funciones `vs` y `ps` de un shader HLSL, compiladas.
+pub struct Code {
+    pub vs: Vec<u8>,
+    pub ps: Vec<u8>,
 }
 
-/// Se compila una vez por proceso.
+/// `SHADER`, compilado una vez por proceso.
 fn shaders() -> Result<&'static Code> {
     static CODE: OnceLock<Result<Code, String>> = OnceLock::new();
-    let code = || Ok(Code { vs: compile(SHADER, s!("vs"), s!("vs_4_0"))?, ps: compile(SHADER, s!("ps"), s!("ps_4_0"))? });
-    CODE.get_or_init(|| code().map_err(|e: anyhow::Error| e.to_string())).as_ref().map_err(|e| anyhow!("{e}"))
+    CODE.get_or_init(|| compile_shaders(SHADER).map_err(|e| e.to_string())).as_ref().map_err(|e| anyhow!("{e}"))
 }
 
-/// Compila la función `entry` de `src` (HLSL). d3dcompiler_47 viene con Windows: se carga recién acá para que con el
+/// Compila las funciones `vs` y `ps` de `src`. d3dcompiler_47 viene con Windows: se carga recién acá para que con el
 /// cursor apagado ni se cargue.
-pub fn compile(src: &str, entry: PCSTR, target: PCSTR) -> Result<Vec<u8>> {
+pub fn compile_shaders(src: &str) -> Result<Code> {
     unsafe {
         let lib = LoadLibraryW(w!("d3dcompiler_47.dll"))?;
         let f = GetProcAddress(lib, s!("D3DCompile")).ok_or_else(|| anyhow!("d3dcompiler_47.dll sin D3DCompile"))?;
         let f: Compile = std::mem::transmute(f);
         let bytes = |b: &ID3DBlob| std::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize()).to_vec();
-        let (mut code, mut errors) = (std::ptr::null_mut(), std::ptr::null_mut());
-        let hr = f(
-            src.as_ptr().cast(),
-            src.len(),
-            PCSTR::null(),
-            std::ptr::null(),
-            std::ptr::null_mut(),
-            entry,
-            target,
-            0,
-            0,
-            &mut code,
-            &mut errors,
-        );
-        let blob = |p: *mut c_void| (!p.is_null()).then(|| ID3DBlob::from_raw(p));
-        match (blob(code), blob(errors)) {
-            (Some(code), _) if hr.is_ok() => Ok(bytes(&code)),
-            (_, errors) => Err(anyhow!("{hr} {}", errors.map(|e| String::from_utf8_lossy(&bytes(&e)).into_owned()).unwrap_or_default())),
-        }
+        let one = |entry: PCSTR, target: PCSTR| -> Result<Vec<u8>> {
+            let (mut code, mut errors) = (std::ptr::null_mut(), std::ptr::null_mut());
+            let hr = f(
+                src.as_ptr().cast(),
+                src.len(),
+                PCSTR::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                entry,
+                target,
+                0,
+                0,
+                &mut code,
+                &mut errors,
+            );
+            let blob = |p: *mut c_void| (!p.is_null()).then(|| ID3DBlob::from_raw(p));
+            match (blob(code), blob(errors)) {
+                (Some(code), _) if hr.is_ok() => Ok(bytes(&code)),
+                (_, errors) => Err(anyhow!("{hr} {}", errors.map(|e| String::from_utf8_lossy(&bytes(&e)).into_owned()).unwrap_or_default())),
+            }
+        };
+        Ok(Code { vs: one(s!("vs"), s!("vs_4_0"))?, ps: one(s!("ps"), s!("ps_4_0"))? })
     }
 }
 

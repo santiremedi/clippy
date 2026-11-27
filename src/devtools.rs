@@ -156,7 +156,7 @@ float4 ps(float4 p : SV_Position) : SV_Target {
 ";
 
 fn test_fullscreen(args: &[String]) -> i32 {
-    use windows::core::{s, w};
+    use windows::core::w;
     use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
     use windows::Win32::Graphics::Direct3D11::*;
@@ -219,8 +219,9 @@ fn test_fullscreen(args: &[String]) -> i32 {
         let passes = args.iter().skip(2).find_map(|a| a.strip_prefix("carga")).map(|n| n.trim_start_matches('=').parse().unwrap_or(8));
         let load = passes.map(|n: u32| {
             let (mut vs, mut ps, mut tex, mut rtv) = (None, None, None, None);
-            dev.CreateVertexShader(&crate::record::compile(LOAD, s!("vs"), s!("vs_4_0")).unwrap(), None, Some(&mut vs)).unwrap();
-            dev.CreatePixelShader(&crate::record::compile(LOAD, s!("ps"), s!("ps_4_0")).unwrap(), None, Some(&mut ps)).unwrap();
+            let code = crate::record::compile_shaders(LOAD).unwrap();
+            dev.CreateVertexShader(&code.vs, None, Some(&mut vs)).unwrap();
+            dev.CreatePixelShader(&code.ps, None, Some(&mut ps)).unwrap();
             let td = D3D11_TEXTURE2D_DESC {
                 Width: w,
                 Height: h,
