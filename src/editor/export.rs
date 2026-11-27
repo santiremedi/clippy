@@ -1,6 +1,6 @@
 //! Exportar: diálogo, plan (tamaño, calidad, copiar o renderizar) y el trabajo en segundo plano.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -93,12 +93,22 @@ impl EditorApp {
         self.pause();
         self.export_dlg = Some(ExportDialog {
             name: format!("Clippy_edit_{}", file_stamp()),
-            dir: self.cfg.output_dir.clone(),
+            dir: self.export_dir(),
             height: self.prefs.export_height,
             fps: self.prefs.export_fps,
             quality: self.prefs.export_quality,
             size_mb: self.prefs.export_size_mb.max(1),
         });
+    }
+
+    /// Dónde se exporta: la carpeta de la última vez o, la primera, "Exportados" dentro de la de clips, así lo
+    /// exportado no se mezcla con los clips. El nombre sale del idioma de ese momento y queda guardado.
+    fn export_dir(&self) -> PathBuf {
+        let rel = self.prefs.export_dir.clone().unwrap_or_else(|| tr!("Exportados", "Exports", "Exportados").into());
+        if rel.as_os_str().is_empty() {
+            return self.cfg.output_dir.clone();
+        }
+        self.cfg.output_dir.join(rel) // si `rel` es absoluta, queda ella sola
     }
 
     /// Lo que va a salir con las opciones del diálogo.
@@ -369,11 +379,14 @@ impl EditorApp {
         self.prefs.export_fps = d.fps;
         self.prefs.export_quality = d.quality;
         self.prefs.export_size_mb = d.size_mb;
+        let rel = d.dir.strip_prefix(&self.cfg.output_dir).map(Path::to_path_buf);
+        self.prefs.export_dir = Some(rel.unwrap_or_else(|_| d.dir.clone()));
         self.prefs.save();
     }
 
     fn start_export(&mut self, d: &ExportDialog, plan: &ExportPlan) {
         let clean = library::clean_name(&d.name);
+        let _ = std::fs::create_dir_all(&d.dir); // la de Exportados no existe hasta la primera exportación
         let mut out = d.dir.join(format!("{clean}.mp4"));
         let mut n = 2;
         while out.exists() {

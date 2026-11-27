@@ -79,7 +79,7 @@ src/
     browser.rs     panel de la biblioteca: elegir, carpetas, mover y mandar a la Papelera
     inspector.rs   panel del clip: imagen, velocidad y sonido
     preview.rs     vista previa: lienzo con su proporción y recorte de la imagen
-    prefs.rs       editor.json (atajos, últimas opciones de exportación, paneles, imán)
+    prefs.rs       editor.json (atajos, últimas opciones y carpeta de exportación, paneles, imán)
     media.rs       exportar: copia sin recodificar o capas ubicadas y fundidas por GPU, velocidad, mezcla de audio
     shortcuts.rs, library.rs, player.rs, devtools.rs
   ui_kit/          estilo y widgets, ventanas nativas, íconos, sonidos
