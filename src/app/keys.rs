@@ -7,6 +7,7 @@ use crate::i18n::{tr, trf};
 pub const MOD_ALT: u32 = 1;
 pub const MOD_CTRL: u32 = 2;
 pub const MOD_SHIFT: u32 = 4;
+const MOD_WIN: u32 = 8;
 
 pub fn hotkey_name(vk: u32, mods: u32) -> String {
     let mut s = String::new();
@@ -68,30 +69,36 @@ pub fn vk_name(vk: u32) -> String {
     }
 }
 
-fn down(vk: i32) -> bool {
-    unsafe { (GetAsyncKeyState(vk) as u16 & 0x8000) != 0 }
+/// Teclas modificadoras y su `MOD_*`: las genéricas, las de cada lado y las dos de Windows.
+const MODIFIERS: [(u32, u32); 11] = [
+    (0x10, MOD_SHIFT),
+    (0xA0, MOD_SHIFT),
+    (0xA1, MOD_SHIFT),
+    (0x11, MOD_CTRL),
+    (0xA2, MOD_CTRL),
+    (0xA3, MOD_CTRL),
+    (0x12, MOD_ALT),
+    (0xA4, MOD_ALT),
+    (0xA5, MOD_ALT),
+    (0x5B, MOD_WIN),
+    (0x5C, MOD_WIN),
+];
+
+/// El `MOD_*` de una tecla modificadora; 0 si no es una.
+pub fn modifier(vk: u32) -> u32 {
+    MODIFIERS.iter().find(|m| m.0 == vk).map_or(0, |m| m.1)
+}
+
+/// ¿Está apretada ahora?
+pub fn down(vk: u32) -> bool {
+    unsafe { (GetAsyncKeyState(vk as i32) as u16 & 0x8000) != 0 }
 }
 
 /// Devuelve la primera tecla (no modificadora) que esté apretada, con sus modificadores.
 pub fn pressed_key() -> Option<(u32, u32)> {
-    for vk in 0x08..=0xFEi32 {
-        // Modificadores, Windows, menú, Bloq Mayús, Bloq Num y botones del mouse se ignoran.
-        if matches!(vk, 0x10 | 0x11 | 0x12 | 0x14 | 0x5B | 0x5C | 0x5D | 0x90 | 0xA0..=0xA5) {
-            continue;
-        }
-        if down(vk) {
-            let mut m = 0;
-            if down(0x11) {
-                m |= MOD_CTRL;
-            }
-            if down(0x10) {
-                m |= MOD_SHIFT;
-            }
-            if down(0x12) {
-                m |= MOD_ALT;
-            }
-            return Some((vk as u32, m));
-        }
-    }
-    None
+    // Bloq Mayús, menú y Bloq Num se ignoran (los botones del mouse van antes de 0x08).
+    let vk = (0x08..=0xFE).find(|&vk| modifier(vk) == 0 && !matches!(vk, 0x14 | 0x5D | 0x90) && down(vk))?;
+    // Los atajos no usan la tecla de Windows.
+    let mods = MODIFIERS.iter().filter(|m| m.1 != MOD_WIN && down(m.0)).fold(0, |acc, m| acc | m.1);
+    Some((vk, mods))
 }

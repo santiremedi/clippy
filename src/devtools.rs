@@ -10,6 +10,7 @@
 //! - `--test-fullscreen <ancho>x<alto> <segundos> [alttab]`: un juego de mentira en pantalla completa exclusiva (D3D11,
 //!   cambia el modo de video como una resolución estirada) que cambia de color en cada cuadro; con `alttab`, cada 6 s
 //!   sale 2 s y vuelve. Para que cuente como juego, corré una copia del exe con otro nombre ("clippy" no es juego).
+//! - `--test-hotkeys`: los atajos globales, con y sin un juego que toma el teclado; ver `app::devtools`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,6 +25,9 @@ pub fn run(args: &[String]) -> Option<i32> {
     }
     if let Some(i) = at("--test-fullscreen") {
         return Some(test_fullscreen(&args[i + 1..]));
+    }
+    if let Some(i) = at(crate::app::devtools::TEST_HOTKEYS) {
+        return Some(crate::app::devtools::test_hotkeys(&args[i + 1..]));
     }
     if at("--test-mic").is_some() {
         return Some(test_mic());

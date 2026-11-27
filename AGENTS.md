@@ -53,7 +53,8 @@ Con `gh`, armá el cuerpo con las mismas secciones que la plantilla.
 
 - Modos del exe, argumentos, candados, títulos de ventana y mensajes a la bandeja: solo en
   `src/app/mode.rs` (`Mode`, `Window`). No escribas `"--settings"` ni `"Local\\Clippy..."` en otro lado.
-- Atajos globales: `config::GlobalAction` (ids, etiqueta, tecla). Atajos del editor: `editor/shortcuts.rs`.
+- Atajos globales: `config::GlobalAction` (ids, etiqueta, tecla); cómo se escuchan, `app/hotkeys.rs`. Atajos del
+  editor: `editor/shortcuts.rs`.
 - Qué cuenta como juego: solo `src/record/game.rs` (lo usan el modo "Solo juegos" y el canal de audio).
 - `config.json` lo escriben la ventana de ajustes y la bandeja; `editor.json` solo el editor;
   `recorder.json` (con qué graba y por qué no puede, `app/status.rs`) solo la bandeja.
@@ -108,4 +109,5 @@ corre aislada y sin ventanas:
 - **Editor**: `--test-export`, `--test-frame`, `--test-strip`, `--test-covers` (ver `editor/devtools.rs`).
 - **De a uno por vez**, porque tocan cosas de toda la PC: `--settings` y `--editor` (candado de instancia
   única y título de ventana: chocan con otro agente o con el Clippy del usuario), `CLIPPY_TEST_MODE` (cambia
-  la resolución del monitor) y medir FPS o CPU. Abrí ventanas solo si el cambio toca la interfaz, al final.
+  la resolución del monitor), `--test-hotkeys` (aprieta teclas y mueve el foco) y medir FPS o CPU. Abrí
+  ventanas solo si el cambio toca la interfaz, al final.
