@@ -51,20 +51,21 @@ type Compile = unsafe extern "system" fn(
     *mut *mut c_void,
 ) -> HRESULT;
 
-/// `SHADER` compilado.
-struct Code {
-    vs: Vec<u8>,
-    ps: Vec<u8>,
+/// Las funciones `vs` y `ps` de un shader HLSL, compiladas.
+pub struct Code {
+    pub vs: Vec<u8>,
+    pub ps: Vec<u8>,
 }
 
-/// Se compila una vez por proceso. d3dcompiler_47 viene con Windows: se carga recién acá para que con el cursor
-/// apagado ni se cargue.
+/// `SHADER`, compilado una vez por proceso.
 fn shaders() -> Result<&'static Code> {
     static CODE: OnceLock<Result<Code, String>> = OnceLock::new();
-    CODE.get_or_init(|| compile().map_err(|e| e.to_string())).as_ref().map_err(|e| anyhow!("{e}"))
+    CODE.get_or_init(|| compile_shaders(SHADER).map_err(|e| e.to_string())).as_ref().map_err(|e| anyhow!("{e}"))
 }
 
-fn compile() -> Result<Code> {
+/// Compila las funciones `vs` y `ps` de `src`. d3dcompiler_47 viene con Windows: se carga recién acá para que con el
+/// cursor apagado ni se cargue.
+pub fn compile_shaders(src: &str) -> Result<Code> {
     unsafe {
         let lib = LoadLibraryW(w!("d3dcompiler_47.dll"))?;
         let f = GetProcAddress(lib, s!("D3DCompile")).ok_or_else(|| anyhow!("d3dcompiler_47.dll sin D3DCompile"))?;
@@ -73,8 +74,8 @@ fn compile() -> Result<Code> {
         let one = |entry: PCSTR, target: PCSTR| -> Result<Vec<u8>> {
             let (mut code, mut errors) = (std::ptr::null_mut(), std::ptr::null_mut());
             let hr = f(
-                SHADER.as_ptr().cast(),
-                SHADER.len(),
+                src.as_ptr().cast(),
+                src.len(),
                 PCSTR::null(),
                 std::ptr::null(),
                 std::ptr::null_mut(),

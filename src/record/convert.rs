@@ -1,8 +1,12 @@
 //! Conversión BGRA -> NV12 con el procesador de video de la GPU (sin shaders ni CPU).
 //! También endereza monitores verticales, estira la resolución estirada y encaja un monitor de otra forma sin deformarlo.
+//!
+//! Las conversiones no se esperan: con la placa llena (un juego sin límite de FPS) cada una tarda en salir más que un
+//! cuadro, porque espera su turno detrás de los cuadros del juego. Se mandan una por cuadro y el encoder recibe cada
+//! imagen, en orden, recién cuando terminó de convertirse.
 
+use std::collections::VecDeque;
 use std::mem::ManuallyDrop;
-
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -12,35 +16,52 @@ use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::capture::Frame;
+use crate::log::log;
 
-/// Lo máximo que se espera a que la GPU termine de convertir una imagen.
-const CONVERT_WAIT: Duration = Duration::from_millis(50);
+/// Cuadros que pueden estar esperando su conversión o al encoder (a 60 fps, 133 ms): con un juego lento que llena la
+/// placa, cada conversión espera detrás de los cuadros que el juego ya tiene en cola. Si tarda más, se saltea el cuadro.
+const QUEUED: usize = 8;
+/// Texturas NV12: las de los cuadros que esperan, más 8 para las que el encoder todavía puede estar leyendo. Con la
+/// cola llena, una textura se reescribe recién 7 imágenes después de pasársela, como antes de la cola.
+const POOL: usize = QUEUED + 8;
+/// Si la placa no avisa en este tiempo que terminó una conversión, el cuadro pasa igual al encoder: mejor uno dudoso
+/// que el video congelado.
+const GIVE_UP: Duration = Duration::from_millis(500);
 
 pub struct Converter {
     /// La imagen que convierte (si `Capture` cambia de textura, hace falta otro `Converter`).
     src: ID3D11Texture2D,
     device: ID3D11Device,
     context: ID3D11DeviceContext,
-    /// Avisa cuándo la GPU terminó la conversión.
-    done: ID3D11Query,
     vctx: ID3D11VideoContext,
     vp: ID3D11VideoProcessor,
     input: ID3D11VideoProcessorInputView,
-    pool: Vec<(ID3D11Texture2D, ID3D11VideoProcessorOutputView)>,
+    pool: Vec<Slot>,
     next: usize,
+    /// Cuadros mandados a convertir (o en negro) que el encoder todavía no recibió, en orden.
+    queue: VecDeque<Queued>,
     black: ID3D11Texture2D,
+    /// Ya se anotó en el log que la placa no avisa (para no repetirlo).
+    gave_up: bool,
+}
+
+/// Una textura NV12 del pool.
+struct Slot {
+    tex: ID3D11Texture2D,
+    view: ID3D11VideoProcessorOutputView,
+    /// Avisa cuándo la GPU terminó de convertir a esta textura.
+    done: ID3D11Query,
+}
+
+/// Un cuadro (`pts`) que espera al encoder: su textura del pool, o None si es negro, y cuándo se mandó.
+struct Queued {
+    pts: i64,
+    slot: Option<usize>,
+    at: Instant,
 }
 
 impl Converter {
-    pub fn new(
-        device: &ID3D11Device,
-        context: &ID3D11DeviceContext,
-        frame: &Frame,
-        w: u32,
-        h: u32,
-        fps: u32,
-        pool_size: usize,
-    ) -> Result<Self> {
+    pub fn new(device: &ID3D11Device, context: &ID3D11DeviceContext, frame: &Frame, w: u32, h: u32, fps: u32) -> Result<Self> {
         unsafe {
             let vdev: ID3D11VideoDevice = device.cast()?;
             let vctx: ID3D11VideoContext = context.cast()?;
@@ -78,8 +99,8 @@ impl Converter {
                     Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
                 },
             };
-            let mut pool = Vec::with_capacity(pool_size);
-            for _ in 0..pool_size {
+            let mut pool = Vec::with_capacity(POOL);
+            for _ in 0..POOL {
                 let mut td = D3D11_TEXTURE2D_DESC {
                     Width: w,
                     Height: h,
@@ -100,7 +121,9 @@ impl Converter {
                 let t = t.unwrap();
                 let mut ov = None;
                 vdev.CreateVideoProcessorOutputView(&t, &en, &ovd, Some(&mut ov))?;
-                pool.push((t, ov.unwrap()));
+                let mut done = None;
+                device.CreateQuery(&D3D11_QUERY_DESC { Query: D3D11_QUERY_EVENT, MiscFlags: 0 }, Some(&mut done))?;
+                pool.push(Slot { tex: t, view: ov.unwrap(), done: done.unwrap() });
             }
 
             // Colores correctos: RGB completo -> YUV BT.709 rango limitado.
@@ -149,16 +172,19 @@ impl Converter {
             let mut black = None;
             device.CreateTexture2D(&bd, Some(&init), Some(&mut black))?;
 
-            let mut done = None;
-            device.CreateQuery(&D3D11_QUERY_DESC { Query: D3D11_QUERY_EVENT, MiscFlags: 0 }, Some(&mut done))?;
-
             Ok(Self {
                 src: src.clone(),
                 device: device.clone(),
                 context: context.clone(),
-                done: done.unwrap(),
                 vctx,
-                vp, input: input.unwrap(), pool, next: 0, black: black.unwrap() })
+                vp,
+                input: input.unwrap(),
+                pool,
+                next: 0,
+                queue: VecDeque::with_capacity(QUEUED),
+                black: black.unwrap(),
+                gave_up: false,
+            })
         }
     }
 
@@ -166,36 +192,71 @@ impl Converter {
         self.src == frame.tex
     }
 
-    pub fn black(&self) -> ID3D11Texture2D {
-        self.black.clone()
+    /// Hay cuadros que el encoder todavía no recibió.
+    pub fn waiting(&self) -> bool {
+        !self.queue.is_empty()
     }
 
-    /// Convierte la imagen actual a una textura NV12 del pool y la devuelve, ya escrita: hay encoders
-    /// (sospecha con AMD) que la leen sin esperar a la conversión y graban cuadros vacíos (verdes).
-    pub fn convert(&mut self) -> Result<ID3D11Texture2D> {
-        let (tex, view) = &self.pool[self.next];
-        self.next = (self.next + 1) % self.pool.len();
+    /// Un cuadro negro para `pts` (el modo "solo juegos" cuando no hay juego en pantalla).
+    pub fn black(&mut self, pts: i64) {
+        if self.queue.len() < QUEUED {
+            self.queue.push_back(Queued { pts, slot: None, at: Instant::now() });
+        }
+    }
+
+    /// Manda a convertir la imagen actual para el cuadro `pts`, sin esperar a la GPU, y devuelve la textura donde va a
+    /// quedar. None si ya hay `QUEUED` cuadros esperando: la placa no da abasto y ese cuadro se saltea.
+    pub fn convert(&mut self, pts: i64) -> Result<Option<ID3D11Texture2D>> {
+        if self.queue.len() >= QUEUED {
+            return Ok(None);
+        }
+        let slot = &self.pool[self.next];
         unsafe {
             let mut streams = [D3D11_VIDEO_PROCESSOR_STREAM {
                 Enable: true.into(),
                 pInputSurface: ManuallyDrop::new(Some(self.input.clone())),
                 ..Default::default()
             }];
-            let r = self.vctx.VideoProcessorBlt(&self.vp, view, 0, &streams);
+            let r = self.vctx.VideoProcessorBlt(&self.vp, &slot.view, 0, &streams);
             ManuallyDrop::drop(&mut streams[0].pInputSurface);
             r?;
-            self.context.End(&self.done);
-            let start = Instant::now();
-            let mut ready = BOOL(0);
-            while start.elapsed() < CONVERT_WAIT {
-                let size = std::mem::size_of::<BOOL>() as u32;
-                if self.context.GetData(&self.done, Some(&mut ready as *mut BOOL as *mut _), size, 0).is_ok() && ready.as_bool() {
-                    break;
-                }
-                std::thread::yield_now();
-            }
+            self.context.End(&slot.done);
+            // Que la GPU la reciba ya, y no cuando se llene el buffer de comandos.
+            self.context.Flush();
         }
-        Ok(tex.clone())
+        self.queue.push_back(Queued { pts, slot: Some(self.next), at: Instant::now() });
+        self.next = (self.next + 1) % POOL;
+        Ok(Some(slot.tex.clone()))
+    }
+
+    /// El cuadro más viejo de los que esperan (textura y `pts`), si ya está listo para el encoder: no uno a medio
+    /// convertir, porque hay encoders (sospecha con AMD) que lo leerían así y grabarían cuadros vacíos (verdes), salvo
+    /// que la placa no avise en `GIVE_UP`. Error si se perdió la placa.
+    pub fn take(&mut self) -> Result<Option<(ID3D11Texture2D, i64)>> {
+        let Some(q) = self.queue.front() else { return Ok(None) };
+        let tex = match q.slot {
+            None => self.black.clone(),
+            Some(i) => {
+                let slot = &self.pool[i];
+                let mut done = BOOL(0);
+                let size = std::mem::size_of::<BOOL>() as u32;
+                // Sin DONOTFLUSH: si no terminó, manda a la GPU lo que quedó en el buffer de comandos. Con DONOTFLUSH, en
+                // una RTX 2060 las conversiones figuraban terminadas recién unos 50 ms después.
+                unsafe { self.context.GetData(&slot.done, Some(&mut done as *mut BOOL as *mut _), size, 0)? };
+                if !done.as_bool() {
+                    if q.at.elapsed() < GIVE_UP {
+                        return Ok(None);
+                    }
+                    if !std::mem::replace(&mut self.gave_up, true) {
+                        log("la placa no avisa que terminó de convertir una imagen: pasa al encoder igual después de 500 ms");
+                    }
+                }
+                slot.tex.clone()
+            }
+        };
+        let pts = q.pts;
+        self.queue.pop_front();
+        Ok(Some((tex, pts)))
     }
 
     /// Brillo promedio de la imagen capturada y de la convertida, para el log: muestra en qué paso se
