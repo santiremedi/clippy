@@ -7,9 +7,11 @@
 //! - `--test-mic`: cuánto audio entrega cada micrófono en 3 s.
 //! - `--test-download`: descarga la versión publicada como el botón "Actualizar".
 //! - `--test-export`, `--test-frame`, `--test-strip`, `--test-covers`: ver `editor::devtools`.
-//! - `--test-fullscreen <ancho>x<alto> <segundos> [alttab]`: un juego de mentira en pantalla completa exclusiva (D3D11,
-//!   cambia el modo de video como una resolución estirada) que cambia de color en cada cuadro; con `alttab`, cada 6 s
-//!   sale 2 s y vuelve. Para que cuente como juego, corré una copia del exe con otro nombre ("clippy" no es juego).
+//! - `--test-fullscreen <ancho>x<alto> <segundos> [alttab] [carga[=<pasadas>]]`: un juego de mentira en pantalla
+//!   completa exclusiva (D3D11, cambia el modo de video como una resolución estirada) que cambia de color en cada
+//!   cuadro; con `alttab`, cada 6 s sale 2 s y vuelve; con `carga`, lleva la placa al 100 % como un juego sin límite de
+//!   FPS (más pasadas, más carga y menos FPS; 8 si no se dice: en una RTX 2060 a 1440x1080, unos 130 FPS). Para que
+//!   cuente como juego, corré una copia del exe con otro nombre ("clippy" no es juego).
 //! - `--test-hotkeys`: los atajos globales, con y sin un juego que toma el teclado; ver `app::devtools`.
 
 use std::sync::Arc;
@@ -140,8 +142,21 @@ fn test_mode(args: &[String]) -> i32 {
     2
 }
 
+/// La carga del juego de mentira: un triángulo que tapa la pantalla con un shader que hace cuentas por cada píxel.
+const LOAD: &str = r"
+float4 vs(uint id : SV_VertexID) : SV_Position {
+    float2 uv = float2((id << 1) & 2, id & 2);
+    return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+float4 ps(float4 p : SV_Position) : SV_Target {
+    float2 v = p.xy * 0.001;
+    [loop] for (int i = 0; i < 256; i++) v = float2(sin(v.x + v.y), cos(v.y - v.x));
+    return float4(v, 0, 1);
+}
+";
+
 fn test_fullscreen(args: &[String]) -> i32 {
-    use windows::core::w;
+    use windows::core::{s, w};
     use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
     use windows::Win32::Graphics::Direct3D11::*;
@@ -198,7 +213,30 @@ fn test_fullscreen(args: &[String]) -> i32 {
         println!("pantalla completa: {:?}", sc.SetFullscreenState(true, None));
         println!("modo {w}x{h}: {:?}", sc.ResizeTarget(&mode));
         // Con "alttab", cada 6 s sale 2 s de la pantalla completa (minimizado), como un Alt+Tab, y vuelve.
-        let alttab = args.get(2).is_some_and(|a| a == "alttab");
+        let alttab = args.iter().skip(2).any(|a| a == "alttab");
+        // Con "carga", cada cuadro dibuja la carga tantas veces en una textura aparte (la pantalla sigue de un solo
+        // color) y se muestra sin esperar al monitor.
+        let passes = args.iter().skip(2).find_map(|a| a.strip_prefix("carga")).map(|n| n.trim_start_matches('=').parse().unwrap_or(8));
+        let load = passes.map(|n: u32| {
+            let (mut vs, mut ps, mut tex, mut rtv) = (None, None, None, None);
+            dev.CreateVertexShader(&crate::record::compile(LOAD, s!("vs"), s!("vs_4_0")).unwrap(), None, Some(&mut vs)).unwrap();
+            dev.CreatePixelShader(&crate::record::compile(LOAD, s!("ps"), s!("ps_4_0")).unwrap(), None, Some(&mut ps)).unwrap();
+            let td = D3D11_TEXTURE2D_DESC {
+                Width: w,
+                Height: h,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+                ..Default::default()
+            };
+            dev.CreateTexture2D(&td, None, Some(&mut tex)).unwrap();
+            dev.CreateRenderTargetView(&tex.unwrap(), None, Some(&mut rtv)).unwrap();
+            println!("carga: {n} pasadas por cuadro");
+            (n, vs.unwrap(), ps.unwrap(), rtv)
+        });
         let mut out = false;
         let start = std::time::Instant::now();
         let mut frame = 0u64;
@@ -230,13 +268,23 @@ fn test_fullscreen(args: &[String]) -> i32 {
             let back: ID3D11Texture2D = sc.GetBuffer(0).unwrap();
             let mut rtv = None;
             dev.CreateRenderTargetView(&back, None, Some(&mut rtv)).unwrap();
+            if let Some((n, vs, ps, target)) = &load {
+                ctx.OMSetRenderTargets(Some(std::slice::from_ref(target)), None);
+                ctx.RSSetViewports(Some(&[D3D11_VIEWPORT { Width: w as f32, Height: h as f32, MaxDepth: 1.0, ..Default::default() }]));
+                ctx.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                ctx.VSSetShader(vs, None);
+                ctx.PSSetShader(ps, None);
+                for _ in 0..*n {
+                    ctx.Draw(3, 0);
+                }
+            }
             let t = start.elapsed().as_secs_f32();
             ctx.ClearRenderTargetView(&rtv.unwrap(), &[(t * 0.7).fract(), 0.2, (t * 0.3).fract(), 1.0]);
-            let _ = sc.Present(1, DXGI_PRESENT(0));
+            let _ = sc.Present(if load.is_some() { 0 } else { 1 }, DXGI_PRESENT(0));
             frame += 1;
         }
         let _ = sc.SetFullscreenState(false, None);
-        println!("{frame} cuadros en {secs} s");
+        println!("{frame} cuadros en {secs} s ({:.1} por segundo)", frame as f64 / start.elapsed().as_secs_f64());
     }
     0
 }

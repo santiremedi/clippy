@@ -12,3 +12,6 @@ mod screen;
 pub mod recorder;
 
 pub use encoder::{Device, CPU_MAX_FPS, CPU_MAX_SHORT};
+/// El juego de mentira de `devtools` compila su carga para la placa con lo mismo que el cursor.
+#[cfg(feature = "devtools")]
+pub use cursor::compile;
