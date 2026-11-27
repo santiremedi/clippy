@@ -34,7 +34,18 @@ Todo cambio entra a `main` por PR; nunca se commitea directo en `main`.
   dependencias, limpieza) o `docs/` (solo documentación). `<nombre>` corto, en español y en kebab-case, dice
   qué cambia (`feature/cursor-en-escritorio`, `fix/encoder-1366`); el worktree se llama igual.
 - Una rama por cambio y PRs chicos. El primer `cargo build` en un worktree nuevo compila todo de cero.
-- Cuando la PR se mergea, borrá el worktree: `git worktree remove .claude/worktrees/<nombre>`.
+- **Al terminar, dejá el repo limpio.** Cuando tu PR se mergea, borrá tu worktree y tu rama local, y
+  actualizá `main`:
+
+  ```bash
+  git worktree remove .claude/worktrees/<nombre>
+  git branch -D <tipo>/<nombre>   # -D porque el squash no la deja como mergeada
+  git pull --ff-only              # en el checkout principal, si está en main y sin cambios
+  ```
+
+  Si en `.claude/worktrees/` quedaron worktrees de PRs ya mergeadas o carpetas vacías, borralos también, con
+  sus ramas. No toques los de otros agentes que siguen trabajando, ni los que tienen cambios sin commitear o
+  una PR abierta.
 - **Commits y PRs sin atribución de IA**: nada de `Co-Authored-By`, "Generated with" ni links de sesión.
 
 ## Issues y PRs
