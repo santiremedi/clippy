@@ -66,7 +66,7 @@ struct Output {
     monitor: HMONITOR,
     output: IDXGIOutput1,
     name: String,
-    /// Tamaño del video para este monitor (ver `video_size`).
+    /// Tamaño del video para este monitor (ver `outputs`).
     width: u32,
     height: u32,
 }
@@ -504,25 +504,13 @@ fn outputs(adapter: &IDXGIAdapter1) -> Vec<Output> {
         }
         let name = wide(&d.DeviceName);
         let r = d.DesktopCoordinates;
-        let desktop = screen::desktop(&name).unwrap_or(((r.right - r.left) as u32, (r.bottom - r.top) as u32));
+        // El video sale del tamaño del panel, como se ve en el monitor, aunque Windows o el juego estén más bajos: la
+        // imagen se agranda y una resolución estirada sale estirada. Si Windows no dice el panel, del escritorio que
+        // eligió el usuario (no del modo que puso un juego).
         let panel = screens.iter().find(|s| s.name == name).map(|s| s.panel);
-        let (width, height) = video_size(desktop, panel);
-        v.push(Output { monitor: d.Monitor, output, name, width, height });
+        let (w, h) = panel.or_else(|| screen::desktop(&name)).unwrap_or(((r.right - r.left) as u32, (r.bottom - r.top) as u32));
+        // Pares, como lo pide H.264.
+        v.push(Output { monitor: d.Monitor, output, name, width: w.max(2) & !1, height: h.max(2) & !1 });
     }
     v
-}
-
-/// Tamaño del video para un monitor (pares, como lo pide H.264): la forma del panel, así una resolución
-/// estirada sale estirada como la ve el jugador, a la resolución del escritorio de Windows (la que eligió el
-/// usuario, no la que pone un juego): no se agranda la imagen, un panel 4K con el escritorio a 1080p graba 1080p.
-fn video_size(desktop: (u32, u32), panel: Option<(u32, u32)>) -> (u32, u32) {
-    let (w, h) = match panel {
-        Some((pw, ph)) => {
-            let short = desktop.0.min(desktop.1).min(pw.min(ph)) as u64;
-            let (pw, ph) = (pw as u64, ph as u64);
-            if pw >= ph { (short * pw / ph, short) } else { (short, short * ph / pw) }
-        }
-        None => (desktop.0 as u64, desktop.1 as u64),
-    };
-    ((w as u32).max(2) & !1, (h as u32).max(2) & !1)
 }
