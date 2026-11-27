@@ -428,17 +428,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             LRESULT(0)
         }
-        WM_HOTKEY => {
-            if let Some(action) = with_app(|a| a.hotkeys.on_hotkey(wp)).flatten() {
+        WM_HOTKEY | WM_INPUT => {
+            if let Some(action) = with_app(|a| a.hotkeys.on_message(msg, wp, lp)).flatten() {
                 run_action(action);
             }
-            LRESULT(0)
-        }
-        WM_INPUT => {
-            if let Some(action) = with_app(|a| a.hotkeys.on_input(lp)).flatten() {
-                run_action(action);
-            }
-            // Windows libera la tecla leída en DefWindowProc.
+            // Con WM_INPUT, Windows libera la tecla leída en DefWindowProc.
             DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_UPDATE => {

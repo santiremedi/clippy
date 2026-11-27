@@ -26,7 +26,7 @@ pub fn run(args: &[String]) -> Option<i32> {
     if let Some(i) = at("--test-fullscreen") {
         return Some(test_fullscreen(&args[i + 1..]));
     }
-    if let Some(i) = at("--test-hotkeys") {
+    if let Some(i) = at(crate::app::devtools::TEST_HOTKEYS) {
         return Some(crate::app::devtools::test_hotkeys(&args[i + 1..]));
     }
     if at("--test-mic").is_some() {
