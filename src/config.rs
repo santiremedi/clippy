@@ -65,7 +65,8 @@ pub struct Config {
     pub hotkey_mods: u32,
     pub fps: u32,
     pub bitrate_mbps: u32,
-    /// Lado corto del video en px (720, 1080, 1440); 0 = como el monitor. Nunca agranda la imagen.
+    /// Lado corto del video en px (720, 1080, 1440), con la forma del monitor y sin pasar de su resolución; 0 = la del
+    /// monitor.
     pub resolution: u32,
     /// Audio del juego (el proceso en pantalla completa que se detecta solo, ver `game`).
     pub game_audio: bool,
