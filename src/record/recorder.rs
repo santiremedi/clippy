@@ -411,8 +411,9 @@ fn session(
             // "Solo juegos" graba la imagen solo si llegó después de que el juego quedó a la vista en el monitor que se
             // graba; mientras tanto, negro. La de antes puede ser otra ventana (la que estaba adelante antes de volver al
             // juego) u otro monitor, y si la captura no manda una nueva (se trabó) quedaría en el clip en vez del juego.
-            seen_since = (cfg.capture_mode == CaptureMode::GamesOnly && au.game.visible_on(cap.monitor())).then(|| seen_since.unwrap_or(now));
-            let visible = cfg.capture_mode == CaptureMode::Screen || seen_since.is_some_and(|t| cap.new_after(t));
+            let games_only = cfg.capture_mode == CaptureMode::GamesOnly;
+            seen_since = (games_only && au.game.visible_on(cap.monitor())).then(|| seen_since.unwrap_or(now));
+            let visible = !games_only || seen_since.is_some_and(|t| cap.got_frame_after(t));
             if let Some(c) = conv.as_mut() {
                 // Solo convertir si el encoder pidió otra imagen; si está ocupado se salta un cuadro.
                 if enc.pending_input > 0 {

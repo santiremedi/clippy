@@ -54,8 +54,8 @@ impl Drop for Proc {
 #[derive(Default)]
 pub struct Detector {
     game: Option<Proc>,
-    /// El juego estaba adelante en pantalla completa en la última revisión (cada 250 ms).
-    in_front: bool,
+    /// Nada tapa al juego en su monitor: fue la última ventana que se activó ahí (ver `watch`).
+    on_top: bool,
     /// Último proceso en pantalla completa que resultó no ser juego (para no consultarlo de nuevo).
     not_game: u32,
     next_fs: i64,
@@ -76,22 +76,20 @@ impl Detector {
         }
         if now >= self.next_fs {
             self.next_fs = now + FS_EVERY;
-            self.in_front = false;
             if let Some((pid, window)) = fullscreen_window() {
                 if let Some(g) = self.game.as_mut().filter(|g| g.pid == pid) {
                     g.window = window;
-                    self.in_front = true;
                 } else if pid != self.not_game {
                     match open_game(pid, window) {
                         Some(p) => {
                             self.game = Some(p);
-                            self.in_front = true;
                             changed = true;
                         }
                         None => self.not_game = pid,
                     }
                 }
             }
+            self.watch();
         }
         changed
     }
@@ -117,18 +115,45 @@ impl Detector {
         }
     }
 
-    /// El juego está adelante en pantalla completa ahora mismo (ahí manda imágenes todo el tiempo). La pantalla
-    /// completa se revisa cada 250 ms; que la ventana activa siga siendo la suya, en el momento: al hacer Alt+Tab
-    /// desde un juego sin bordes, la otra ventana no tiene que llegar al clip de "Solo juegos".
+    /// El juego está adelante en pantalla completa ahora mismo (ahí manda imágenes todo el tiempo).
     pub fn in_front(&self) -> bool {
-        self.in_front && self.game.as_ref().is_some_and(|g| foreground() == Some(g.window))
+        foreground().is_some_and(|h| self.is_front(h))
     }
 
-    /// El juego se ve en el monitor `m`: está ahí (no minimizado) y adelante, o la ventana activa está en otro
-    /// monitor (con dos o más pantallas, mirar Discord en la otra no tapa el juego).
-    pub fn visible_on(&self, m: HMONITOR) -> bool {
-        self.monitor() == Some(m)
-            && (self.in_front() || foreground().is_none_or(|h| unsafe { MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST) } != m))
+    /// El juego se ve en el monitor `m`: está ahí (no minimizado) y nada lo tapa. Lo tapa la última ventana que se
+    /// activó en su monitor si no fue él (Alt+Tab al navegador), aunque después actives algo en otro monitor o la
+    /// barra de tareas; mirar Discord en otra pantalla no lo tapa. Se mira en cada cuadro: el clip pasa a negro en
+    /// el mismo cuadro en que algo lo tapa.
+    pub fn visible_on(&mut self, m: HMONITOR) -> bool {
+        let covered = self.watch();
+        !covered && self.on_top && self.monitor() == Some(m)
+    }
+
+    /// Mira la ventana activa y recuerda si tapa al juego en su monitor. Devuelve si lo tapa ahora mismo: el
+    /// selector de Alt+Tab lo tapa mientras está, pero al irse deja todo como estaba.
+    fn watch(&mut self) -> bool {
+        let Some(m) = self.monitor() else {
+            // Minimizado: al restaurarlo vuelve a estar arriba recién cuando pasa adelante.
+            self.on_top = false;
+            return false;
+        };
+        let Some(h) = foreground() else { return false };
+        if self.is_front(h) {
+            self.on_top = true;
+            return false;
+        }
+        if unsafe { MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST) } != m {
+            return false;
+        }
+        if !passing(h) {
+            self.on_top = false;
+        }
+        true
+    }
+
+    /// `h` es la ventana del juego y ocupa todo su monitor.
+    fn is_front(&self, h: HWND) -> bool {
+        self.game.as_ref().is_some_and(|g| g.window == h) && covers_monitor(h)
     }
 }
 
@@ -140,16 +165,20 @@ pub fn active_monitor() -> Option<HMONITOR> {
 
 /// Ventana activa, salvo el escritorio y las barras de tareas.
 fn foreground() -> Option<HWND> {
-    unsafe {
-        let h = GetForegroundWindow();
-        if h.is_invalid() {
-            return None;
-        }
-        let mut cls = [0u16; 64];
-        let n = GetClassNameW(h, &mut cls).max(0) as usize;
-        let cls = String::from_utf16_lossy(&cls[..n]);
-        (!matches!(cls.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd")).then_some(h)
-    }
+    let h = unsafe { GetForegroundWindow() };
+    (!h.is_invalid() && !matches!(class(h).as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd")).then_some(h)
+}
+
+/// Ventanas de Windows que pasan adelante solo mientras cambiás de ventana: el selector de Alt+Tab (Windows 11 y
+/// 10) y la que activa Windows en el medio del cambio.
+fn passing(h: HWND) -> bool {
+    matches!(class(h).as_str(), "XamlExplorerHostIslandWindow" | "MultitaskingViewFrame" | "ForegroundStaging")
+}
+
+fn class(h: HWND) -> String {
+    let mut cls = [0u16; 64];
+    let n = unsafe { GetClassNameW(h, &mut cls) }.max(0) as usize;
+    String::from_utf16_lossy(&cls[..n])
 }
 
 fn is_game(exe: &str) -> bool {
@@ -253,28 +282,28 @@ fn snapshot() -> Vec<(u32, String)> {
     v
 }
 
-/// (PID, ventana) de la ventana activa si ocupa todo su monitor. El escritorio, las ventanas normales y las
-/// maximizadas no cuentan: en un monitor sin barra de tareas una ventana maximizada también lo tapa entero,
-/// y apps sin barra de título estándar (Discord, Spotify) parecerían juegos. Un juego sin bordes no se
-/// maximiza: se agranda al tamaño del monitor.
+/// (PID, ventana) de la ventana activa si ocupa todo su monitor (el escritorio no cuenta).
 fn fullscreen_window() -> Option<(u32, HWND)> {
+    let h = foreground().filter(|&h| covers_monitor(h))?;
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
+    (pid != 0).then_some((pid, h))
+}
+
+/// La ventana `h` ocupa todo su monitor. Las ventanas normales y las maximizadas no cuentan: en un monitor sin barra
+/// de tareas una ventana maximizada también lo tapa entero, y apps sin barra de título estándar (Discord, Spotify)
+/// parecerían juegos. Un juego sin bordes no se maximiza: se agranda al tamaño del monitor.
+fn covers_monitor(h: HWND) -> bool {
     unsafe {
-        let h = foreground()?;
         if IsZoomed(h).as_bool() {
-            return None;
+            return false;
         }
         let mut r = RECT::default();
-        GetWindowRect(h, &mut r).ok()?;
         let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
-        if !GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mut mi).as_bool() {
-            return None;
+        if GetWindowRect(h, &mut r).is_err() || !GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mut mi).as_bool() {
+            return false;
         }
         let m = mi.rcMonitor;
-        if !(r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom) {
-            return None;
-        }
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(h, Some(&mut pid));
-        (pid != 0).then_some((pid, h))
+        r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom
     }
 }

@@ -200,7 +200,7 @@ impl Capture {
     }
 
     /// Llegó una imagen nueva después de `t` (con el reloj de `poll`).
-    pub fn new_after(&self, t: i64) -> bool {
+    pub fn got_frame_after(&self, t: i64) -> bool {
         self.last_new > t
     }
 
