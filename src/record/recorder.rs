@@ -1,5 +1,6 @@
 //! Hilo de grabación: captura -> NV12 -> encoder -> buffer en RAM. Guarda clips a pedido.
-//! Se despierta exactamente `fps` veces por segundo con un temporizador de alta resolución.
+//! Se despierta exactamente `fps` veces por segundo con un temporizador de alta resolución (y cada 2 ms mientras haya
+//! cuadros esperando al encoder).
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
@@ -253,6 +254,9 @@ const AIM_EVERY: i64 = 2_500_000;
 /// Cuánto después de empezar a convertir un monitor se controla la imagen para el log (100 ns).
 const PROBE_AFTER: i64 = 20_000_000;
 
+/// Mientras haya cuadros esperando al encoder, cada cuánto se le pregunta si quiere otro (100 ns).
+const FEED_EVERY: i64 = 20_000;
+
 /// El tamaño más grande que entra en `(w, h)` con los dos lados múltiplos de 16 (la imagen se encaja adentro).
 fn align16((w, h): (u32, u32)) -> (u32, u32) {
     ((w & !15).max(16), (h & !15).max(16))
@@ -391,7 +395,7 @@ fn session(
         cap.poll(now)?;
         if let Some(f) = &cap.latest {
             if !conv.as_ref().is_some_and(|c| c.is_for(f)) {
-                conv = Some(cap.check(Converter::new(&cap.device, &cap.context, f, w, h, fps, 8))?);
+                conv = Some(cap.check(Converter::new(&cap.device, &cap.context, f, w, h, fps))?);
                 probe_at = Some(now + PROBE_AFTER);
             }
         }
@@ -415,27 +419,26 @@ fn session(
             seen_since = (games_only && au.game.visible_on(cap.monitor())).then(|| seen_since.unwrap_or(now));
             let visible = !games_only || seen_since.is_some_and(|t| cap.got_frame_after(t));
             if let Some(c) = conv.as_mut() {
-                // Solo convertir si el encoder pidió otra imagen; si está ocupado se salta un cuadro.
-                if enc.pending_input > 0 {
-                    let tex = if visible {
-                        // Con un juego, nunca: muchos dibujan su propio cursor y el de Windows queda quieto en el medio.
-                        cap.draw_cursor(au.game.pid().is_none());
-                        cap.check(c.convert())?
-                    } else {
-                        c.black()
-                    };
-                    if visible && probe_at.is_some_and(|t| now >= t) {
+                #[cfg(feature = "devtools")]
+                if reject {
+                    anyhow::bail!("encoder de prueba: {w}x{h} no es múltiplo de 16 (0x80004005)");
+                }
+                if visible {
+                    // Con un juego, nunca: muchos dibujan su propio cursor y el de Windows queda quieto en el medio.
+                    cap.draw_cursor(au.game.pid().is_none());
+                    let tex = cap.check(c.convert(pts))?;
+                    if let Some(tex) = tex.filter(|_| probe_at.is_some_and(|t| now >= t)) {
                         probe_at = None;
                         log(&c.probe(&tex));
                     }
-                    #[cfg(feature = "devtools")]
-                    if reject {
-                        anyhow::bail!("encoder de prueba: {w}x{h} no es múltiplo de 16 (0x80004005)");
-                    }
-                    cap.check(enc.feed(&tex, pts, frame_dur))?;
+                } else {
+                    c.black(pts);
                 }
             }
             next_frame = pts + frame_dur;
+        }
+        if let Some(c) = conv.as_mut() {
+            feed(&mut enc, c, &cap, frame_dur)?;
         }
 
         trim_video(&mut packets, now - keep);
@@ -445,8 +448,32 @@ fn session(
         au.mic.buf.trim_before(a_min);
         au.masks.retain(|m| m.1 > now - keep - 20_000_000);
 
-        timer.sleep(next_frame - (now_100ns() - t0));
+        // Mientras haya cuadros esperando, se le vuelve a preguntar al encoder cada `FEED_EVERY` en vez de esperar al
+        // cuadro siguiente: el de NVIDIA pide las imágenes de a una, un rato después de recibir la anterior (con la placa
+        // llena, a veces más de un cuadro), y las conversiones terminan en cualquier momento.
+        loop {
+            let left = next_frame - (now_100ns() - t0);
+            if left <= FEED_EVERY || !conv.as_ref().is_some_and(|c| c.waiting()) {
+                timer.sleep(left);
+                break;
+            }
+            timer.sleep(FEED_EVERY);
+            cap.check(enc.poll(&mut out))?;
+            packets.extend(out.drain(..));
+            if let Some(c) = conv.as_mut() {
+                feed(&mut enc, c, &cap, frame_dur)?;
+            }
+        }
     }
+}
+
+/// Le pasa al encoder, en orden, los cuadros que ya terminaron de convertirse, mientras pida más.
+fn feed(enc: &mut Encoder, conv: &mut Converter, cap: &Capture, frame_dur: i64) -> Result<()> {
+    while enc.pending_input > 0 {
+        let Some((tex, pts)) = conv.take() else { break };
+        cap.check(enc.feed(&tex, pts, frame_dur))?;
+    }
+    Ok(())
 }
 
 /// Descarta GOPs completos que ya quedaron fuera de la ventana.
@@ -521,9 +548,15 @@ fn save_clip(cfg: &Config, packets: &VecDeque<Packet>, enc: &Encoder, au: &Audio
         .or_else(|| packets.iter().position(|p| p.key));
     let Some(start) = start else { return fail(no_video()) };
     let pk: Vec<Packet> = packets.iter().skip(start).cloned().collect();
-    log(&format!("clip: {} cuadros, {} fotogramas clave", pk.len(), pk.iter().filter(|p| p.key).count()));
     let base = pk[0].pts;
     let end = pk.last().map_or(base, |p| p.pts) + frame_dur;
+    let secs = (end - base) as f64 / 10_000_000.0;
+    log(&format!(
+        "clip: {} cuadros en {secs:.1} s ({:.1} por segundo), {} fotogramas clave",
+        pk.len(),
+        pk.len() as f64 / secs,
+        pk.iter().filter(|p| p.key).count()
+    ));
     let audio = cfg.audio_on().then(|| mixed_audio(cfg, au, frames_at(base), frames_at(end)));
     if au.game.pid().is_none() {
         if cfg.game_audio {
