@@ -20,6 +20,9 @@ pub(super) struct Prefs {
     pub(super) export_fps: u32,
     pub(super) export_quality: Quality,
     pub(super) export_size_mb: u32,
+    /// Carpeta de la última exportación: relativa a la de clips si está adentro (así la sigue si cambia),
+    /// absoluta si no. None = todavía no se exportó nada (ver `EditorApp::export_dir`).
+    pub(super) export_dir: Option<PathBuf>,
     /// Tamaño de los paneles (puntos), como los dejó el usuario arrastrando sus bordes.
     pub(super) library_w: f32,
     pub(super) props_w: f32,
@@ -38,6 +41,7 @@ impl Default for Prefs {
             export_fps: 0,
             export_quality: Quality::Recommended,
             export_size_mb: 25,
+            export_dir: None,
             library_w: 320.0,
             props_w: 290.0,
             timeline_h: 268.0,
