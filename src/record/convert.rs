@@ -16,11 +16,11 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::capture::Frame;
 
-/// Texturas NV12: las que esperan su conversión o al encoder, más las que el encoder todavía puede estar leyendo.
-const POOL: usize = 8;
-/// Cuadros que pueden estar esperando su conversión o al encoder (a 60 fps, 67 ms): si la placa tarda más, se saltean.
-/// El resto del pool queda para el encoder.
-const QUEUED: usize = 4;
+/// Cuadros que pueden estar esperando su conversión o al encoder (a 60 fps, 133 ms): con un juego lento que llena la
+/// placa, cada conversión espera detrás de los cuadros que el juego ya tiene en cola. Si tarda más, se saltea el cuadro.
+const QUEUED: usize = 8;
+/// Texturas NV12: las de los cuadros que esperan, más 4 que el encoder todavía puede estar leyendo.
+const POOL: usize = QUEUED + 4;
 
 pub struct Converter {
     /// La imagen que convierte (si `Capture` cambia de textura, hace falta otro `Converter`).
