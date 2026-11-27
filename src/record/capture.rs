@@ -199,6 +199,11 @@ impl Capture {
         (now - self.last_new.max(since) > STALL).then_some(self.dup_lost)
     }
 
+    /// Llegó una imagen nueva después de `t` (con el reloj de `poll`).
+    pub fn new_after(&self, t: i64) -> bool {
+        self.last_new > t
+    }
+
     /// La sesión llegó a capturar (si después se traba, es que algo la trabó, no que nunca anduvo).
     pub fn worked(&self) -> bool {
         self.new_frames >= WORKED

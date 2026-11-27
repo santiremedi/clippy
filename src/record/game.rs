@@ -54,7 +54,7 @@ impl Drop for Proc {
 #[derive(Default)]
 pub struct Detector {
     game: Option<Proc>,
-    /// El juego está adelante en pantalla completa ahora mismo.
+    /// El juego estaba adelante en pantalla completa en la última revisión (cada 250 ms).
     in_front: bool,
     /// Último proceso en pantalla completa que resultó no ser juego (para no consultarlo de nuevo).
     not_game: u32,
@@ -117,16 +117,18 @@ impl Detector {
         }
     }
 
-    /// El juego está adelante en pantalla completa ahora mismo (ahí manda imágenes todo el tiempo).
+    /// El juego está adelante en pantalla completa ahora mismo (ahí manda imágenes todo el tiempo). La pantalla
+    /// completa se revisa cada 250 ms; que la ventana activa siga siendo la suya, en el momento: al hacer Alt+Tab
+    /// desde un juego sin bordes, la otra ventana no tiene que llegar al clip de "Solo juegos".
     pub fn in_front(&self) -> bool {
-        self.in_front
+        self.in_front && self.game.as_ref().is_some_and(|g| foreground() == Some(g.window))
     }
 
-    /// El juego se ve en su monitor: está adelante, o la ventana activa está en otro monitor
-    /// (con dos o más pantallas, mirar Discord en la otra no tapa el juego).
-    pub fn visible(&self) -> bool {
-        let Some(m) = self.monitor() else { return false };
-        self.in_front || foreground().is_none_or(|h| unsafe { MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST) } != m)
+    /// El juego se ve en el monitor `m`: está ahí (no minimizado) y adelante, o la ventana activa está en otro
+    /// monitor (con dos o más pantallas, mirar Discord en la otra no tapa el juego).
+    pub fn visible_on(&self, m: HMONITOR) -> bool {
+        self.monitor() == Some(m)
+            && (self.in_front() || foreground().is_none_or(|h| unsafe { MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST) } != m))
     }
 }
 
